@@ -451,4 +451,41 @@
 #define JIT_INVOKE_SYSTEM_REFLECTION_METHODBASE          0x164
 #define JIT_REFLECTION_DYNAMICALLY_BOX_RETURN_VALUE      0x165
 
+// Emitted before a conv.ovf.* conversion: throws OverflowException if the value on top of the
+// eval stack does not fit the destination type. Parameter: from-kind | (to-kind << 8).
+#define JIT_CONV_OVF_CHECK                               0x166
+
+// Unary minus on floating point (there was no way to negate a float or double).
+#define JIT_NEG_F32                                      0x167
+#define JIT_NEG_F64                                      0x168
+
+// cpobj: copy a value of a given type from one address to another. Operand: the type.
+#define JIT_COPYOBJECT                                   0x169
+// ckfinite: throws OverflowException (as the reference runtimes do) if the float is NaN or infinite.
+#define JIT_CKFINITE_F32                                 0x16a
+#define JIT_CKFINITE_F64                                 0x16b
+
+// ldvirtftn: resolve a virtual or interface method against an object's runtime type and push it.
+#define JIT_LOADVIRTFUNCTION                             0x16c
+
+// mkrefany / refanyval / refanytype: building and taking apart a TypedReference (address + type).
+#define JIT_MKREFANY                                     0x16d
+#define JIT_REFANYVAL                                    0x16e
+#define JIT_REFANYTYPE                                   0x16f
+
+// calli: call the method whose pointer (from ldftn/ldvirtftn) is on top of the evaluation stack.
+#define JIT_CALLI                                        0x170
+// jmp: put the current method's arguments back on the evaluation stack, ready to call the target.
+#define JIT_JMP_COPYARGS                                 0x171
+
+// cpblk (copy a block of bytes; the ranges may overlap) and initblk (fill a block with a byte).
+#define JIT_CPBLK                                        0x172
+#define JIT_INITBLK                                      0x173
+
+// unbox: type-check a boxed value and push a pointer to the value inside the box.
+#define JIT_UNBOX                                        0x174
+
+// endfilter: ends the code of an exception filter, with the verdict (nonzero = handle it) on the stack.
+#define JIT_ENDFILTER                                    0x175
+
 #endif

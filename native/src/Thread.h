@@ -40,6 +40,28 @@ struct tThreadStack_ {
 	tThreadStack *pNext;
 };
 
+// Exception filters (`catch ... when (...)`). Looking for a handler is a first pass that may have to
+// stop and run filter code, in the frame that owns the filter, with the frames above it left
+// exactly as they are (they still have finally blocks to run once a handler is chosen). One of these
+// records a search that is waiting for a filter's verdict. A filter can itself call code that
+// throws and catches, so they stack.
+#define MAX_ACTIVE_FILTERS 16
+typedef struct tFilterCtx_ tFilterCtx;
+struct tFilterCtx_ {
+	// the frame the exception was thrown in (the top of the frames the search is going through)
+	tMethodState *pTopState;
+	// the frame that owns the filter, and which clause of its method the filter belongs to
+	tMethodState *pFrame;
+	U32 clause;
+	// that frame's instruction pointer and stack depth, which running the filter overwrites
+	U32 savedIp;
+	U32 savedStackOfs;
+	// the exception being filtered
+	HEAP_PTR savedException;
+	// whether the search that was interrupted was itself for an exception thrown inside a filter
+	U32 outerSearchInFilter;
+};
+
 struct tThread_ {
 	// Stuff that's synced with Thread.cs
 	// The threadID of this thread
@@ -68,6 +90,19 @@ struct tThread_ {
 	tMethodState *pCatchMethodState;
 	// And the exception catch handler we're aiming for...
 	tExceptionHeader *pCatchExceptionHandler;
+	// Searching for a handler: the frame the exception was thrown in, the next frame to look at,
+	// and the clause to resume at in it. Kept here, not in locals, so a search interrupted to run
+	// a filter can be resumed from endfilter.
+	tMethodState *pThrowTopState;
+	tMethodState *pSearchFrame;
+	U32 searchNextClause;
+	// Is the exception being searched for one thrown from inside a running filter? Then nothing
+	// outside that filter's own call chain may handle it: it is swallowed at the filter.
+	U32 searchInFilter;
+	// The filters currently running, innermost last. The array is only allocated when a thread first
+	// runs a filter (almost none do), so that a thread that never does carries nothing for them.
+	U32 numFilters;
+	tFilterCtx *pFilterCtx;
 	// If this thread is waiting on async data, then the details are stored here
 	tAsyncCall *pAsync;
 	// Does this thread start with a parameter?

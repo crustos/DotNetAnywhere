@@ -103,6 +103,10 @@
 #define CIL_STIND_I1	0x52
 #define CIL_STIND_I2	0x53
 #define CIL_STIND_I4	0x54
+#define CIL_STIND_I8	0x55
+#define CIL_STIND_R4	0x56
+#define CIL_STIND_R8	0x57
+#define CIL_STIND_I	0xdf
 
 #define CIL_ADD			0x58
 #define CIL_SUB			0x59
@@ -165,6 +169,7 @@
 #define CIL_LDELEM_I4	0x94
 #define CIL_LDELEM_U4	0x95
 #define CIL_LDELEM_I8	0x96
+#define CIL_LDELEM_I	0x97
 
 #define CIL_LDELEM_R4	0x98
 #define CIL_LDELEM_R8	0x99
@@ -173,6 +178,7 @@
 #define CIL_STELEM_I1	0x9c
 #define CIL_STELEM_I2	0x9d
 #define CIL_STELEM_I4	0x9e
+#define CIL_STELEM_I	0x9b
 #define CIL_STELEM_I8	0x9f
 #define CIL_STELEM_R4	0xa0
 #define CIL_STELEM_R8	0xa1
@@ -189,6 +195,8 @@
 #define CIL_CONV_OVF_U4	0xb8
 #define CIL_CONV_OVF_I8	0xb9
 #define CIL_CONV_OVF_U8	0xba
+#define CIL_CONV_OVF_I	0xd4
+#define CIL_CONV_OVF_U	0xd5
 
 #define CIL_LDTOKEN		0xd0
 #define CIL_CONV_U2		0xd1
@@ -209,6 +217,24 @@
 
 #define CIL_EXTENDED	0xfe
 
+// Single-byte opcodes that were missing from this table
+#define CIL_BREAK		0x01
+#define CIL_JMP			0x27
+#define CIL_CALLI		0x29
+#define CIL_CPOBJ		0x70
+#define CIL_UNBOX		0x79
+#define CIL_REFANYVAL	0xc2
+#define CIL_CKFINITE	0xc3
+#define CIL_MKREFANY	0xc6
+// 0xf8-0xfd and 0xff: reserved encodings (ECMA-335 prefix7..prefix2, prefixref). Never valid.
+#define CIL_PREFIX7		0xf8
+#define CIL_PREFIX6		0xf9
+#define CIL_PREFIX5		0xfa
+#define CIL_PREFIX4		0xfb
+#define CIL_PREFIX3		0xfc
+#define CIL_PREFIX2		0xfd
+#define CIL_PREFIXREF	0xff
+
 
 // Extended op-codes
 
@@ -218,6 +244,23 @@
 #define CILX_CLT		0x04
 #define CILX_CLT_UN		0x05
 #define CILX_LOADFUNCTION 0x06
+#define CILX_ARGLIST	0x00
+#define CILX_LDVIRTFTN	0x07
+#define CILX_LDARG		0x09
+#define CILX_LDARGA		0x0a
+#define CILX_STARG		0x0b
+#define CILX_LDLOC		0x0c
+#define CILX_LDLOCA		0x0d
+#define CILX_STLOC		0x0e
+#define CILX_LOCALLOC	0x0f
+#define CILX_ENDFILTER	0x11
+#define CILX_UNALIGNED	0x12
+#define CILX_VOLATILE	0x13
+#define CILX_TAIL		0x14
+#define CILX_CPBLK		0x17
+#define CILX_INITBLK	0x18
+#define CILX_SIZEOF		0x1c
+#define CILX_REFANYTYPE	0x1d
 
 #define CILX_INITOBJ	0x15
 #define CILX_CONSTRAINED 0x16

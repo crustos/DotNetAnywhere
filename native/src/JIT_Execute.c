@@ -38,6 +38,8 @@
 #include "System.Reflection.MethodBase.h"
 #include "System.Diagnostics.Debugger.h"
 
+#include <math.h>
+
 // Global array which stores the absolute addresses of the start and end of all JIT code
 // fragment machine code.
 tJITCodeInfo jitCodeInfo[JIT_OPCODE_MAXNUM];
@@ -126,7 +128,166 @@ tJITCodeInfo jitCodeGoNext;
 #define PARAMLOCAL_U32(offset) *(U32*)(pParamsLocals + offset)
 #define PARAMLOCAL_U64(offset) *(U64*)(pParamsLocals + offset)
 
-#define THROW(exType) heapPtr = Heap_AllocType(exType); goto throwHeapPtr
+// Portable overflow-checked 64-bit arithmetic: each returns non-zero on overflow and always
+// stores the wrapped result. (Checked against the compiler builtins in tests/.)
+static int AddOvfI64(I64 a, I64 b, I64 *r) {
+	U64 ur = (U64)a + (U64)b;
+	*r = (I64)ur;
+	return (int)((((U64)a ^ ur) & ((U64)b ^ ur)) >> 63);
+}
+static int SubOvfI64(I64 a, I64 b, I64 *r) {
+	U64 ur = (U64)a - (U64)b;
+	*r = (I64)ur;
+	return (int)((((U64)a ^ (U64)b) & ((U64)a ^ ur)) >> 63);
+}
+static int MulOvfI64(I64 a, I64 b, I64 *r) {
+	if (a == 0 || b == 0) {
+		*r = 0;
+		return 0;
+	}
+	*r = (I64)((U64)a * (U64)b);
+	if ((a == -1 && b == (I64)0x8000000000000000ULL) || (b == -1 && a == (I64)0x8000000000000000ULL)) {
+		return 1;
+	}
+	return *r / b != a;
+}
+static int AddOvfU64(U64 a, U64 b, U64 *r) { *r = a + b; return *r < a; }
+static int SubOvfU64(U64 a, U64 b, U64 *r) { *r = a - b; return a < b; }
+static int MulOvfU64(U64 a, U64 b, U64 *r) { *r = a * b; return a != 0 && *r / a != b; }
+
+// Does the value on top of the evaluation stack fit the destination of a conv.ovf.*?
+//   from: 0 int32, 1 uint32, 2 int64, 3 uint64, 4 float32, 5 float64
+//   to:   0 I1, 1 U1, 2 I2, 3 U2, 4 I4, 5 U4, 6 I8, 7 U8   (ConvOvfTarget in JIT.c)
+// Integers are compared by sign and magnitude; floats are truncated toward zero first, and a
+// NaN fails both bounds, so it overflows.
+static int ConvOvfFits(U32 from, U32 to, PTR pTop) {
+	static const U64 negLimit[8] = {128, 0, 32768, 0, 2147483648ULL, 0, 0x8000000000000000ULL, 0};
+	static const U64 posLimit[8] = {127, 255, 32767, 65535, 2147483647ULL, 4294967295ULL,
+		0x7fffffffffffffffULL, 0xffffffffffffffffULL};
+	static const double lo[8] = {-128.0, 0.0, -32768.0, 0.0, -2147483648.0, 0.0, -9223372036854775808.0, 0.0};
+	static const double hiEx[8] = {128.0, 256.0, 32768.0, 65536.0, 2147483648.0, 4294967296.0,
+		9223372036854775808.0, 18446744073709551616.0};
+
+	if (from >= 4) {
+		double d = (from == 4) ? (double)*(float*)(pTop - 4) : *(double*)(pTop - 8);
+		d = trunc(d);
+		return d >= lo[to] && d < hiEx[to];
+	} else {
+		int neg;
+		U64 mag;
+		switch (from) {
+		case 0: {
+			I32 v = *(I32*)(pTop - 4);
+			neg = v < 0;
+			mag = neg ? (U64)0 - (U64)(I64)v : (U64)v;
+			break;
+		}
+		case 1:
+			neg = 0;
+			mag = *(U32*)(pTop - 4);
+			break;
+		case 2: {
+			I64 v = *(I64*)(pTop - 8);
+			neg = v < 0;
+			mag = neg ? (U64)0 - (U64)v : (U64)v;
+			break;
+		}
+		default:
+			neg = 0;
+			mag = *(U64*)(pTop - 8);
+			break;
+		}
+		return mag <= (neg ? negLimit[to] : posLimit[to]);
+	}
+}
+
+// The method that actually runs for a virtual or interface method called on an object of
+// type pThisType (the same resolution callvirt does). NULL if the type does not implement it.
+static tMD_MethodDef* ResolveVirtualMethod(tMD_MethodDef *pMethod, tMD_TypeDef *pThisType) {
+	if (TYPE_ISINTERFACE(pMethod->pParentType)) {
+		I32 i;
+		// Searched backwards, so an interface implemented more than once in the hierarchy gets
+		// its most recent implementation.
+		for (i = (I32)pThisType->numInterfaces - 1; i >= 0; i--) {
+			if (pThisType->pInterfaceMaps[i].pInterface == pMethod->pParentType) {
+				if (pThisType->pInterfaceMaps[i].pVTableLookup != NULL) {
+					return pThisType->pVTable[pThisType->pInterfaceMaps[i].pVTableLookup[pMethod->vTableOfs]];
+				}
+				return pThisType->pInterfaceMaps[i].ppMethodVLookup[pMethod->vTableOfs];
+			}
+		}
+		return NULL;
+	}
+	if (METHOD_ISVIRTUAL(pMethod)) {
+		return pThisType->pVTable[pMethod->vTableOfs];
+	}
+	return pMethod;
+}
+
+// Unboxing a value of type `held` as `expected`. The reference runtimes allow an exact match, or
+// types with the same underlying type where an enum counts as its integer type: so int <-> an int
+// enum, and one int enum <-> another, but not int <-> uint, int <-> long, or int <-> a byte enum.
+static tMD_TypeDef* UnboxUnderlying(tMD_TypeDef *pType) {
+	if (pType->pParent == types[TYPE_SYSTEM_ENUM]) {
+		U32 i;
+		for (i = 0; i < pType->numFields; i++) {
+			if (!FIELD_ISSTATIC(pType->ppFields[i])) {
+				return pType->ppFields[i]->pType;
+			}
+		}
+	}
+	return pType;
+}
+static int UnboxCompatible(tMD_TypeDef *pExpected, tMD_TypeDef *pHeld) {
+	return pExpected == pHeld || UnboxUnderlying(pExpected) == UnboxUnderlying(pHeld);
+}
+
+// Indirect (ref/pointer) access of a 1- or 2-byte integer. Two things can be pointed at:
+//  * a packed element of a byte[]/sbyte[]/short[]/ushort[]/char[]: really 1 or 2 bytes wide;
+//  * anything else (locals, parameters, instance and static fields): a 4-byte slot holding
+//    the value widened to 32 bits.
+// Accessing a packed element as a whole word read its neighbours and, on a store, overwrote them.
+static int IsPackedNarrowElement(void *p) {
+	tMD_TypeDef *pType = Heap_GetObjectTypeContaining(p);
+	return pType != NULL && TYPE_ISARRAY(pType) &&
+		pType->pArrayElementType->arrayElementSize < pType->pArrayElementType->stackSize;
+}
+
+// cpobj: copy one value of type `pType` from *pSrc to *pDst. References copy as pointers; 4- and
+// 8-byte values and structs byte for byte; 1- and 2-byte integers by element width where the
+// address is a packed array element, and as a widened 4-byte slot otherwise (see above).
+static void CopyObject(tMD_TypeDef *pType, PTR pDst, PTR pSrc) {
+	if (!pType->isValueType) {
+		*(void**)pDst = *(void**)pSrc;
+	} else if (pType->arrayElementSize < pType->stackSize) {
+		U32 size = pType->arrayElementSize, value;
+		int isSigned = pType == types[TYPE_SYSTEM_SBYTE] || pType == types[TYPE_SYSTEM_INT16];
+		if (IsPackedNarrowElement(pSrc)) {
+			value = (size == 1) ? (isSigned ? (U32)(I32)*(I8*)pSrc : (U32)*(U8*)pSrc)
+				: (isSigned ? (U32)(I32)*(I16*)pSrc : (U32)*(U16*)pSrc);
+		} else {
+			value = *(U32*)pSrc;
+		}
+		if (IsPackedNarrowElement(pDst)) {
+			if (size == 1) { *(U8*)pDst = (U8)value; } else { *(U16*)pDst = (U16)value; }
+		} else {
+			*(U32*)pDst = value;
+		}
+	} else {
+		memmove(pDst, pSrc, pType->arrayElementSize);
+	}
+}
+
+
+// Throw a new exception of the given type. This must not assign `heapPtr` directly: several
+// handlers declare a local of that name, which would receive the exception while the shared throw
+// code reads the function-level one. (That is how every failed castclass used to throw some stale,
+// unrelated object, or crash on a NULL one.) So the type goes through a function-level variable
+// and a stub allocates it where only the function-level heapPtr is visible.
+#define THROW(exType) throwEx = (exType); goto throwTyped
+// For handlers that declare their own local `heapPtr` (which would shadow the one the shared
+// throw code reads): jump to a stub that allocates into the function-level variable.
+#define THROW_NULLREF() goto throwNullRef
 
 static void CheckIfCurrentInstructionHasBreakpoint(tMethodState* pMethodState, U32 opOffset, I32* pOpSequencePoints)
 {
@@ -265,6 +426,7 @@ U32 JIT_Execute(tThread *pThread, U32 numInst) {
 	//float fValue;
 	//uConvDouble convDouble;
 	U32 ofs;
+	tMD_TypeDef *throwEx;
 	HEAP_PTR heapPtr;
 	PTR pMem;
 
@@ -319,6 +481,7 @@ U32 JIT_Execute(tThread *pThread, U32 numInst) {
 		GET_LABELS(JIT_SWITCH);
 		GET_LABELS(JIT_LOAD_ELEMENT_ADDR);
 		GET_LABELS(JIT_CALL_INTERFACE);
+		GET_LABELS(JIT_CALLI);
 		GET_LABELS(JIT_CAST_CLASS);
 		GET_LABELS(JIT_LOAD_ELEMENT);
 		GET_LABELS(JIT_LOADFIELD_VALUETYPE);
@@ -436,6 +599,20 @@ U32 JIT_Execute(tThread *pThread, U32 numInst) {
 		GET_LABELS_DYNAMIC(JIT_NEG_I32, 0);
 		GET_LABELS_DYNAMIC(JIT_NOT_I32, 0);
 		GET_LABELS_DYNAMIC(JIT_NEG_I64, 0);
+		GET_LABELS_DYNAMIC(JIT_NEG_F32, 0);
+		GET_LABELS_DYNAMIC(JIT_NEG_F64, 0);
+		GET_LABELS_DYNAMIC(JIT_COPYOBJECT, 4);
+		GET_LABELS_DYNAMIC(JIT_LOADVIRTFUNCTION, 4);
+		GET_LABELS_DYNAMIC(JIT_MKREFANY, 4);
+		GET_LABELS_DYNAMIC(JIT_REFANYVAL, 4);
+		GET_LABELS_DYNAMIC(JIT_REFANYTYPE, 0);
+		GET_LABELS_DYNAMIC(JIT_JMP_COPYARGS, 0);
+		GET_LABELS_DYNAMIC(JIT_CPBLK, 0);
+		GET_LABELS_DYNAMIC(JIT_UNBOX, 4);
+		GET_LABELS(JIT_ENDFILTER);
+		GET_LABELS_DYNAMIC(JIT_INITBLK, 0);
+		GET_LABELS_DYNAMIC(JIT_CKFINITE_F32, 0);
+		GET_LABELS_DYNAMIC(JIT_CKFINITE_F64, 0);
 		GET_LABELS_DYNAMIC(JIT_NOT_I64, 0);
 
 		GET_LABELS(JIT_BOX_NULLABLE);
@@ -484,6 +661,10 @@ U32 JIT_Execute(tThread *pThread, U32 numInst) {
 		GET_LABELS(JIT_BGT_UN_I32I32);
 		GET_LABELS(JIT_BLE_UN_I32I32);
 		GET_LABELS(JIT_BLT_UN_I32I32);
+		GET_LABELS(JIT_BGE_UN_I64I64);
+		GET_LABELS(JIT_BGT_UN_I64I64);
+		GET_LABELS(JIT_BLE_UN_I64I64);
+		GET_LABELS(JIT_BLT_UN_I64I64);
 
 		GET_LABELS_DYNAMIC(JIT_SHL_I32, 0);
 		GET_LABELS_DYNAMIC(JIT_SHR_I32, 0);
@@ -504,6 +685,7 @@ U32 JIT_Execute(tThread *pThread, U32 numInst) {
 		GET_LABELS(JIT_LOADINDIRECT_I32);
 		GET_LABELS(JIT_LOADINDIRECT_U32);
 		GET_LABELS(JIT_LOADINDIRECT_I64);
+		GET_LABELS(JIT_LOADINDIRECT_I);
 
 		GET_LABELS(JIT_LOADINDIRECT_R32);
 		GET_LABELS(JIT_LOADINDIRECT_R64);
@@ -512,6 +694,9 @@ U32 JIT_Execute(tThread *pThread, U32 numInst) {
 		GET_LABELS(JIT_STOREINDIRECT_U8);
 		GET_LABELS(JIT_STOREINDIRECT_U16);
 		GET_LABELS(JIT_STOREINDIRECT_U32);
+		GET_LABELS(JIT_STOREINDIRECT_U64);
+		GET_LABELS(JIT_STOREINDIRECT_R32);
+		GET_LABELS(JIT_STOREINDIRECT_R64);
 
 		GET_LABELS_DYNAMIC(JIT_CONV_I32_I32, 4);
 		GET_LABELS_DYNAMIC(JIT_CONV_I32_U32, 4);
@@ -561,6 +746,15 @@ U32 JIT_Execute(tThread *pThread, U32 numInst) {
 		GET_LABELS(JIT_LOAD_ELEMENT_R32);
 		GET_LABELS(JIT_LOAD_ELEMENT_R64);
 
+		GET_LABELS_DYNAMIC(JIT_ADD_OVF_I64I64, 0);
+		GET_LABELS_DYNAMIC(JIT_ADD_OVF_UN_I64I64, 0);
+		GET_LABELS_DYNAMIC(JIT_SUB_OVF_I64I64, 0);
+		GET_LABELS_DYNAMIC(JIT_SUB_OVF_UN_I64I64, 0);
+		GET_LABELS_DYNAMIC(JIT_MUL_OVF_I64I64, 0);
+		GET_LABELS_DYNAMIC(JIT_MUL_OVF_UN_I64I64, 0);
+		GET_LABELS_DYNAMIC(JIT_CONV_OVF_CHECK, 4);
+		GET_LABELS_DYNAMIC(JIT_REM_F32F32, 0);
+		GET_LABELS_DYNAMIC(JIT_REM_F64F64, 0);
 		GET_LABELS_DYNAMIC(JIT_ADD_I64I64, 0);
 		GET_LABELS_DYNAMIC(JIT_SUB_I64I64, 0);
 		GET_LABELS_DYNAMIC(JIT_MUL_I64I64, 0);
@@ -574,6 +768,10 @@ U32 JIT_Execute(tThread *pThread, U32 numInst) {
 
 		GET_LABELS_DYNAMIC(JIT_CEQ_F32F32, 0);
 		GET_LABELS_DYNAMIC(JIT_CGT_F32F32, 0);
+		GET_LABELS_DYNAMIC(JIT_CGT_UN_F32F32, 0);
+		GET_LABELS_DYNAMIC(JIT_CLT_UN_F32F32, 0);
+		GET_LABELS_DYNAMIC(JIT_CGT_UN_F64F64, 0);
+		GET_LABELS_DYNAMIC(JIT_CLT_UN_F64F64, 0);
 		GET_LABELS_DYNAMIC(JIT_CLT_F32F32, 0);
 		GET_LABELS_DYNAMIC(JIT_CEQ_F64F64, 0);
 		GET_LABELS_DYNAMIC(JIT_CGT_F64F64, 0);
@@ -911,27 +1109,83 @@ JIT_STOREPARAMLOCAL_7_end:
 	GO_NEXT();
 
 JIT_LOADINDIRECT_I8_start:
-JIT_LOADINDIRECT_I16_start:
-JIT_LOADINDIRECT_I32_start:
+	OPCODE_USE(JIT_LOADINDIRECT_I8);
+	{
+		PTR pMem = POP_PTR();
+		if (pMem == NULL) {
+			THROW_NULLREF();
+		}
+		PUSH_U32(IsPackedNarrowElement(pMem) ? (U32)(I32)*(I8*)pMem : *(U32*)pMem);
+	}
+JIT_LOADINDIRECT_I8_end:
+	GO_NEXT();
+
 JIT_LOADINDIRECT_U8_start:
+	OPCODE_USE(JIT_LOADINDIRECT_U8);
+	{
+		PTR pMem = POP_PTR();
+		if (pMem == NULL) {
+			THROW_NULLREF();
+		}
+		PUSH_U32(IsPackedNarrowElement(pMem) ? (U32)*(U8*)pMem : *(U32*)pMem);
+	}
+JIT_LOADINDIRECT_U8_end:
+	GO_NEXT();
+
+JIT_LOADINDIRECT_I16_start:
+	OPCODE_USE(JIT_LOADINDIRECT_I16);
+	{
+		PTR pMem = POP_PTR();
+		if (pMem == NULL) {
+			THROW_NULLREF();
+		}
+		PUSH_U32(IsPackedNarrowElement(pMem) ? (U32)(I32)*(I16*)pMem : *(U32*)pMem);
+	}
+JIT_LOADINDIRECT_I16_end:
+	GO_NEXT();
+
 JIT_LOADINDIRECT_U16_start:
+	OPCODE_USE(JIT_LOADINDIRECT_U16);
+	{
+		PTR pMem = POP_PTR();
+		if (pMem == NULL) {
+			THROW_NULLREF();
+		}
+		PUSH_U32(IsPackedNarrowElement(pMem) ? (U32)*(U16*)pMem : *(U32*)pMem);
+	}
+JIT_LOADINDIRECT_U16_end:
+	GO_NEXT();
+
+JIT_LOADINDIRECT_I32_start:
 JIT_LOADINDIRECT_U32_start:
 JIT_LOADINDIRECT_R32_start:
 JIT_LOADINDIRECT_REF_start:
 	OPCODE_USE(JIT_LOADINDIRECT_U32);
 	{
 		PTR pMem = POP_PTR();
-		U32 value = *(U32*)pMem;
+		U32 value;
+		if (pMem == NULL) {
+			THROW_NULLREF();
+		}
+		value = *(U32*)pMem;
 		PUSH_U32(value);
 	}
-JIT_LOADINDIRECT_I8_end:
-JIT_LOADINDIRECT_I16_end:
 JIT_LOADINDIRECT_I32_end:
-JIT_LOADINDIRECT_U8_end:
-JIT_LOADINDIRECT_U16_end:
 JIT_LOADINDIRECT_U32_end:
 JIT_LOADINDIRECT_R32_end:
 JIT_LOADINDIRECT_REF_end:
+	GO_NEXT();
+
+JIT_LOADINDIRECT_I_start:
+	OPCODE_USE(JIT_LOADINDIRECT_I);
+	{
+		PTR pMem = POP_PTR();
+		if (pMem == NULL) {
+			THROW_NULLREF();
+		}
+		PUSH_PTR(*(PTR*)pMem);
+	}
+JIT_LOADINDIRECT_I_end:
 	GO_NEXT();
 
 JIT_LOADINDIRECT_R64_start:
@@ -939,7 +1193,11 @@ JIT_LOADINDIRECT_I64_start:
 	OPCODE_USE(JIT_LOADINDIRECT_I64);
 	{
 		PTR pMem = POP_PTR();
-		U64 value = *(U64*)pMem;
+		U64 value;
+		if (pMem == NULL) {
+			THROW_NULLREF();
+		}
+		value = *(U64*)pMem;
 		PUSH_U64(value);
 	}
 JIT_LOADINDIRECT_R64_end:
@@ -947,19 +1205,69 @@ JIT_LOADINDIRECT_I64_end:
 	GO_NEXT();
 
 JIT_STOREINDIRECT_U8_start:
+	OPCODE_USE(JIT_STOREINDIRECT_U8);
+	{
+		U32 value = POP_U32(); // The value to store
+		PTR pMem = POP_PTR(); // The address to store to
+		if (pMem == NULL) {
+			THROW_NULLREF();
+		}
+		if (IsPackedNarrowElement(pMem)) {
+			*(U8*)pMem = (U8)value;
+		} else {
+			*(U32*)pMem = value;
+		}
+	}
+JIT_STOREINDIRECT_U8_end:
+	GO_NEXT();
+
 JIT_STOREINDIRECT_U16_start:
+	OPCODE_USE(JIT_STOREINDIRECT_U16);
+	{
+		U32 value = POP_U32();
+		PTR pMem = POP_PTR();
+		if (pMem == NULL) {
+			THROW_NULLREF();
+		}
+		if (IsPackedNarrowElement(pMem)) {
+			*(U16*)pMem = (U16)value;
+		} else {
+			*(U32*)pMem = value;
+		}
+	}
+JIT_STOREINDIRECT_U16_end:
+	GO_NEXT();
+
 JIT_STOREINDIRECT_U32_start:
 JIT_STOREINDIRECT_REF_start:
+JIT_STOREINDIRECT_R32_start:
 	OPCODE_USE(JIT_STOREINDIRECT_U32);
 	{
 		U32 value = POP_U32(); // The value to store
 		PTR pMem = POP_PTR(); // The address to store to
+		if (pMem == NULL) {
+			THROW_NULLREF();
+		}
 		*(U32*)pMem = value;
 	}
-JIT_STOREINDIRECT_U8_end:
-JIT_STOREINDIRECT_U16_end:
 JIT_STOREINDIRECT_U32_end:
 JIT_STOREINDIRECT_REF_end:
+JIT_STOREINDIRECT_R32_end:
+	GO_NEXT();
+
+JIT_STOREINDIRECT_U64_start:
+JIT_STOREINDIRECT_R64_start:
+	OPCODE_USE(JIT_STOREINDIRECT_U64);
+	{
+		U64 value = POP_U64();
+		PTR pMem = POP_PTR();
+		if (pMem == NULL) {
+			THROW_NULLREF();
+		}
+		*(U64*)pMem = value;
+	}
+JIT_STOREINDIRECT_U64_end:
+JIT_STOREINDIRECT_R64_end:
 	GO_NEXT();
 
 JIT_STORE_OBJECT_VALUETYPE_start:
@@ -1207,6 +1515,9 @@ JIT_CALL_O_start:
 	goto allCallStart;
 JIT_CALL_INTERFACE_start:
 	op = JIT_CALL_INTERFACE;
+	goto allCallStart;
+JIT_CALLI_start:
+	op = JIT_CALLI;
 allCallStart:
 	OPCODE_USE(JIT_CALL_O);
 	{
@@ -1218,7 +1529,15 @@ allCallStart:
 			pBoxCallType = (tMD_TypeDef*)GET_OP();
 		}
 
-		pCallMethod = (tMD_MethodDef*)GET_OP();
+		if (op == JIT_CALLI) {
+			// calli: the target is a method pointer on top of the stack, above the arguments
+			pCallMethod = (tMD_MethodDef*)POP_PTR();
+			if (pCallMethod == NULL) {
+				THROW_NULLREF();
+			}
+		} else {
+			pCallMethod = (tMD_MethodDef*)GET_OP();
+		}
 		heapPtr = NULL;
 
 		if (op == JIT_BOX_CALLVIRT) {
@@ -1291,6 +1610,7 @@ JIT_CALL_PTR_end:
 JIT_CALLVIRT_O_end:
 JIT_CALL_O_end:
 JIT_CALL_INTERFACE_end:
+JIT_CALLI_end:
 	GO_NEXT_CHECK();
 
 JIT_BRANCH_start:
@@ -1746,6 +2066,62 @@ JIT_BLT_UN_I32I32_start:
 JIT_BLT_UN_I32I32_end:
 	GO_NEXT_CHECK();
 
+JIT_BGE_UN_I64I64_start:
+	OPCODE_USE(JIT_BGE_UN_I64I64);
+	{
+		U64 v1, v2;
+		U32 ofs;
+		POP_U64_U64(v1, v2);
+		ofs = GET_OP();
+		if (v1 >= v2) {
+			pCurOp = pOps + ofs;
+		}
+	}
+JIT_BGE_UN_I64I64_end:
+	GO_NEXT_CHECK();
+
+JIT_BGT_UN_I64I64_start:
+	OPCODE_USE(JIT_BGT_UN_I64I64);
+	{
+		U64 v1, v2;
+		U32 ofs;
+		POP_U64_U64(v1, v2);
+		ofs = GET_OP();
+		if (v1 > v2) {
+			pCurOp = pOps + ofs;
+		}
+	}
+JIT_BGT_UN_I64I64_end:
+	GO_NEXT_CHECK();
+
+JIT_BLE_UN_I64I64_start:
+	OPCODE_USE(JIT_BLE_UN_I64I64);
+	{
+		U64 v1, v2;
+		U32 ofs;
+		POP_U64_U64(v1, v2);
+		ofs = GET_OP();
+		if (v1 <= v2) {
+			pCurOp = pOps + ofs;
+		}
+	}
+JIT_BLE_UN_I64I64_end:
+	GO_NEXT_CHECK();
+
+JIT_BLT_UN_I64I64_start:
+	OPCODE_USE(JIT_BLT_UN_I64I64);
+	{
+		U64 v1, v2;
+		U32 ofs;
+		POP_U64_U64(v1, v2);
+		ofs = GET_OP();
+		if (v1 < v2) {
+			pCurOp = pOps + ofs;
+		}
+	}
+JIT_BLT_UN_I64I64_end:
+	GO_NEXT_CHECK();
+
 JIT_CEQ_I32I32_start: // Handles I32 and O
 	OPCODE_USE(JIT_CEQ_I32I32);
 	BINARY_OP(U32, U32, U32, ==);
@@ -1816,6 +2192,49 @@ JIT_CEQ_F64F64_start:
 	OPCODE_USE(JIT_CEQ_F64F64);
 	BINARY_OP(U32, double, double, ==);
 JIT_CEQ_F64F64_end:
+	GO_NEXT();
+
+// cgt.un / clt.un on floating point mean "greater / less than, OR UNORDERED" (either operand NaN),
+// i.e. !(a <= b) and !(a >= b). C# uses them to build `a <= b` and `a >= b` as values
+// (cgt.un; ldc.i4.0; ceq), which is how the opcodes are reached when not fused into a branch.
+JIT_CGT_UN_F32F32_start:
+	OPCODE_USE(JIT_CGT_UN_F32F32);
+	{
+		float v1, v2;
+		POP_F32_F32(v1, v2);
+		PUSH_U32(!(v1 <= v2));
+	}
+JIT_CGT_UN_F32F32_end:
+	GO_NEXT();
+
+JIT_CLT_UN_F32F32_start:
+	OPCODE_USE(JIT_CLT_UN_F32F32);
+	{
+		float v1, v2;
+		POP_F32_F32(v1, v2);
+		PUSH_U32(!(v1 >= v2));
+	}
+JIT_CLT_UN_F32F32_end:
+	GO_NEXT();
+
+JIT_CGT_UN_F64F64_start:
+	OPCODE_USE(JIT_CGT_UN_F64F64);
+	{
+		double v1, v2;
+		POP_F64_F64(v1, v2);
+		PUSH_U32(!(v1 <= v2));
+	}
+JIT_CGT_UN_F64F64_end:
+	GO_NEXT();
+
+JIT_CLT_UN_F64F64_start:
+	OPCODE_USE(JIT_CLT_UN_F64F64);
+	{
+		double v1, v2;
+		POP_F64_F64(v1, v2);
+		PUSH_U32(!(v1 >= v2));
+	}
+JIT_CLT_UN_F64F64_end:
 	GO_NEXT();
 
 JIT_CGT_F32F32_start:
@@ -1976,7 +2395,9 @@ JIT_SUB_I64I64_end:
 
 JIT_SUB_F32F32_start:
 	OPCODE_USE(JIT_SUB_F32F32);
-	BINARY_OP(double, double, double, -);
+	// Was BINARY_OP(double, double, double, -): it read two 8-byte doubles from a stack holding
+	// two 4-byte floats, so every float subtraction was wrong and moved the stack by 4 bytes too much.
+	BINARY_OP(float, float, float, -);
 JIT_SUB_F32F32_end:
 	GO_NEXT();
 
@@ -2012,13 +2433,35 @@ JIT_MUL_F64F64_end:
 
 JIT_DIV_I32I32_start:
 	OPCODE_USE(JIT_DIV_I32I32);
-	BINARY_OP(I32, I32, I32, /);
+	{
+		I32 v1, v2;
+		POP_U32_U32(v1, v2);
+		if (v2 == 0) {
+			THROW(types[TYPE_SYSTEM_DIVIDEBYZEROEXCEPTION]);
+		}
+		if (v2 == -1 && v1 == (I32)0x80000000) {
+			// MinValue / -1 (or % -1) overflows
+			THROW(types[TYPE_SYSTEM_OVERFLOWEXCEPTION]);
+		}
+		PUSH_U32(v1 / v2);
+	}
 JIT_DIV_I32I32_end:
 	GO_NEXT();
 
 JIT_DIV_I64I64_start:
 	OPCODE_USE(JIT_DIV_I64I64);
-	BINARY_OP(I64, I64, I64, /);
+	{
+		I64 v1, v2;
+		POP_U64_U64(v1, v2);
+		if (v2 == 0) {
+			THROW(types[TYPE_SYSTEM_DIVIDEBYZEROEXCEPTION]);
+		}
+		if (v2 == -1 && v1 == (I64)0x8000000000000000ULL) {
+			// MinValue / -1 (or % -1) overflows
+			THROW(types[TYPE_SYSTEM_OVERFLOWEXCEPTION]);
+		}
+		PUSH_U64(v1 / v2);
+	}
 JIT_DIV_I64I64_end:
 	GO_NEXT();
 
@@ -2036,37 +2479,209 @@ JIT_DIV_F64F64_end:
 
 JIT_DIV_UN_I32I32_start:
 	OPCODE_USE(JIT_DIV_UN_I32I32);
-	BINARY_OP(U32, U32, U32, /);
+	{
+		U32 v1, v2;
+		POP_U32_U32(v1, v2);
+		if (v2 == 0) {
+			THROW(types[TYPE_SYSTEM_DIVIDEBYZEROEXCEPTION]);
+		}
+		PUSH_U32(v1 / v2);
+	}
 JIT_DIV_UN_I32I32_end:
 	GO_NEXT();
 
 JIT_DIV_UN_I64I64_start:
 	OPCODE_USE(JIT_DIV_UN_I64I64);
-	BINARY_OP(U64, U64, U64, /);
+	{
+		U64 v1, v2;
+		POP_U64_U64(v1, v2);
+		if (v2 == 0) {
+			THROW(types[TYPE_SYSTEM_DIVIDEBYZEROEXCEPTION]);
+		}
+		PUSH_U64(v1 / v2);
+	}
 JIT_DIV_UN_I64I64_end:
 	GO_NEXT();
 
 JIT_REM_I32I32_start:
 	OPCODE_USE(JIT_REM_I32I32);
-	BINARY_OP(I32, I32, I32, %);
+	{
+		I32 v1, v2;
+		POP_U32_U32(v1, v2);
+		if (v2 == 0) {
+			THROW(types[TYPE_SYSTEM_DIVIDEBYZEROEXCEPTION]);
+		}
+		if (v2 == -1 && v1 == (I32)0x80000000) {
+			// MinValue / -1 (or % -1) overflows
+			THROW(types[TYPE_SYSTEM_OVERFLOWEXCEPTION]);
+		}
+		PUSH_U32(v1 % v2);
+	}
 JIT_REM_I32I32_end:
 	GO_NEXT();
 
 JIT_REM_I64I64_start:
 	OPCODE_USE(JIT_REM_I64I64);
-	BINARY_OP(I64, I64, I64, %);
+	{
+		I64 v1, v2;
+		POP_U64_U64(v1, v2);
+		if (v2 == 0) {
+			THROW(types[TYPE_SYSTEM_DIVIDEBYZEROEXCEPTION]);
+		}
+		if (v2 == -1 && v1 == (I64)0x8000000000000000ULL) {
+			// MinValue / -1 (or % -1) overflows
+			THROW(types[TYPE_SYSTEM_OVERFLOWEXCEPTION]);
+		}
+		PUSH_U64(v1 % v2);
+	}
 JIT_REM_I64I64_end:
+	GO_NEXT();
+
+JIT_ADD_OVF_I64I64_start:
+	OPCODE_USE(JIT_ADD_OVF_I64I64);
+	{
+		U64 v1, v2;
+		I64 res;
+		POP_U64_U64(v1, v2);
+		if (AddOvfI64((I64)v1, (I64)v2, &res)) {
+			// Overflowed, so throw exception
+			THROW(types[TYPE_SYSTEM_OVERFLOWEXCEPTION]);
+		}
+		PUSH_U64((U64)res);
+	}
+JIT_ADD_OVF_I64I64_end:
+	GO_NEXT();
+
+JIT_ADD_OVF_UN_I64I64_start:
+	OPCODE_USE(JIT_ADD_OVF_UN_I64I64);
+	{
+		U64 v1, v2;
+		U64 res;
+		POP_U64_U64(v1, v2);
+		if (AddOvfU64((U64)v1, (U64)v2, &res)) {
+			// Overflowed, so throw exception
+			THROW(types[TYPE_SYSTEM_OVERFLOWEXCEPTION]);
+		}
+		PUSH_U64((U64)res);
+	}
+JIT_ADD_OVF_UN_I64I64_end:
+	GO_NEXT();
+
+JIT_SUB_OVF_I64I64_start:
+	OPCODE_USE(JIT_SUB_OVF_I64I64);
+	{
+		U64 v1, v2;
+		I64 res;
+		POP_U64_U64(v1, v2);
+		if (SubOvfI64((I64)v1, (I64)v2, &res)) {
+			// Overflowed, so throw exception
+			THROW(types[TYPE_SYSTEM_OVERFLOWEXCEPTION]);
+		}
+		PUSH_U64((U64)res);
+	}
+JIT_SUB_OVF_I64I64_end:
+	GO_NEXT();
+
+JIT_SUB_OVF_UN_I64I64_start:
+	OPCODE_USE(JIT_SUB_OVF_UN_I64I64);
+	{
+		U64 v1, v2;
+		U64 res;
+		POP_U64_U64(v1, v2);
+		if (SubOvfU64((U64)v1, (U64)v2, &res)) {
+			// Overflowed, so throw exception
+			THROW(types[TYPE_SYSTEM_OVERFLOWEXCEPTION]);
+		}
+		PUSH_U64((U64)res);
+	}
+JIT_SUB_OVF_UN_I64I64_end:
+	GO_NEXT();
+
+JIT_MUL_OVF_I64I64_start:
+	OPCODE_USE(JIT_MUL_OVF_I64I64);
+	{
+		U64 v1, v2;
+		I64 res;
+		POP_U64_U64(v1, v2);
+		if (MulOvfI64((I64)v1, (I64)v2, &res)) {
+			// Overflowed, so throw exception
+			THROW(types[TYPE_SYSTEM_OVERFLOWEXCEPTION]);
+		}
+		PUSH_U64((U64)res);
+	}
+JIT_MUL_OVF_I64I64_end:
+	GO_NEXT();
+
+JIT_MUL_OVF_UN_I64I64_start:
+	OPCODE_USE(JIT_MUL_OVF_UN_I64I64);
+	{
+		U64 v1, v2;
+		U64 res;
+		POP_U64_U64(v1, v2);
+		if (MulOvfU64((U64)v1, (U64)v2, &res)) {
+			// Overflowed, so throw exception
+			THROW(types[TYPE_SYSTEM_OVERFLOWEXCEPTION]);
+		}
+		PUSH_U64((U64)res);
+	}
+JIT_MUL_OVF_UN_I64I64_end:
+	GO_NEXT();
+
+JIT_REM_F32F32_start:
+	OPCODE_USE(JIT_REM_F32F32);
+	{
+		float v2 = STACK_ADDR(float);
+		pCurEvalStack -= sizeof(float);
+		STACK_ADDR(float) = fmodf(STACK_ADDR(float), v2);
+	}
+JIT_REM_F32F32_end:
+	GO_NEXT();
+
+JIT_REM_F64F64_start:
+	OPCODE_USE(JIT_REM_F64F64);
+	{
+		double v2 = STACK_ADDR(double);
+		pCurEvalStack -= sizeof(double);
+		STACK_ADDR(double) = fmod(STACK_ADDR(double), v2);
+	}
+JIT_REM_F64F64_end:
+	GO_NEXT();
+
+JIT_CONV_OVF_CHECK_start:
+	OPCODE_USE(JIT_CONV_OVF_CHECK);
+	{
+		U32 param = GET_OP();
+		if (!ConvOvfFits(param & 0xff, param >> 8, pCurEvalStack)) {
+			// Does not fit the destination type, so throw exception
+			THROW(types[TYPE_SYSTEM_OVERFLOWEXCEPTION]);
+		}
+	}
+JIT_CONV_OVF_CHECK_end:
 	GO_NEXT();
 
 JIT_REM_UN_I32I32_start:
 	OPCODE_USE(JIT_REM_UN_I32I32);
-	BINARY_OP(U32, U32, U32, %);
+	{
+		U32 v1, v2;
+		POP_U32_U32(v1, v2);
+		if (v2 == 0) {
+			THROW(types[TYPE_SYSTEM_DIVIDEBYZEROEXCEPTION]);
+		}
+		PUSH_U32(v1 % v2);
+	}
 JIT_REM_UN_I32I32_end:
 	GO_NEXT();
 
 JIT_REM_UN_I64I64_start:
 	OPCODE_USE(JIT_REM_UN_I64I64);
-	BINARY_OP(U64, U64, U64, %);
+	{
+		U64 v1, v2;
+		POP_U64_U64(v1, v2);
+		if (v2 == 0) {
+			THROW(types[TYPE_SYSTEM_DIVIDEBYZEROEXCEPTION]);
+		}
+		PUSH_U64(v1 % v2);
+	}
 JIT_REM_UN_I64I64_end:
 	GO_NEXT();
 
@@ -2116,6 +2731,49 @@ JIT_NEG_I64_start:
 	OPCODE_USE(JIT_NEG_I64);
 	UNARY_OP(I64, -);
 JIT_NEG_I64_end:
+	GO_NEXT();
+
+JIT_NEG_F32_start:
+	OPCODE_USE(JIT_NEG_F32);
+	UNARY_OP(float, -);
+JIT_NEG_F32_end:
+	GO_NEXT();
+
+JIT_NEG_F64_start:
+	OPCODE_USE(JIT_NEG_F64);
+	UNARY_OP(double, -);
+JIT_NEG_F64_end:
+	GO_NEXT();
+
+JIT_COPYOBJECT_start:
+	OPCODE_USE(JIT_COPYOBJECT);
+	{
+		tMD_TypeDef *pCpType = (tMD_TypeDef*)GET_OP();
+		PTR pSrc = POP_PTR();
+		PTR pDst = POP_PTR();
+		if (pSrc == NULL || pDst == NULL) {
+			THROW_NULLREF();
+		}
+		CopyObject(pCpType, pDst, pSrc);
+	}
+JIT_COPYOBJECT_end:
+	GO_NEXT();
+
+JIT_CKFINITE_F32_start:
+	OPCODE_USE(JIT_CKFINITE_F32);
+	if (!isfinite(STACK_ADDR(float))) {
+		// NaN or infinity. The reference runtimes throw OverflowException here.
+		THROW(types[TYPE_SYSTEM_OVERFLOWEXCEPTION]);
+	}
+JIT_CKFINITE_F32_end:
+	GO_NEXT();
+
+JIT_CKFINITE_F64_start:
+	OPCODE_USE(JIT_CKFINITE_F64);
+	if (!isfinite(STACK_ADDR(double))) {
+		THROW(types[TYPE_SYSTEM_OVERFLOWEXCEPTION]);
+	}
+JIT_CKFINITE_F64_end:
 	GO_NEXT();
 
 JIT_NOT_I32_start:
@@ -2385,7 +3043,9 @@ JIT_CONV_R64_U32_end:
 JIT_CONV_R64_I64_start:
 	OPCODE_USE(JIT_CONV_R64_I64);
 	{
-		float value = POP_FLOAT();
+		// Was `float value = POP_FLOAT();` (copied from the R32 version): it popped 4 bytes of an
+		// 8-byte double, converted the wrong half, and left the stack 4 bytes out.
+		double value = POP_DOUBLE();
 		PUSH_U64((I64)value);
 	}
 JIT_CONV_R64_I64_end:
@@ -2417,6 +3077,104 @@ JIT_LOADFUNCTION_start:
 		PUSH_U32(value);
 	}
 JIT_LOADFUNCTION_end:
+	GO_NEXT();
+
+JIT_LOADVIRTFUNCTION_start:
+	OPCODE_USE(JIT_LOADVIRTFUNCTION);
+	{
+		tMD_MethodDef *pVirtMethod = (tMD_MethodDef*)GET_OP();
+		HEAP_PTR pObj = POP_O();
+		tMD_MethodDef *pResolved;
+		if (pObj == NULL) {
+			THROW_NULLREF();
+		}
+		pResolved = ResolveVirtualMethod(pVirtMethod, Heap_GetType(pObj));
+		if (pResolved == NULL) {
+			THROW(types[TYPE_SYSTEM_INVALIDCASTEXCEPTION]);
+		}
+		PUSH_PTR(pResolved);
+	}
+JIT_LOADVIRTFUNCTION_end:
+	GO_NEXT();
+
+// A TypedReference is two pointers on the stack: the address, then the type.
+JIT_MKREFANY_start:
+	OPCODE_USE(JIT_MKREFANY);
+	{
+		tMD_TypeDef *pRefType = (tMD_TypeDef*)GET_OP();
+		PTR pAddr = POP_PTR();
+		PUSH_PTR(pAddr);
+		PUSH_PTR((PTR)pRefType);
+	}
+JIT_MKREFANY_end:
+	GO_NEXT();
+
+JIT_REFANYVAL_start:
+	OPCODE_USE(JIT_REFANYVAL);
+	{
+		tMD_TypeDef *pWanted = (tMD_TypeDef*)GET_OP();
+		tMD_TypeDef *pHeld = (tMD_TypeDef*)POP_PTR();
+		PTR pAddr = POP_PTR();
+		if (pHeld != pWanted) {
+			// the reference was made for a different type
+			THROW(types[TYPE_SYSTEM_INVALIDCASTEXCEPTION]);
+		}
+		PUSH_PTR(pAddr);
+	}
+JIT_REFANYVAL_end:
+	GO_NEXT();
+
+JIT_REFANYTYPE_start:
+	OPCODE_USE(JIT_REFANYTYPE);
+	{
+		PTR pType = POP_PTR();
+		(void)POP_PTR();
+		PUSH_PTR(pType);
+	}
+JIT_REFANYTYPE_end:
+	GO_NEXT();
+
+JIT_JMP_COPYARGS_start:
+	OPCODE_USE(JIT_JMP_COPYARGS);
+	{
+		// Arguments sit in the frame laid out exactly as they sit on the evaluation stack
+		U32 size = pCurrentMethodState->pMethod->parameterStackSize;
+		memcpy(pCurEvalStack, pParamsLocals, size);
+		pCurEvalStack += size;
+	}
+JIT_JMP_COPYARGS_end:
+	GO_NEXT();
+
+JIT_CPBLK_start:
+	OPCODE_USE(JIT_CPBLK);
+	{
+		U32 count = POP_U32();
+		PTR pSrc = POP_PTR();
+		PTR pDst = POP_PTR();
+		if (count != 0) {
+			if (pSrc == NULL || pDst == NULL) {
+				THROW_NULLREF();
+			}
+			memmove(pDst, pSrc, count);
+		}
+	}
+JIT_CPBLK_end:
+	GO_NEXT();
+
+JIT_INITBLK_start:
+	OPCODE_USE(JIT_INITBLK);
+	{
+		U32 count = POP_U32();
+		U32 value = POP_U32();
+		PTR pDst = POP_PTR();
+		if (count != 0) {
+			if (pDst == NULL) {
+				THROW_NULLREF();
+			}
+			memset(pDst, (int)(value & 0xff), count);
+		}
+	}
+JIT_INITBLK_end:
 	GO_NEXT();
 
 JIT_LOADOBJECT_start:
@@ -2735,6 +3493,9 @@ JIT_STOREFIELD_F32_start:
 		pFieldDef = (tMD_FieldDef*)GET_OP();
 		value = POP_U32();
 		heapPtr = POP_O();
+		if (heapPtr == NULL) {
+			THROW_NULLREF();
+		}
 		pMem = heapPtr + pFieldDef->memOffset;
 		*(U32*)pMem = value;
 	}
@@ -2757,6 +3518,9 @@ JIT_STOREFIELD_F64_start:
 		pFieldDef = (tMD_FieldDef*)GET_OP();
 		value = POP_U64();
 		heapPtr = POP_O();
+		if (heapPtr == NULL) {
+			THROW_NULLREF();
+		}
 		pMem = heapPtr + pFieldDef->memOffset;
 		*(U64*)pMem = value;
 	}
@@ -2774,6 +3538,9 @@ JIT_STOREFIELD_VALUETYPE_start:
 		pCurEvalStack -= pFieldDef->memSize;
 		pMem = pCurEvalStack;
 		heapPtr = POP_O();
+		if (heapPtr == NULL) {
+			THROW_NULLREF();
+		}
 		memcpy(heapPtr + pFieldDef->memOffset, pMem, pFieldDef->memSize);
 	}
 JIT_STOREFIELD_VALUETYPE_end:
@@ -2787,6 +3554,9 @@ JIT_LOADFIELD_start:
 
 		pFieldDef = (tMD_FieldDef*)GET_OP();
 		heapPtr = POP_O();
+		if (heapPtr == NULL) {
+			THROW_NULLREF();
+		}
 		pMem = heapPtr + pFieldDef->memOffset;
 		// It may not be a value-type, but this'll work anyway
 		PUSH_VALUETYPE(pMem, pFieldDef->memSize, pFieldDef->memSize);
@@ -2799,6 +3569,9 @@ JIT_LOADFIELD_4_start:
 	{
 		U32 ofs = GET_OP();
 		PTR heapPtr = POP_O();
+		if (heapPtr == NULL) {
+			THROW_NULLREF();
+		}
 		PUSH_U32(*(U32*)(heapPtr + ofs));
 	}
 JIT_LOADFIELD_4_end:
@@ -2833,6 +3606,9 @@ JIT_LOAD_FIELD_ADDR_start:
 	{
 		U32 ofs = GET_OP();
 		HEAP_PTR heapPtr = POP_O();
+		if (heapPtr == NULL) {
+			THROW_NULLREF();
+		}
 		PTR pMem = heapPtr + ofs;
 		PUSH_PTR(pMem);
 	}
@@ -3060,14 +3836,36 @@ JIT_BOX_NULLABLE_end:
 JIT_UNBOX2VALUETYPE_start:
 	OPCODE_USE(JIT_UNBOX2VALUETYPE);
 	{
-		tMD_TypeDef *pTypeDef;
-		HEAP_PTR heapPtr;
-
-		heapPtr = POP_O();
-		pTypeDef = Heap_GetType(heapPtr);
-		PUSH_VALUETYPE(heapPtr, pTypeDef->stackSize, pTypeDef->stackSize);
+		// unbox.any of a value type. This used to take the size from the object's own type with no
+		// checks, so null crashed and a wrongly-typed object was silently reinterpreted.
+		tMD_TypeDef *pExpected = (tMD_TypeDef*)GET_OP();
+		HEAP_PTR pBoxed = POP_O();
+		if (pBoxed == NULL) {
+			THROW_NULLREF();
+		}
+		if (!UnboxCompatible(pExpected, Heap_GetType(pBoxed))) {
+			THROW(types[TYPE_SYSTEM_INVALIDCASTEXCEPTION]);
+		}
+		PUSH_VALUETYPE(pBoxed, pExpected->stackSize, pExpected->stackSize);
 	}
 JIT_UNBOX2VALUETYPE_end:
+	GO_NEXT();
+
+JIT_UNBOX_start:
+	OPCODE_USE(JIT_UNBOX);
+	{
+		tMD_TypeDef *pExpected = (tMD_TypeDef*)GET_OP();
+		HEAP_PTR pBoxed = POP_O();
+		if (pBoxed == NULL) {
+			THROW_NULLREF();
+		}
+		if (!UnboxCompatible(pExpected, Heap_GetType(pBoxed))) {
+			THROW(types[TYPE_SYSTEM_INVALIDCASTEXCEPTION]);
+		}
+		// the value lives at the start of the box's memory
+		PUSH_PTR(pBoxed);
+	}
+JIT_UNBOX_end:
 	GO_NEXT();
 
 JIT_UNBOX_NULLABLE_start:
@@ -3123,74 +3921,155 @@ JIT_THROW_start:
 	op = JIT_THROW;
 throwStart:
 	OPCODE_USE(JIT_THROW);
+	// Get the exception object
+	if (op == JIT_RETHROW) {
+		heapPtr = pThread->pCurrentExceptionObject;
+	} else {
+		heapPtr = POP_O();
+throwHeapPtr:
+		pThread->pCurrentExceptionObject = heapPtr;
+	}
+	SAVE_METHOD_STATE();
+	// A new search starts in the frame that threw. If a filter is running, the exception is one
+	// thrown from inside it, and nothing outside that filter's own call chain may handle it.
+	pThread->pThrowTopState = pCurrentMethodState;
+	pThread->pSearchFrame = pCurrentMethodState;
+	pThread->searchNextClause = 0;
+	pThread->searchInFilter = (pThread->numFilters > 0);
+
+	// ---- First pass: find the handler. Walks the frames from the throwing one down, in each testing
+	// the clauses that cover where the frame is. A filter clause means running the filter's code to
+	// get its verdict: the search then stops here and is resumed by endfilter (JIT_ENDFILTER), which
+	// is why where it has got to lives in the thread rather than in locals.
+searchHandlers:
 	{
-		U32 i;
+		U32 i, startClause;
+		tMethodState *pFrame;
 		tExceptionHeader *pCatch;
-		tMethodState *pCatchMethodState;
 		tMD_TypeDef *pExType;
 
-		// Get the exception object
-		if (op == JIT_RETHROW) {
-			heapPtr = pThread->pCurrentExceptionObject;
-		} else {
-			heapPtr = POP_O();
-throwHeapPtr:
-			pThread->pCurrentExceptionObject = heapPtr;
-		}
-		SAVE_METHOD_STATE();
-		pExType = Heap_GetType(heapPtr);
-		// Find any catch exception clauses; look in the complete call stack
+		pExType = Heap_GetType(pThread->pCurrentExceptionObject);
 		pCatch = NULL;
-		pCatchMethodState = pCurrentMethodState;
+		pFrame = pThread->pSearchFrame;
+		startClause = pThread->searchNextClause;
 		for(;;) {
-			for (i=0; i<pCatchMethodState->pMethod->pJITted->numExceptionHandlers; i++) {
-				tExceptionHeader *pEx = &pCatchMethodState->pMethod->pJITted->pExceptionHeaders[i];
-				if (pEx->flags == COR_ILEXCEPTION_CLAUSE_EXCEPTION &&
-					pCatchMethodState->ipOffset - 1 >= pEx->tryStart &&
-					pCatchMethodState->ipOffset - 1 < pEx->tryEnd &&
-					Type_IsDerivedFromOrSame(pEx->u.pCatchTypeDef, pExType)) {
-					
-					// Found the correct catch clause to jump to
-					pCatch = pEx;
-					break;
+			if (pThread->searchInFilter && pFrame == pThread->pFilterCtx[pThread->numFilters - 1].pFrame) {
+				// Reached the frame running the filter that this exception came out of, and nothing
+				// in between handled it: the filter threw, which counts as it answering "no".
+				// (Unwinding to the filter's frame, with a NULL handler, means exactly that.)
+				pThread->pCatchMethodState = pFrame;
+				pThread->pCatchExceptionHandler = NULL;
+				pThread->nextFinallyUnwindStack = 0;
+				goto unwindToHandler;
+			}
+			for (i=startClause; i<pFrame->pMethod->pJITted->numExceptionHandlers; i++) {
+				tExceptionHeader *pEx = &pFrame->pMethod->pJITted->pExceptionHeaders[i];
+				if (pFrame->ipOffset - 1 >= pEx->tryStart && pFrame->ipOffset - 1 < pEx->tryEnd) {
+					if (pEx->flags == COR_ILEXCEPTION_CLAUSE_EXCEPTION &&
+						Type_IsDerivedFromOrSame(pEx->u.pCatchTypeDef, pExType)) {
+						// Found the correct catch clause to jump to
+						pCatch = pEx;
+						break;
+					}
+					if (pEx->flags == COR_ILEXCEPTION_CLAUSE_FILTER) {
+						// Run the filter code in this frame, with just the exception on its stack,
+						// leaving the frames above (which still have finally blocks to run) alone.
+						tFilterCtx *pCtx;
+						if (pThread->numFilters >= MAX_ACTIVE_FILTERS) {
+							Crash("Exception filters nested more than %d deep", MAX_ACTIVE_FILTERS);
+						}
+						if (pThread->pFilterCtx == NULL) {
+							pThread->pFilterCtx = (tFilterCtx*)malloc(MAX_ACTIVE_FILTERS * sizeof(tFilterCtx));
+						}
+						pCtx = &pThread->pFilterCtx[pThread->numFilters++];
+						pCtx->pTopState = pThread->pThrowTopState;
+						pCtx->pFrame = pFrame;
+						pCtx->clause = i;
+						pCtx->savedIp = pFrame->ipOffset;
+						pCtx->savedStackOfs = pFrame->stackOfs;
+						pCtx->savedException = pThread->pCurrentExceptionObject;
+						pCtx->outerSearchInFilter = pThread->searchInFilter;
+						pFrame->stackOfs = 0;
+						pFrame->ipOffset = pEx->u.filterOffset;
+						pThread->pCurrentMethodState = pFrame;
+						LOAD_METHOD_STATE();
+						PUSH_O(pThread->pCurrentExceptionObject);
+						goto throwEnd;
+					}
 				}
 			}
 			if (pCatch != NULL) {
 				// Found a suitable exception handler
 				break;
 			}
-			pCatchMethodState = pCatchMethodState->pCaller;
-			if (pCatchMethodState == NULL) {
+			pFrame = pFrame->pCaller;
+			startClause = 0;
+			if (pFrame == NULL) {
 				Crash("Unhandled exception in %s.%s(): %s.%s",
 					pCurrentMethodState->pMethod->pParentType->name,
 					pCurrentMethodState->pMethod->name, pExType->nameSpace, pExType->name);
 			}
 		}
-		// Unwind the stack down to the exception handler's stack frame (MethodState)
-		// Run all finally clauses during unwinding
-		pThread->pCatchMethodState = pCatchMethodState;
+		pThread->pCatchMethodState = pFrame;
 		pThread->pCatchExceptionHandler = pCatch;
-		// Have to use the pThread->pCatchMethodState, as we could be getting here from END_FINALLY
-		while (pCurrentMethodState != pThread->pCatchMethodState) {
+		pThread->nextFinallyUnwindStack = 0;
+	}
+
+	// ---- Second pass: unwind the stack down to the handler's frame, running the finally and fault
+	// clauses on the way, then enter the handler. Resumed by END_FINALLY after each such block, so
+	// it works from pThread->pCatchMethodState and not from locals.
+unwindToHandler:
+	{
+		U32 i;
+
+		// This loop also visits the catching frame itself. There, only the finally clauses that
+		// come *before* the matching catch in the exception table are run: the table lists
+		// nested clauses before the ones enclosing them, so those are the finally blocks sitting
+		// inside the catch's try block (they must run before the catch handler), whereas a
+		// finally attached to the same try as the catch comes after it and runs later, at LEAVE.
+		// Without this, `try { try { throw } finally { A } } catch { C }` in one method skipped A.
+		// NB: no initialisers on these declarations; `goto finallyUnwindStack` jumps past them.
+		for (;;) {
 			tMethodState *pPrevState;
+			U32 finallyLimit;
 
 finallyUnwindStack:
-			for (i=pThread->nextFinallyUnwindStack; i<pCurrentMethodState->pMethod->pJITted->numExceptionHandlers; i++) {
+			// (A NULL handler is a filter that threw: its frame has no clause to stop short of.)
+			finallyLimit = (pCurrentMethodState == pThread->pCatchMethodState)
+				? ((pThread->pCatchExceptionHandler != NULL)
+					? (U32)(pThread->pCatchExceptionHandler - pCurrentMethodState->pMethod->pJITted->pExceptionHeaders)
+					: 0)
+				: pCurrentMethodState->pMethod->pJITted->numExceptionHandlers;
+			for (i=pThread->nextFinallyUnwindStack; i<finallyLimit; i++) {
 				tExceptionHeader *pEx;
 
 				pEx = &pCurrentMethodState->pMethod->pJITted->pExceptionHeaders[i];
-				if (pEx->flags == COR_ILEXCEPTION_CLAUSE_FINALLY &&
+				if ((pEx->flags == COR_ILEXCEPTION_CLAUSE_FINALLY || pEx->flags == COR_ILEXCEPTION_CLAUSE_FAULT) &&
 					pCurrentMethodState->ipOffset - 1 >= pEx->tryStart &&
 					pCurrentMethodState->ipOffset - 1 < pEx->tryEnd) {
 
-					// Found a finally handler
-					POP_ALL();
-					CHANGE_METHOD_STATE(pCurrentMethodState);
+					// Found a finally (or fault) handler. Make this frame the thread's current one, empty
+					// its evaluation stack, point it at the handler, and only then load: the order
+					// matters, because LOAD_METHOD_STATE derives pCurOp from ipOffset. (This used
+					// to CHANGE_METHOD_STATE first and set ipOffset afterwards, so the handler
+					// address was written after pCurOp had been computed and the finally block
+					// never ran; and its SAVE half stored the innermost frame's op pointer into
+					// a caller's frame state when unwinding more than one frame.)
+					pThread->pCurrentMethodState = pCurrentMethodState;
+					pCurrentMethodState->stackOfs = 0;
 					pCurrentMethodState->ipOffset = pEx->handlerStart;
+					LOAD_METHOD_STATE();
 					// Keep track of which finally clause should be executed next
 					pThread->nextFinallyUnwindStack = i + 1;
 					goto throwEnd;
 				}
+			}
+
+			if (pCurrentMethodState == pThread->pCatchMethodState) {
+				// Reached the catching frame with every nested finally run. Clear the tracker so a
+				// later, ordinary END_FINALLY isn't mistaken for part of this unwind.
+				pThread->nextFinallyUnwindStack = 0;
+				break;
 			}
 
 			pPrevState = pCurrentMethodState->pCaller;
@@ -3199,9 +4078,33 @@ finallyUnwindStack:
 			// Reset the stack unwind tracker
 			pThread->nextFinallyUnwindStack = 0;
 		}
+
+		if (pThread->pCatchExceptionHandler == NULL) {
+			// The unwind was of an exception thrown inside a filter, ending at the filter's frame:
+			// the filter answers "no". Put everything back as it was when the filter began, and
+			// carry on looking for the handler of the exception being filtered, after this clause.
+			tFilterCtx *pCtx = &pThread->pFilterCtx[--pThread->numFilters];
+			pCtx->pFrame->ipOffset = pCtx->savedIp;
+			pCtx->pFrame->stackOfs = pCtx->savedStackOfs;
+			pThread->pCurrentExceptionObject = pCtx->savedException;
+			pThread->pThrowTopState = pCtx->pTopState;
+			pThread->searchInFilter = pCtx->outerSearchInFilter;
+			pThread->pSearchFrame = pCtx->pFrame;
+			pThread->searchNextClause = pCtx->clause + 1;
+			pThread->pCurrentMethodState = pCtx->pTopState;
+			LOAD_METHOD_STATE();
+			goto searchHandlers;
+		}
+
 		// Set the IP to the catch handler
 		pCurrentMethodState->ipOffset = pThread->pCatchExceptionHandler->handlerStart;
-		// Set the current method state
+		// Set the current method state. The unwind loop above only advanced the local
+		// pCurrentMethodState; LOAD_METHOD_STATE reloads from the thread, so without this it
+		// restored the (already deleted) frame that threw. That "worked" for a one-frame unwind
+		// only because that frame's leftover `ret` then returned into the catching frame, and
+		// ran off the end of the opcode stream for anything deeper. It also left the GC walking
+		// dead frames when it scanned for roots.
+		pThread->pCurrentMethodState = pCurrentMethodState;
 		LOAD_METHOD_STATE();
 		// Push onto this stack-frame's evaluation stack the opject thrown
 		POP_ALL();
@@ -3210,6 +4113,49 @@ finallyUnwindStack:
 throwEnd:
 JIT_THROW_end:
 JIT_RETHROW_end:
+	GO_NEXT_CHECK();
+
+throwNullRef:
+	throwEx = types[TYPE_SYSTEM_NULLREFERENCEEXCEPTION];
+throwTyped:
+	heapPtr = Heap_AllocType(throwEx);
+	goto throwHeapPtr;
+
+JIT_ENDFILTER_start:
+	OPCODE_USE(JIT_ENDFILTER);
+	{
+		// The filter's verdict is on the stack. Put the filter's frame back as it was when the filter
+		// began, return to the frame that threw, and either start unwinding to the handler this filter
+		// guards (nonzero) or resume the search at the next clause (zero).
+		U32 verdict = POP_U32();
+		tFilterCtx *pCtx;
+		tMethodState *pFilterFrame;
+		U32 clause;
+
+		if (pThread->numFilters == 0) {
+			Crash("endfilter outside an exception filter");
+		}
+		pCtx = &pThread->pFilterCtx[--pThread->numFilters];
+		pFilterFrame = pCtx->pFrame;
+		clause = pCtx->clause;
+		pFilterFrame->ipOffset = pCtx->savedIp;
+		pFilterFrame->stackOfs = pCtx->savedStackOfs;
+		pThread->pCurrentExceptionObject = pCtx->savedException;
+		pThread->pThrowTopState = pCtx->pTopState;
+		pThread->searchInFilter = pCtx->outerSearchInFilter;
+		pThread->pCurrentMethodState = pCtx->pTopState;
+		LOAD_METHOD_STATE();
+		if (verdict != 0) {
+			pThread->pCatchMethodState = pFilterFrame;
+			pThread->pCatchExceptionHandler = &pFilterFrame->pMethod->pJITted->pExceptionHeaders[clause];
+			pThread->nextFinallyUnwindStack = 0;
+			goto unwindToHandler;
+		}
+		pThread->pSearchFrame = pFilterFrame;
+		pThread->searchNextClause = clause + 1;
+		goto searchHandlers;
+	}
+JIT_ENDFILTER_end:
 	GO_NEXT_CHECK();
 
 JIT_LEAVE_start:

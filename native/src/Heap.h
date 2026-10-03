@@ -55,6 +55,7 @@ void Heap_MakeUndeletable(HEAP_PTR heapEntry);
 void Heap_MakeDeletable(HEAP_PTR heapEntry);
 
 tMD_TypeDef* Heap_GetType(HEAP_PTR heapEntry);
+tMD_TypeDef* Heap_GetObjectTypeContaining(void *addr);
 
 HEAP_PTR Heap_Box(tMD_TypeDef *pType, PTR pMem);
 HEAP_PTR Heap_Clone(HEAP_PTR obj);

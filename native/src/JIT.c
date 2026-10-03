@@ -24,6 +24,7 @@
 #include "JIT.h"
 
 #include "JIT_OpCodes.h"
+#include "System.Runtime.InteropServices.Marshal.h"
 #include "CIL_OpCodes.h"
 #include "CLIFile.h"
 
@@ -238,6 +239,58 @@ static SetBreakPoint(tMD_MethodDef *pMethodDef, U32 cilOfs, tOps ops)
     
 }
 
+// Overflow-checked conversions (conv.ovf.*). Returns the destination kind for JIT_CONV_OVF_CHECK
+// (the order must match ConvOvfFits in JIT_Execute.c), or -1 if `op` is not one of them.
+// *pUnsigned is set for the .un forms, which treat an integer source as unsigned.
+// Native int/uint are 32 bits here, like the rest of this JIT.
+#define OVF_TO_I1 0
+#define OVF_TO_U1 1
+#define OVF_TO_I2 2
+#define OVF_TO_U2 3
+#define OVF_TO_I4 4
+#define OVF_TO_U4 5
+#define OVF_TO_I8 6
+#define OVF_TO_U8 7
+static I32 ConvOvfTarget(U32 op, U32 *pUnsigned) {
+	*pUnsigned = 0;
+	switch (op) {
+	case CIL_CONV_OVF_I1_UN: *pUnsigned = 1; /* fall through */
+	case CIL_CONV_OVF_I1: return OVF_TO_I1;
+	case CIL_CONV_OVF_U1_UN: *pUnsigned = 1; /* fall through */
+	case CIL_CONV_OVF_U1: return OVF_TO_U1;
+	case CIL_CONV_OVF_I2_UN: *pUnsigned = 1; /* fall through */
+	case CIL_CONV_OVF_I2: return OVF_TO_I2;
+	case CIL_CONV_OVF_U2_UN: *pUnsigned = 1; /* fall through */
+	case CIL_CONV_OVF_U2: return OVF_TO_U2;
+	case CIL_CONV_OVF_I4_UN:
+	case CIL_CONV_OVF_I_UN: *pUnsigned = 1; /* fall through */
+	case CIL_CONV_OVF_I4:
+	case CIL_CONV_OVF_I: return OVF_TO_I4;
+	case CIL_CONV_OVF_U4_UN:
+	case CIL_CONV_OVF_U_UN: *pUnsigned = 1; /* fall through */
+	case CIL_CONV_OVF_U4:
+	case CIL_CONV_OVF_U: return OVF_TO_U4;
+	case CIL_CONV_OVF_I8_UN: *pUnsigned = 1; /* fall through */
+	case CIL_CONV_OVF_I8: return OVF_TO_I8;
+	case CIL_CONV_OVF_U8_UN: *pUnsigned = 1; /* fall through */
+	case CIL_CONV_OVF_U8: return OVF_TO_U8;
+	}
+	return -1;
+}
+
+// Does this conversion opcode treat an integer source as unsigned? (ECMA-335: conv.u8, conv.r.un
+// and the .un forms of conv.ovf.*; every other conversion treats it as signed.) This is decided
+// by the opcode, not by the static type of the value being converted: `(long)(int)uintVar` is a
+// bare conv.i8 on a uint local and must sign-extend. Choosing by the local's type made it
+// zero-extend, and made (double)(long)ulongVar convert as unsigned.
+static int ConvSourceIsUnsigned(U32 op) {
+	U32 isUn;
+	if (op == CIL_CONV_U8 || op == CIL_CONV_R_UN) {
+		return 1;
+	}
+	return ConvOvfTarget(op, &isUn) >= 0 && isUn;
+}
+
 static U32* JITit(tMD_MethodDef *pMethodDef, U8 *pCIL, U32 codeSize, tParameter *pLocals, tJITted *pJITted, U32 genCombinedOpcodes, I32 **ppSequencePoints) {
 	U32 maxStack = pJITted->maxStack;
 	U32 i;
@@ -250,6 +303,7 @@ static U32* JITit(tMD_MethodDef *pMethodDef, U8 *pCIL, U32 codeSize, tParameter 
 	U32 *pFinalOps;
 	tMD_TypeDef *pStackType;
 	tTypeStack typeStack;
+	U32 jmpPending = 0; // set while translating a jmp as "load args; call; ret"
 
 #ifdef GEN_COMBINED_OPCODES
 	tOps isDynamic;
@@ -314,6 +368,22 @@ static U32* JITit(tMD_MethodDef *pMethodDef, U8 *pCIL, U32 codeSize, tParameter 
 			pTypeStack->ofs = 1;
 			pTypeStack->ppTypes = TMALLOC(tMD_TypeDef*);
 			pTypeStack->ppTypes[0] = pEx->u.pCatchTypeDef;
+		} else if (pEx->flags == COR_ILEXCEPTION_CLAUSE_FILTER) {
+			// Both the filter code and the handler it guards are entered with the exception object
+			// (typed as plain object: the filter is what decides whether it is wanted) on the stack.
+			U32 entries[2];
+			U32 k;
+			entries[0] = pEx->u.filterOffset;
+			entries[1] = pEx->handlerStart;
+			for (k = 0; k < 2; k++) {
+				tTypeStack *pTypeStack;
+
+				ppTypeStacks[entries[k]] = pTypeStack = TMALLOC(tTypeStack);
+				pTypeStack->maxBytes = 4;
+				pTypeStack->ofs = 1;
+				pTypeStack->ppTypes = TMALLOC(tMD_TypeDef*);
+				pTypeStack->ppTypes[0] = types[TYPE_SYSTEM_OBJECT];
+			}
 		}
 	}
 
@@ -351,6 +421,132 @@ static U32* JITit(tMD_MethodDef *pMethodDef, U8 *pCIL, U32 codeSize, tParameter 
                 {
                     PushOp(JIT_NOP);
                 }
+				break;
+
+			case CIL_BREAK:
+				// A debugger breakpoint instruction; there is no attached debugger to stop in.
+				PushOp(JIT_NOP);
+				break;
+
+			case CIL_PREFIX7:
+			case CIL_PREFIX6:
+			case CIL_PREFIX5:
+			case CIL_PREFIX4:
+			case CIL_PREFIX3:
+			case CIL_PREFIX2:
+			case CIL_PREFIXREF:
+				// Reserved by ECMA-335 as encodings for future instruction prefixes; they are not
+				// instructions and cannot appear in a valid method body.
+				Crash("JITit(): reserved op-code 0x%02x is not valid in a method body", op);
+				break;
+
+			case CIL_MKREFANY:
+				{
+					tMD_TypeDef *pRefType;
+
+					PopStackTypeDontCare(); // the address
+					u32Value = GetUnalignedU32(pCIL, &cilOfs);
+					pRefType = MetaData_GetTypeDefFromDefRefOrSpec(pMethodDef->pMetaData, u32Value, pMethodDef->pParentType->ppClassTypeArgs, pMethodDef->ppMethodTypeArgs);
+					MetaData_Fill_TypeDef(pRefType, NULL, NULL);
+					MetaData_Fill_TypeDef(types[TYPE_SYSTEM_TYPEDREFERENCE], NULL, NULL);
+					PushOp(JIT_MKREFANY);
+					PushPTR(pRefType);
+					PushStackType(types[TYPE_SYSTEM_TYPEDREFERENCE]);
+				}
+				break;
+
+			case CIL_REFANYVAL:
+				{
+					tMD_TypeDef *pRefType;
+
+					PopStackTypeDontCare(); // the TypedReference
+					u32Value = GetUnalignedU32(pCIL, &cilOfs);
+					pRefType = MetaData_GetTypeDefFromDefRefOrSpec(pMethodDef->pMetaData, u32Value, pMethodDef->pParentType->ppClassTypeArgs, pMethodDef->ppMethodTypeArgs);
+					MetaData_Fill_TypeDef(pRefType, NULL, NULL);
+					PushOp(JIT_REFANYVAL);
+					PushPTR(pRefType);
+					PushStackType(types[TYPE_SYSTEM_INTPTR]);
+				}
+				break;
+
+			case CIL_CALLI:
+				{
+					// calli <call-site signature>: ..., args, function pointer -> ..., result
+					tMD_StandAloneSig *pCallSig;
+					SIG callSig;
+					U32 callConv, numCallParams;
+					tMD_TypeDef *pCallRetType;
+
+					u32Value = GetUnalignedU32(pCIL, &cilOfs);
+					pCallSig = (tMD_StandAloneSig*)MetaData_GetTableRow(pMetaData, u32Value);
+					callSig = MetaData_GetBlob(pCallSig->signature, NULL);
+					callConv = MetaData_DecodeSigEntry(&callSig);
+					numCallParams = MetaData_DecodeSigEntry(&callSig);
+					pCallRetType = Type_GetTypeFromSig(pMetaData, &callSig, pMethodDef->pParentType->ppClassTypeArgs, pMethodDef->ppMethodTypeArgs);
+					PopStackTypeDontCare(); // the function pointer
+					// An instance signature (HASTHIS, without EXPLICITTHIS) has `this` pushed first too
+					PopStackTypeMulti(numCallParams + (((callConv & SIG_METHODDEF_HASTHIS) && !(callConv & 0x40)) ? 1 : 0));
+					PushOp(JIT_CALLI);
+					if (pCallRetType != NULL) {
+						MetaData_Fill_TypeDef(pCallRetType, NULL, NULL);
+						PushStackType(pCallRetType);
+					}
+				}
+				break;
+
+			case CIL_JMP:
+				// jmp <method>: transfer to another method, passing this method's own arguments. Done as
+				// the equivalent "ldarg 0..n-1; call <method>; ret". The call translation reads the method
+				// token itself, so it is deliberately not consumed here; jmpPending makes it end in a ret.
+				PushOp(JIT_JMP_COPYARGS);
+				for (i=0; i<pMethodDef->numberOfParameters; i++) {
+					PushStackType(pMethodDef->pParams[i].pTypeDef);
+				}
+				op = CIL_CALL;
+				u32Value2 = 0;
+				jmpPending = 1;
+				goto cilCallVirtConstrained;
+
+			case CIL_UNBOX:
+				{
+					tMD_TypeDef *pUnboxType;
+
+					PopStackTypeDontCare(); // the boxed object
+					u32Value = GetUnalignedU32(pCIL, &cilOfs);
+					pUnboxType = MetaData_GetTypeDefFromDefRefOrSpec(pMethodDef->pMetaData, u32Value, pMethodDef->pParentType->ppClassTypeArgs, pMethodDef->ppMethodTypeArgs);
+					if (!pUnboxType->isValueType || pUnboxType->pGenericDefinition == types[TYPE_SYSTEM_NULLABLE]) {
+						Crash("JITit(): unbox needs a (non-Nullable) value type");
+					}
+					MetaData_Fill_TypeDef(pUnboxType, NULL, NULL);
+					PushOp(JIT_UNBOX);
+					PushPTR(pUnboxType);
+					PushStackType(types[TYPE_SYSTEM_INTPTR]);
+				}
+				break;
+
+			case CIL_CKFINITE:
+				pStackType = PopStackType();
+				if (pStackType->stackType == EVALSTACK_F32) {
+					PushOp(JIT_CKFINITE_F32);
+				} else if (pStackType->stackType == EVALSTACK_F64) {
+					PushOp(JIT_CKFINITE_F64);
+				} else {
+					Crash("JITit(): ckfinite needs a floating-point value, not stack type %d", pStackType->stackType);
+				}
+				PushStackType(pStackType);
+				break;
+
+			case CIL_CPOBJ:
+				{
+					tMD_TypeDef *pCpTypeDef;
+
+					PopStackTypeMulti(2); // destination and source addresses
+					u32Value = GetUnalignedU32(pCIL, &cilOfs);
+					pCpTypeDef = MetaData_GetTypeDefFromDefRefOrSpec(pMethodDef->pMetaData, u32Value, pMethodDef->pParentType->ppClassTypeArgs, pMethodDef->ppMethodTypeArgs);
+					MetaData_Fill_TypeDef(pCpTypeDef, NULL, NULL);
+					PushOp(JIT_COPYOBJECT);
+					PushPTR(pCpTypeDef);
+				}
 				break;
 
 			case CIL_LDNULL:
@@ -464,6 +660,7 @@ cilLdArg:
 			case CIL_LDARGA_S:
 				// Get the argument number to load the address of
 				u32Value = pCIL[cilOfs++];
+cilLdArgA:
 				PushOpParam(JIT_LOAD_PARAMLOCAL_ADDR, pMethodDef->pParams[u32Value].offset);
 				PushStackType(types[TYPE_SYSTEM_INTPTR]);
 				break;
@@ -471,6 +668,7 @@ cilLdArg:
 			case CIL_STARG_S:
 				// Get the argument number to store the arg of
 				u32Value = pCIL[cilOfs++];
+cilStArg:
 				pStackType = PopStackType();
 				ofs = pMethodDef->pParams[u32Value].offset;
 				if (pStackType->stackSize == 4 && ofs < 32) {
@@ -536,6 +734,7 @@ cilStLoc:
 			case CIL_LDLOCA_S:
 				// Get the local number to load the address of
 				u32Value = pCIL[cilOfs++];
+cilLdLocA:
 				PushOpParam(JIT_LOAD_PARAMLOCAL_ADDR, pMethodDef->parameterStackSize + pLocals[u32Value].offset);
 				PushStackType(types[TYPE_SYSTEM_INTPTR]);
 				break;
@@ -578,10 +777,18 @@ cilLdInd:
 				PushStackType(types[u32Value]);
 				break;
 
+			case CIL_STIND_I: // native int: 4 bytes here, same as a reference
+				PopStackTypeMulti(2); // Don't care what they are
+				PushOp(JIT_STOREINDIRECT_REF);
+				break;
+
 			case CIL_STIND_REF:
 			case CIL_STIND_I1:
 			case CIL_STIND_I2:
 			case CIL_STIND_I4:
+			case CIL_STIND_I8:
+			case CIL_STIND_R4:
+			case CIL_STIND_R8:
 				PopStackTypeMulti(2); // Don't care what they are
 				PushOp(JIT_STOREINDIRECT_REF + (op - CIL_STIND_REF));
 				break;
@@ -597,13 +804,17 @@ cilLdInd:
 					tMD_MethodDef *pCallMethod;
 					tMD_TypeDef *pBoxCallType;
 					U32 derefRefType;
-					U8 dynamicallyBoxReturnValue = 0;
+					U8 dynamicallyBoxReturnValue;
 
 					u32Value2 = 0;
 
 cilCallVirtConstrained:
 					pBoxCallType = NULL;
 					derefRefType = 0;
+					// Must be reset here, not at the declaration: the CIL_CONSTRAINED prefix
+					// jumps to the label above, past any initialiser on the declaration, which
+					// left this indeterminate on that path.
+					dynamicallyBoxReturnValue = 0;
 
 					u32Value = GetUnalignedU32(pCIL, &cilOfs);
 					pCallMethod = MetaData_GetMethodDefFromDefRefOrSpec(pMetaData, u32Value, pMethodDef->pParentType->ppClassTypeArgs, pMethodDef->ppMethodTypeArgs);
@@ -710,6 +921,13 @@ cilCallVirtConstrained:
 
 					if (dynamicallyBoxReturnValue) {
 						PushOp(JIT_REFLECTION_DYNAMICALLY_BOX_RETURN_VALUE);
+					}
+
+					if (jmpPending) {
+						// the "ret" half of a jmp
+						jmpPending = 0;
+						PushOp(JIT_RETURN);
+						RestoreTypeStack(&typeStack, ppTypeStacks[cilOfs]);
 					}
 				}
 				break;
@@ -865,6 +1083,12 @@ cilBinaryArithOp:
 				} else if (pTypeA->stackType == EVALSTACK_INT64) {
 					PushOp(JIT_NEG_I64 + (op - CIL_NEG));
 					PushStackType(types[TYPE_SYSTEM_INT64]);
+				} else if (op == CIL_NEG && pTypeA->stackType == EVALSTACK_F32) {
+					PushOp(JIT_NEG_F32);
+					PushStackType(types[TYPE_SYSTEM_SINGLE]);
+				} else if (op == CIL_NEG && pTypeA->stackType == EVALSTACK_F64) {
+					PushOp(JIT_NEG_F64);
+					PushStackType(types[TYPE_SYSTEM_DOUBLE]);
 				} else {
 					Crash("JITit(): Cannot perform unary operand on stack types: %d", pTypeA->stackType);
 				}
@@ -907,6 +1131,7 @@ cilBinaryArithOp:
 			case CIL_CONV_OVF_I4: // Fix this later - will never overflow
 			case CIL_CONV_OVF_I4_UN: // Fix this later - will never overflow
 			case CIL_CONV_I: // Only on 32-bit
+			case CIL_CONV_OVF_I: // Only on 32-bit
 			case CIL_CONV_OVF_I_UN: // Only on 32-bit; Fix this later - will never overflow
 				toBitCount = 32;
 				toType = TYPE_SYSTEM_INT32;
@@ -929,6 +1154,7 @@ cilConvInt32:
 			case CIL_CONV_OVF_U4: // Fix this later - will never overflow
 			case CIL_CONV_OVF_U4_UN: // Fix this later - will never overflow
 			case CIL_CONV_U: // Only on 32-bit
+			case CIL_CONV_OVF_U: // Only on 32-bit
 			case CIL_CONV_OVF_U_UN: // Only on 32-bit; Fix this later - will never overflow
 				toBitCount = 32;
 				toType = TYPE_SYSTEM_UINT32;
@@ -961,18 +1187,31 @@ cilConv:
 				{
 					U32 opCodeBase;
 					U32 useParam = 0, param;
+					{
+						// conv.ovf.*: check the value fits first; the conversion op that follows
+						// then just narrows/widens it. (These used to be aliased to the unchecked
+						// conversions and silently wrapped.)
+						U32 ovfUnsigned;
+						I32 ovfTo = ConvOvfTarget(op, &ovfUnsigned);
+						if (ovfTo >= 0) {
+							U32 ovfFrom;
+							switch (pStackType->stackType) {
+							case EVALSTACK_INT64: ovfFrom = ovfUnsigned ? 3 : 2; break;
+							case EVALSTACK_F32: ovfFrom = 4; break;
+							case EVALSTACK_F64: ovfFrom = 5; break;
+							default: ovfFrom = ovfUnsigned ? 1 : 0; break; // INT32 and native int
+							}
+							PushOpParam(JIT_CONV_OVF_CHECK, ovfFrom | ((U32)ovfTo << 8));
+						}
+					}
 					// This is the types that the conversion is from.
 					switch (pStackType->stackType) {
 					case EVALSTACK_INT64:
-						opCodeBase = (pStackType == types[TYPE_SYSTEM_INT64])?JIT_CONV_FROM_I64:JIT_CONV_FROM_U64;
+						opCodeBase = ConvSourceIsUnsigned(op)?JIT_CONV_FROM_U64:JIT_CONV_FROM_I64;
 						break;
 					case EVALSTACK_INT32:
 					case EVALSTACK_PTR: // Only on 32-bit
-						opCodeBase =
-							(pStackType == types[TYPE_SYSTEM_BYTE] ||
-							pStackType == types[TYPE_SYSTEM_UINT16] ||
-							pStackType == types[TYPE_SYSTEM_UINT32] ||
-							pStackType == types[TYPE_SYSTEM_UINTPTR])?JIT_CONV_FROM_U32:JIT_CONV_FROM_I32;
+						opCodeBase = ConvSourceIsUnsigned(op)?JIT_CONV_FROM_U32:JIT_CONV_FROM_I32;
 						break;
 					case EVALSTACK_F64:
 						opCodeBase = JIT_CONV_FROM_R64;
@@ -1217,6 +1456,12 @@ conv2:
 				PushStackType(types[TYPE_SYSTEM_OBJECT]);
 				break;
 
+			case CIL_LDELEM_I: // native int: 4 bytes here
+				PopStackTypeMulti(2); // Don't care what any of these are
+				PushOp(JIT_LOAD_ELEMENT_U32);
+				PushStackType(types[TYPE_SYSTEM_INTPTR]);
+				break;
+
 			case CIL_LDELEM_ANY:
 				u32Value = GetUnalignedU32(pCIL, &cilOfs);
 				pStackType = (tMD_TypeDef*)MetaData_GetTypeDefFromDefRefOrSpec(pMetaData, u32Value, pMethodDef->pParentType->ppClassTypeArgs, pMethodDef->ppMethodTypeArgs);
@@ -1235,6 +1480,7 @@ conv2:
 			case CIL_STELEM_I1:
 			case CIL_STELEM_I2:
 			case CIL_STELEM_I4:
+			case CIL_STELEM_I:
 			case CIL_STELEM_R4:
 			case CIL_STELEM_REF:
 				PopStackTypeMulti(3); // Don't care what any of these are
@@ -1396,15 +1642,24 @@ conv2:
 					PopStackTypeDontCare(); // Don't care what it is
 					u32Value = GetUnalignedU32(pCIL, &cilOfs);
 					pTypeDef = MetaData_GetTypeDefFromDefRefOrSpec(pMethodDef->pMetaData, u32Value, pMethodDef->pParentType->ppClassTypeArgs, pMethodDef->ppMethodTypeArgs);
+					// isValueType is only known once the type is filled in; an enum nothing has touched
+					// yet would otherwise look like a reference type and be routed to castclass
+					MetaData_Fill_TypeDef(pTypeDef, NULL, NULL);
 					if (pTypeDef->pGenericDefinition == types[TYPE_SYSTEM_NULLABLE]) {
 						// This is a nullable type, so special unboxing is required.
 						PushOp(JIT_UNBOX_NULLABLE);
 						// For nullable types, push the underlying type
 						PushPTR(pTypeDef->ppClassTypeArgs[0]);
 					} else if (pTypeDef->isValueType) {
+						// The target type is an operand so the object's type can be checked against it
+						MetaData_Fill_TypeDef(pTypeDef, NULL, NULL);
 						PushOp(JIT_UNBOX2VALUETYPE);
+						PushPTR(pTypeDef);
 					} else {
-						PushOp(JIT_UNBOX2OBJECT);
+						// unbox.any of a reference type is castclass (it used to be a no-op, so a
+						// wrongly-typed object passed through unchecked)
+						PushOp(JIT_CAST_CLASS);
+						PushPTR(pTypeDef);
 					}
 					PushStackType(pTypeDef);
 				}
@@ -1481,6 +1736,49 @@ cilLeave:
 					}
 					break;
 
+				case CILX_ENDFILTER:
+					// Ends a filter; the int32 on the stack is its verdict. Control does not continue
+					// into the next instruction (the guarded handler), so, as for ret, pick up that
+					// instruction's recorded stack.
+					PopStackTypeDontCare();
+					PushOp(JIT_ENDFILTER);
+					RestoreTypeStack(&typeStack, ppTypeStacks[cilOfs]);
+					break;
+
+				case CILX_CPBLK:
+					PopStackTypeMulti(3); // destination, source, byte count
+					PushOp(JIT_CPBLK);
+					break;
+
+				case CILX_INITBLK:
+					PopStackTypeMulti(3); // address, value, byte count
+					PushOp(JIT_INITBLK);
+					break;
+
+				case CILX_REFANYTYPE:
+					PopStackTypeDontCare(); // the TypedReference
+					PushOp(JIT_REFANYTYPE);
+					PushStackType(types[TYPE_SYSTEM_RUNTIMETYPEHANDLE]);
+					break;
+
+				case CILX_LDVIRTFTN:
+					{
+						tMD_MethodDef *pVirtFuncMethodDef;
+
+						PopStackTypeDontCare(); // the object
+						u32Value = GetUnalignedU32(pCIL, &cilOfs);
+						pVirtFuncMethodDef = MetaData_GetMethodDefFromDefRefOrSpec(pMethodDef->pMetaData, u32Value, pMethodDef->pParentType->ppClassTypeArgs, pMethodDef->ppMethodTypeArgs);
+						if (pVirtFuncMethodDef->isFilled == 0) {
+							// as for a call: the declaring type must be filled in before its vtable index is read
+							tMD_TypeDef *pDeclaringType = MetaData_GetTypeDefFromMethodDef(pVirtFuncMethodDef);
+							MetaData_Fill_TypeDef(pDeclaringType, NULL, NULL);
+						}
+						PushOp(JIT_LOADVIRTFUNCTION);
+						PushPTR(pVirtFuncMethodDef);
+						PushStackType(types[TYPE_SYSTEM_INTPTR]);
+					}
+					break;
+
 				case CILX_CEQ:
 				case CILX_CGT:
 				case CILX_CGT_UN:
@@ -1518,6 +1816,58 @@ cilLeave:
 					// Do nothing
 					break;
 
+				case CILX_VOLATILE:
+				case CILX_TAIL:
+					// Prefixes with no effect here: the interpreter does no reordering or caching that
+					// volatile. would have to defeat, and tail. is only a request to reuse the frame.
+					break;
+
+				case CILX_UNALIGNED:
+					cilOfs++; // the alignment operand; accesses are never assumed aligned anyway
+					break;
+
+				// The two-byte forms take a 16-bit index (for methods with more than 255 args/locals)
+				case CILX_LDARG:
+					u32Value = pCIL[cilOfs] | ((U32)pCIL[cilOfs + 1] << 8); cilOfs += 2;
+					goto cilLdArg;
+				case CILX_LDARGA:
+					u32Value = pCIL[cilOfs] | ((U32)pCIL[cilOfs + 1] << 8); cilOfs += 2;
+					goto cilLdArgA;
+				case CILX_STARG:
+					u32Value = pCIL[cilOfs] | ((U32)pCIL[cilOfs + 1] << 8); cilOfs += 2;
+					goto cilStArg;
+				case CILX_LDLOC:
+					u32Value = pCIL[cilOfs] | ((U32)pCIL[cilOfs + 1] << 8); cilOfs += 2;
+					goto cilLdLoc;
+				case CILX_LDLOCA:
+					u32Value = pCIL[cilOfs] | ((U32)pCIL[cilOfs + 1] << 8); cilOfs += 2;
+					goto cilLdLocA;
+				case CILX_STLOC:
+					u32Value = pCIL[cilOfs] | ((U32)pCIL[cilOfs + 1] << 8); cilOfs += 2;
+					goto cilStLoc;
+
+				case CILX_SIZEOF:
+					{
+						tMD_TypeDef *pSizeType;
+						I32 size;
+
+						u32Value = GetUnalignedU32(pCIL, &cilOfs);
+						pSizeType = MetaData_GetTypeDefFromDefRefOrSpec(pMethodDef->pMetaData, u32Value, pMethodDef->pParentType->ppClassTypeArgs, pMethodDef->ppMethodTypeArgs);
+						MetaData_Fill_TypeDef(pSizeType, NULL, NULL);
+						if (!pSizeType->isValueType) {
+							size = sizeof(void*);
+						} else {
+							// Unmanaged types have the reference runtime's layout; anything else
+							// (a struct holding references) falls back to this runtime's own size.
+							size = Marshal_GetUnmanagedSize(pSizeType);
+							if (size < 0) {
+								size = pSizeType->instanceMemSize;
+							}
+						}
+						i32Value = size;
+					}
+					goto cilLdcI4;
+
 				default:
 					Crash("JITit(): JITter cannot handle extended op-code:0x%02x", op);
 
@@ -1549,6 +1899,9 @@ cilLeave:
 		tExceptionHeader *pEx;
 
 		pEx = &pJITted->pExceptionHeaders[i];
+		if (pEx->flags == COR_ILEXCEPTION_CLAUSE_FILTER) {
+			pEx->u.filterOffset = pJITOffsets[pEx->u.filterOffset];
+		}
 		pEx->tryEnd = pJITOffsets[pEx->tryStart + pEx->tryEnd];
 		pEx->tryStart = pJITOffsets[pEx->tryStart];
 		pEx->handlerEnd = pJITOffsets[pEx->handlerStart + pEx->handlerEnd];

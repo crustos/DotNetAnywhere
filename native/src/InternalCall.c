@@ -52,6 +52,7 @@
 #include "Reflection.h"
 
 #include "JSInterop.h"
+#include "System.Runtime.InteropServices.Marshal.h"
 
 #define MAX_PARAMS 6
 
@@ -130,6 +131,7 @@ static tInternalCall internalCalls[] = {
 
 	{NULL, "Enum", "Internal_GetValue", System_Enum_Internal_GetValue, TYPE_SYSTEM_INT32, 0},
 	{NULL, NULL,   "Internal_GetInfo", System_Enum_Internal_GetInfo, TYPE_SYSTEM_VOID, 3, {TYPE_SYSTEM_TYPE, TYPE_SYSTEM_INTPTR, TYPE_SYSTEM_INTPTR}},
+	{NULL, NULL,   "Internal_GetKind", System_Enum_Internal_GetKind, TYPE_SYSTEM_INT32, 1, {TYPE_SYSTEM_TYPE}},
 
 	{NULL, "ValueType", "GetFields", System_ValueType_GetFields, TYPE_SYSTEM_ARRAY_NO_TYPE, 2, {TYPE_SYSTEM_OBJECT, TYPE_SYSTEM_OBJECT}},
 
@@ -185,6 +187,10 @@ static tInternalCall internalCalls[] = {
 
 	{"System.Runtime.InteropServices", 	"GCHandle", 	"ToHeapRef", Framework_JSInterop_ToHeapRef, TYPE_SYSTEM_INT32, 1, {TYPE_SYSTEM_OBJECT}}, 
 	{NULL, 								NULL, 			"FromHeapRef", Framework_JSInterop_FromHeapRefImpl, TYPE_SYSTEM_OBJECT, 1, {TYPE_SYSTEM_INT32}}, 
+
+	{"System.Runtime.InteropServices", "Marshal", "SizeOfImpl", System_Runtime_InteropServices_Marshal_SizeOfImpl, TYPE_SYSTEM_INT32, 1, {TYPE_SYSTEM_TYPE}},
+	{"System.Runtime.InteropServices", "MemoryMarshal", "Serialize", System_Runtime_InteropServices_MemoryMarshal_Serialize, TYPE_SYSTEM_INT32, 4, {TYPE_SYSTEM_TYPE, TYPE_SYSTEM_OBJECT, TYPE_SYSTEM_ARRAY_BYTE, TYPE_SYSTEM_INT32}},
+	{NULL, NULL, "Deserialize", System_Runtime_InteropServices_MemoryMarshal_Deserialize, TYPE_SYSTEM_OBJECT, 3, {TYPE_SYSTEM_TYPE, TYPE_SYSTEM_ARRAY_BYTE, TYPE_SYSTEM_INT32}},
 	{NULL, NULL, NULL, NULL}
 };
 

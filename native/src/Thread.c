@@ -56,6 +56,9 @@ tThread* Thread() {
 	pThis->pCurrentMethodState = NULL;
 	pThis->threadExitValue = 0;
 	pThis->nextFinallyUnwindStack = 0;
+	pThis->numFilters = 0;
+	pThis->pFilterCtx = NULL;
+	pThis->searchInFilter = 0;
 	pThis->pAsync = NULL;
 	pThis->hasParam = 0;
 
@@ -120,6 +123,8 @@ static void Thread_Delete(tThread *pThis) {
 		free(pStack);
 		pStack = pNextStack;
 	}
+	free(pThis->pFilterCtx);
+	pThis->pFilterCtx = NULL;
 	Heap_MakeDeletable((HEAP_PTR)pThis);
 }
 
@@ -299,6 +304,24 @@ void Thread_GetHeapRoots(tHeapRoots *pHeapRoots) {
 				pMethodState->pMethod->parameterStackSize+pMethodState->pMethod->pJITted->localsStackSize);
 
 			pMethodState = pMethodState->pCaller;
+		}
+
+		// While a filter runs, the frames above the one that owns it are not reachable from the
+		// current frame, but they are still live: their finally blocks run after the filter says yes.
+		{
+			U32 k;
+			for (k = 0; k < pThread->numFilters; k++) {
+				// The exception being filtered lives in memory the collector does not otherwise
+				// see (the contexts are not part of the managed heap), so root it explicitly
+				Heap_SetRoots(pHeapRoots, &pThread->pFilterCtx[k].savedException, sizeof(HEAP_PTR));
+				pMethodState = pThread->pFilterCtx[k].pTopState;
+				while (pMethodState != NULL) {
+					Heap_SetRoots(pHeapRoots, pMethodState->pEvalStack, pMethodState->pMethod->pJITted->maxStack);
+					Heap_SetRoots(pHeapRoots, pMethodState->pParamsLocals,
+						pMethodState->pMethod->parameterStackSize+pMethodState->pMethod->pJITted->localsStackSize);
+					pMethodState = pMethodState->pCaller;
+				}
+			}
 		}
 
 		pThread = pThread->pNextThread;

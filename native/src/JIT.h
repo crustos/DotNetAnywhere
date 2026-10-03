@@ -74,7 +74,10 @@ struct tJITted_ {
 #include "Thread.h"
 
 #define COR_ILEXCEPTION_CLAUSE_EXCEPTION 0
+#define COR_ILEXCEPTION_CLAUSE_FILTER 1
 #define COR_ILEXCEPTION_CLAUSE_FINALLY 2
+// A fault block runs while an exception unwinds past it, but never on normal exit
+#define COR_ILEXCEPTION_CLAUSE_FAULT 4
 
 struct tExceptionHeader_ {
 	U32 flags;
@@ -85,7 +88,7 @@ struct tExceptionHeader_ {
 	union {
 		// Class token for type-based exception handler
 		IDX_TABLE classToken;
-		// Filter code offset for filter-based exception handler (not supported)
+		// Offset of the filter code, for a filter-based handler (an op offset once the method is JITted)
 		U32 filterOffset;
 		// The TypeDef of the catch type
 		tMD_TypeDef *pCatchTypeDef;

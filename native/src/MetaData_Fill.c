@@ -241,8 +241,15 @@ void MetaData_Fill_TypeDef_(tMD_TypeDef *pTypeDef, tMD_TypeDef **ppClassTypeArgs
 					tMD_MethodDef *pVirtualOveriddenMethod;
 
 					pVirtualOveriddenMethod = FindVirtualOverriddenMethod(pTypeDef->pParent, pMethodDef);
-					Assert(pVirtualOveriddenMethod != NULL);
-					pMethodDef->vTableOfs = pVirtualOveriddenMethod->vTableOfs;
+					if (pVirtualOveriddenMethod != NULL) {
+						pMethodDef->vTableOfs = pVirtualOveriddenMethod->vTableOfs;
+					} else {
+						// ECMA-335 II.10.3.3: a virtual method that is not marked newslot reuses the slot
+						// of the base method it matches; if it matches none, it gets a new slot. (Compilers
+						// always set newslot on a first declaration, so this only arises from other
+						// producers; it used to assert and then dereference NULL.)
+						pMethodDef->vTableOfs = virtualOfs++;
+					}
 				}
 			} else {
 				// Dummy value - make it obvious it's not valid!

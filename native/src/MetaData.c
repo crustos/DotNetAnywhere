@@ -592,9 +592,40 @@ void MetaData_GetConstant(tMetaData *pThis, IDX_TABLE idx, PTR pResultMem) {
 		Crash("MetaData_GetConstant() Cannot handle idx: 0x%08x", idx);
 	}
 
+	// The result is always one 32-bit word: that is how enum member values are handled. Narrower
+	// constants are widened the way a value of that type is held in a 4-byte slot (signed ones
+	// sign-extended, unsigned ones zero-extended). Constants are read with memcpy because the
+	// blob (a length byte, then the value) is not aligned. (This used to accept only int32, so
+	// converting a member of any other kind of enum, such as `enum F : byte`, to a string crashed.)
 	switch (pConst->type) {
+	case ELEMENT_TYPE_BOOLEAN:
+	case ELEMENT_TYPE_U1:
+		*(U32*)pResultMem = *(U8*)(pConst->value+1);
+		return;
+	case ELEMENT_TYPE_I1:
+		*(I32*)pResultMem = *(I8*)(pConst->value+1);
+		return;
+	case ELEMENT_TYPE_CHAR:
+	case ELEMENT_TYPE_U2: {
+		U16 v;
+		memcpy(&v, pConst->value+1, 2);
+		*(U32*)pResultMem = v;
+		return;
+	}
+	case ELEMENT_TYPE_I2: {
+		I16 v;
+		memcpy(&v, pConst->value+1, 2);
+		*(I32*)pResultMem = v;
+		return;
+	}
 	case ELEMENT_TYPE_I4:
-		//*(U32*)pReturnMem = MetaData_DecodeSigEntry(
+	case ELEMENT_TYPE_U4:
+		memcpy(pResultMem, pConst->value+1, 4);
+		return;
+	case ELEMENT_TYPE_I8:
+	case ELEMENT_TYPE_U8:
+		// Only the low word fits. Enum values are 32-bit here, so a 64-bit enum is only
+		// represented faithfully while its members fit in 32 bits.
 		memcpy(pResultMem, pConst->value+1, 4);
 		return;
 	default:

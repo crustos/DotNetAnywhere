@@ -40,7 +40,13 @@ void* mallocTrace(int s, char *pFile, int line);
 
 #include "MetaData.h"
 
+// Prints a message and exits; never returns. Declared so the compiler knows that the
+// `default: Crash(...)` arm of a switch leaves nothing uninitialised.
+#if defined(__GNUC__) || defined(__clang__)
+void Crash(char *pMsg, ...) __attribute__((noreturn));
+#else
 void Crash(char *pMsg, ...);
+#endif
 
 extern U32 logLevel;
 void log_f(U32 level, char *pMsg, ...);

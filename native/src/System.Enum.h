@@ -23,6 +23,9 @@
 
 #include "Types.h"
 
+// int Internal_GetKind(Type enumType): the underlying type and attributes, packed:
+//   bit 0 = signed;  bits 8..15 = size in bytes;  bit 16 = marked [Flags]
+tAsyncCall* System_Enum_Internal_GetKind(PTR pThis_, PTR pParams, PTR pReturnValue);
 tAsyncCall* System_Enum_Internal_GetValue(PTR pThis_, PTR pParams, PTR pReturnValue);
 tAsyncCall* System_Enum_Internal_GetInfo(PTR pThis_, PTR pParams, PTR pReturnValue);
 
