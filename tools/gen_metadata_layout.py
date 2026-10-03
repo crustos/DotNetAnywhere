@@ -8,15 +8,20 @@ sizeof(struct) on a 32-bit build. That cannot describe a 64-bit struct (8-byte a
 a bigger struct), and it stored pointers through `(unsigned int)` casts.
 
 This script keeps those strings as the ONE description of the file format (SPEC below, with the
-32-bit layout they imply), asks the compiler where each struct field really is on a 32-bit target,
-and emits for every bound column {source, destination width, offsetof(struct, field)}. The emitted
+32-bit layout they imply), works out where each struct field is on a 32-bit target (from the struct
+declarations and the typedefs; no compiler is involved), and emits for every bound column {source, destination width, offsetof(struct, field)}. The emitted
 code uses offsetof(), so each target (wasm32, x86-64, ...) gets its own layout from one table, and on
 a 32-bit target generated static asserts pin every offset to the value the old strings implied, so
-32-bit behaviour is provably unchanged. The output is committed; run this only when SPEC or the
+32-bit behaviour is provably unchanged. The output is a build product; it is regenerated when SPEC or the
 structs change:
 
-    python3 tools/gen_metadata_layout.py            # rewrite native/src/MetaDataLayout.gen.h
-    python3 tools/gen_metadata_layout.py --check    # fail if the committed file is out of date
+    python3 tools/gen_metadata_layout.py            # (re)write native/src/MetaDataLayout.gen.h
+    python3 tools/gen_metadata_layout.py --check    # fail if the file is out of date
+    python3 tools/gen_metadata_layout.py --verify-with-compiler   # also cross-check the layout against gcc -m32
+
+The 32-bit layout is computed here from the typedefs in Types.h (no compiler needed); --verify-with-compiler
+compares it with what `gcc -m32` says. build.py runs this itself when the header is missing or older than its
+inputs, and the header is not committed (it is in .gitignore).
 """
 import os, re, subprocess, sys, tempfile
 
@@ -62,31 +67,52 @@ SPEC = [
     (0x2C, "tMD_GenericParamConstraint", "\x2a*0*"),
 ]
 
+VERIFY = "--verify-with-compiler" in sys.argv
+
 POINTER_SOURCES = set("SGB^m")     # these produce pointers, so they are stored pointer-sized
 DST_WIDTH_32 = {"*": 4, "s": 2, "c": 1, "x": 0}
 
 
-def struct_fields(struct):
-    """The member names of `struct tMD_X_ {...}` in MetaDataTables.h, in order, skipping any that are
-    inside a preprocessor conditional (those are optional diagnostics fields, never file-bound)."""
+def _declarators(stmt):
+    """The members declared by one C statement without its ';': [(type text, array length or None, name)].
+    `U16 a, b[2];` declares two; every name shares the first piece's base type."""
+    pieces = stmt.split(",")
+    first = pieces[0].strip()
+    mm = re.match(r"^(.*?)(\w+)\s*(?:\[\s*(\d+)\s*\])?\s*$", first)
+    if not mm:
+        return []
+    base = mm.group(1).strip()
+    root = re.sub(r"[\s\*]+$", "", base)           # the type words, without pointer stars
+    out = [(base, int(mm.group(3)) if mm.group(3) else None, mm.group(2))]
+    for piece in pieces[1:]:
+        pm = re.match(r"^\s*(\**)\s*(\w+)\s*(?:\[\s*(\d+)\s*\])?\s*$", piece)
+        if pm:
+            out.append((root + " " + pm.group(1) if pm.group(1) else root, int(pm.group(3)) if pm.group(3) else None, pm.group(2)))
+    return out
+
+
+def parse_struct(struct):
+    """The members of `struct tMD_X_ {...}` in MetaDataTables.h, in order, as dicts {name, type, count, members}.
+    Members inside a preprocessor conditional are skipped (they are optional diagnostics, never file-bound), and a
+    nested `union { ... } name;` is one member, `name`, with its own members listed."""
     text = open(os.path.join(SRC, "MetaDataTables.h")).read()
     m = re.search(r"struct %s_\s*\{(.*?)\n\};" % struct, text, re.S)
     if not m:
         sys.exit("struct %s_ not found in MetaDataTables.h" % struct)
-    names, depth, nested = [], 0, False
-    decls = {}
+    fields, depth, nested = [], 0, None
     for line in m.group(1).split("\n"):
         line = re.sub(r"//.*", "", line).strip()
-        if nested:                      # inside `union { ... } name;`: the whole thing is one member, `name`
+        if nested is not None:           # inside `union { ... } name;`
             if line.startswith("}"):
-                nested = False
                 mm = re.match(r"\}\s*(\w+)\s*;", line)
                 if mm and depth == 0:
-                    names.append(mm.group(1))
-                    decls[mm.group(1)] = "union"
+                    fields.append({"name": mm.group(1), "type": "union", "count": None, "members": nested})
+                nested = None
+            elif line.endswith(";"):
+                nested.extend((t, c) for t, c, _ in _declarators(line[:-1]))
             continue
         if re.match(r"(union|struct)\s*\{", line):
-            nested = True
+            nested = []
             continue
         if line.startswith("#if"):
             depth += 1
@@ -95,16 +121,17 @@ def struct_fields(struct):
         elif line.startswith("#"):
             continue
         elif depth == 0 and line.endswith(";"):
-            # `U16 a, b, c;` declares three members: take the last identifier of each comma-separated piece
-            for n, piece in enumerate(line[:-1].split(",")):
-                mm = re.search(r"(\w+)\s*(\[[^\]]*\])?\s*$", piece)
-                if mm:
-                    names.append(mm.group(1))
-                    # the declared type: for `U16 a, b;` every name shares the first piece's type
-                    first = line[:-1].split(",")[0]
-                    decls[mm.group(1)] = (first[:first.rindex(re.search(r"(\w+)\s*(\[[^\]]*\])?\s*$", first).group(1))] if n == 0 else first.split()[0]) + (piece[:piece.rindex(mm.group(1))] if n else "")
-    struct_fields.decls[struct] = decls
-    return names
+            for t, c, n in _declarators(line[:-1]):
+                fields.append({"name": n, "type": t, "count": c, "members": None})
+    return fields
+
+
+def struct_fields(struct):
+    """The member names of a row struct in order. Also records each member's declared type in
+    struct_fields.decls (the pointer-column check uses it)."""
+    fields = parse_struct(struct)
+    struct_fields.decls[struct] = dict((f["name"], f["type"]) for f in fields)
+    return [f["name"] for f in fields]
 
 
 struct_fields.decls = {}
@@ -117,8 +144,64 @@ def is_pointer_type(decl):
     return "*" in decl or decl.strip().split()[-1:] and decl.strip().split()[-1] in POINTER_TYPES
 
 
-def probe_32bit():
-    """Ask gcc -m32 for the real offset and size of every field of every row struct, and the struct sizes."""
+# ---- the 32-bit layout, computed without a compiler ---------------------------------------------------------
+# (size, alignment) of the C types a row struct is made of, for a 32-bit target (ILP32, i386 System V: a 64-bit
+# integer inside a struct is 4-byte aligned). Named types such as U8 or STRING are read from Types.h.
+C_BASE = {"char": (1, 1), "unsigned char": (1, 1), "short": (2, 2), "unsigned short": (2, 2),
+          "int": (4, 4), "unsigned int": (4, 4), "unsigned": (4, 4), "long": (4, 4), "unsigned long": (4, 4),
+          "long long": (8, 4), "unsigned long long": (8, 4), "float": (4, 4), "double": (8, 4)}
+
+
+def typedefs():
+    td = {}
+    for name in ("Types.h", "Compat.h"):
+        path = os.path.join(SRC, name)
+        if os.path.exists(path):
+            for line in open(path).read().split("\n"):
+                m = re.match(r"\s*typedef\s+(.+?)\s*(\w+)\s*;", re.sub(r"//.*", "", line))
+                if m:
+                    td[m.group(2)] = m.group(1)
+    return td
+
+
+def type_info(t, td):
+    t = re.sub(r"\b(const|volatile|struct|enum)\b", "", t).strip()
+    if "*" in t:
+        return (4, 4)
+    t = " ".join(t.split())
+    if t in C_BASE:
+        return C_BASE[t]
+    if t in td:
+        return type_info(td[t], td)
+    sys.exit("don't know the size of type `%s`: add it to C_BASE, or make sure its typedef is in Types.h" % t)
+
+
+def layout_32bit():
+    """For every row struct: sizeof, and [(offset, name, size)] of its members on a 32-bit target."""
+    td = typedefs()
+    sizes, fields = {}, {}
+    for _, struct, _ in SPEC:
+        off, maxalign, out = 0, 1, []
+        struct_fields(struct)       # also records each member's declared type, for the pointer-column check
+        for f in parse_struct(struct):
+            if f["type"] == "union":
+                size = max((type_info(t, td)[0] * (c or 1) for t, c in f["members"]), default=0)
+                align = max((type_info(t, td)[1] for t, c in f["members"]), default=1)
+            else:
+                size, align = type_info(f["type"], td)
+                size *= f["count"] or 1
+            off = (off + align - 1) & ~(align - 1)
+            out.append((off, f["name"], size))
+            off += size
+            maxalign = max(maxalign, align)
+        sizes[struct] = (off + maxalign - 1) & ~(maxalign - 1)
+        fields[struct] = out
+    return sizes, fields
+
+
+def probe_with_compiler():
+    """Ask gcc -m32 for the real offset and size of every field of every row struct, and the struct sizes.
+    Only used to cross-check layout_32bit() (--verify-with-compiler); the generator does not need a compiler."""
     lines = ['#include <stdio.h>', '#include <stddef.h>', '#include "Compat.h"', '#include "Sys.h"',
              '#include "MetaData.h"', '#include "MetaDataTables.h"', 'int main(void) {']
     for _, struct, _ in SPEC:
@@ -145,8 +228,27 @@ def probe_32bit():
     return sizes, fields
 
 
+def verify_against_compiler(sizes, fields):
+    """Compare the computed 32-bit layout with gcc -m32's. Skipped (with a note) if there is no 32-bit compiler."""
+    try:
+        psizes, pfields = probe_with_compiler()
+    except SystemExit as e:
+        print("note: compiler cross-check skipped: %s" % str(e).splitlines()[0], file=sys.stderr)
+        return
+    for struct in sizes:
+        if psizes[struct] != sizes[struct]:
+            sys.exit("layout mismatch: sizeof(%s) is %d by the compiler, %d computed" % (struct, psizes[struct], sizes[struct]))
+        got = sorted(pfields[struct])
+        want = sorted(fields[struct])
+        if got != want:
+            sys.exit("layout mismatch in %s:\n  compiler: %s\n  computed: %s" % (struct, got, want))
+    print("layout cross-check against gcc -m32: %d structs agree" % len(sizes), file=sys.stderr)
+
+
 def generate():
-    sizes, fields = probe_32bit()
+    sizes, fields = layout_32bit()
+    if VERIFY:
+        verify_against_compiler(sizes, fields)
     out = []
     w = out.append
     w("// GENERATED by tools/gen_metadata_layout.py from its SPEC table and MetaDataTables.h. Do not edit:")
@@ -243,5 +345,9 @@ if __name__ == "__main__":
             sys.exit("MetaDataLayout.gen.h is out of date: run tools/gen_metadata_layout.py")
         print("MetaDataLayout.gen.h is up to date")
     else:
-        open(OUT, "w").write(text)
-        print("wrote", os.path.relpath(OUT), "(%d tables, %d bound columns)" % (len(SPEC), text.count("{ '") + text.count("{ 0x")))
+        # Only touch the file if its content changes, so a build that regenerates it does not recompile everything
+        if os.path.exists(OUT) and open(OUT).read() == text:
+            print("unchanged", os.path.relpath(OUT))
+        else:
+            open(OUT, "w").write(text)
+            print("wrote", os.path.relpath(OUT), "(%d tables, %d bound columns)" % (len(SPEC), text.count("{ '") + text.count("{ 0x")))
