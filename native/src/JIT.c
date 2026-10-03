@@ -379,7 +379,7 @@ static tOpWord* JITit(tMD_MethodDef *pMethodDef, U8 *pCIL, U32 codeSize, tParame
 			tTypeStack *pTypeStack;
 
 			ppTypeStacks[pEx->handlerStart] = pTypeStack = TMALLOC(tTypeStack);
-			pTypeStack->maxBytes = 4;
+			pTypeStack->maxBytes = sizeof(void*);   // the exception reference pushed on entry (was a hard-coded 4)
 			pTypeStack->ofs = 1;
 			pTypeStack->ppTypes = TMALLOC(tMD_TypeDef*);
 			pTypeStack->ppTypes[0] = pEx->u.pCatchTypeDef;
@@ -394,12 +394,21 @@ static tOpWord* JITit(tMD_MethodDef *pMethodDef, U8 *pCIL, U32 codeSize, tParame
 				tTypeStack *pTypeStack;
 
 				ppTypeStacks[entries[k]] = pTypeStack = TMALLOC(tTypeStack);
-				pTypeStack->maxBytes = 4;
+				pTypeStack->maxBytes = sizeof(void*);   // the exception reference pushed on entry (was a hard-coded 4)
 				pTypeStack->ofs = 1;
 				pTypeStack->ppTypes = TMALLOC(tMD_TypeDef*);
 				pTypeStack->ppTypes[0] = types[TYPE_SYSTEM_OBJECT];
 			}
 		}
+	}
+
+	// A catch or filter is entered with the exception reference on the evaluation stack, and that push is not
+	// made by any instruction, so nothing else counts it towards the method's maximum stack (restoring a
+	// saved type stack never raises the running maximum). Count it here. On a 32-bit target a reference is
+	// 4 bytes, which some other instruction nearly always needs anyway, so it never showed; on 64-bit it
+	// overflowed the evaluation stack into the parameters that sit right after it.
+	if (pJITted->numExceptionHandlers > 0 && typeStack.maxBytes < sizeof(void*)) {
+		typeStack.maxBytes = sizeof(void*);
 	}
 
 	InitOps(ops, 32);
@@ -1681,8 +1690,10 @@ conv2:
 					if (pTypeDef->pGenericDefinition == types[TYPE_SYSTEM_NULLABLE]) {
 						// This is a nullable type, so special boxing code is needed.
 						PushOp(JIT_BOX_NULLABLE);
-						// Push the underlying type of the nullable type, not the nullable type itself
+						// Push the underlying type of the nullable type, and then the nullable type itself
+						// (its size and where .Value sits in it are not simply "+4": they follow its layout)
 						PushPTR(pTypeDef->ppClassTypeArgs[0]);
+						PushPTR(pTypeDef);
 					} else {
 						PushOp(JIT_BOX_TYPEID + pStackType->stackType);
 						PushPTR(pTypeDef);
@@ -1705,8 +1716,9 @@ conv2:
 					if (pTypeDef->pGenericDefinition == types[TYPE_SYSTEM_NULLABLE]) {
 						// This is a nullable type, so special unboxing is required.
 						PushOp(JIT_UNBOX_NULLABLE);
-						// For nullable types, push the underlying type
+						// For nullable types, push the underlying type, and then the nullable type itself
 						PushPTR(pTypeDef->ppClassTypeArgs[0]);
+						PushPTR(pTypeDef);
 					} else if (pTypeDef->isValueType) {
 						// The target type is an operand so the object's type can be checked against it
 						MetaData_Fill_TypeDef(pTypeDef, NULL, NULL);
@@ -2197,7 +2209,20 @@ void JIT_Prepare(tMD_MethodDef *pMethodDef, U32 genCombinedOpcodes) {
 			exSize = numClauses * sizeof(tExceptionHeader);
 			pJITted->pExceptionHeaders =
 				(tExceptionHeader*)(genCombinedOpcodes?malloc(exSize):mallocForever(exSize));
-			memcpy(pJITted->pExceptionHeaders, pMethodHeader + 4, exSize);
+			memset(pJITted->pExceptionHeaders, 0, exSize);
+			// The file holds 24 bytes per clause. They were copied straight over the structs, which only
+			// worked while tExceptionHeader happened to be exactly 24 bytes (it is 32 on a 64-bit target,
+			// where the union holds a pointer), so each clause is read field by field.
+			for (i=0; i<numClauses; i++) {
+				U32 w[6];
+				memcpy(w, pMethodHeader + 4 + i * 24, sizeof(w));
+				pJITted->pExceptionHeaders[i].flags = w[0];
+				pJITted->pExceptionHeaders[i].tryStart = w[1];
+				pJITted->pExceptionHeaders[i].tryEnd = w[2];        // (a length, until the offsets are fixed up)
+				pJITted->pExceptionHeaders[i].handlerStart = w[3];
+				pJITted->pExceptionHeaders[i].handlerEnd = w[4];    // (likewise)
+				pJITted->pExceptionHeaders[i].u.classToken = w[5];  // or the filter's offset
+			}
 		} else {
 			// Thin header
 			tExceptionHeader *pExHeaders;
@@ -2209,6 +2234,7 @@ void JIT_Prepare(tMD_MethodDef *pMethodDef, U32 genCombinedOpcodes) {
 			//pExHeaders = pJITted->pExceptionHeaders = (tExceptionHeader*)mallocForever(numClauses * sizeof(tExceptionHeader));
 			pExHeaders = pJITted->pExceptionHeaders =
 				(tExceptionHeader*)(genCombinedOpcodes?malloc(exSize):mallocForever(exSize));
+			memset(pExHeaders, 0, exSize);
 			for (i=0; i<numClauses; i++) {
 				pExHeaders[i].flags = ((U16*)pMethodHeader)[0];
 				pExHeaders[i].tryStart = ((U16*)pMethodHeader)[1];
