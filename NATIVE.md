@@ -7,22 +7,34 @@ large number of runtime bugs found by comparing DNA against Mono.
 
 ## Building and testing
 
-Needs: `gcc` (with 32-bit support, `gcc-multilib`, only if you want the 32-bit build), `python3`, a Crust checkout
-at `../crust` (or `--crust DIR` / `$CRUST_ROOT`), and, for corlib and the tests, `mono-mcs`, `mono-runtime` and
-`mono-devel` (for `ilasm`). The reference run in `MathBits` also uses a .NET SDK if one is installed.
+`build.py` is the only build script (the old CMake file, `build.sh` and `build.cmd` are gone), and `make` just calls
+it. Needs: `gcc`, `python3`, a Crust checkout at `../crust` (or `--crust DIR` / `$CRUST_ROOT`), and, for corlib and
+the tests, `mono-mcs`, `mono-runtime` and `mono-devel` (for `ilasm`). `gcc-multilib` is needed only for the 32-bit
+build. The reference run in `MathBits` also uses a .NET SDK if one is installed.
 
     git clone https://github.com/brentharts/crust.git ../crust
-    python3 build.py --corlib             # build/dna (native, 64-bit on x86-64) and build/corlib.dll
-    python3 build.py --m32 --corlib       # build/dna32 (32-bit: what WebAssembly uses)
-    python3 tests/run_tests.py            # the whole suite (--32 / --64 pick the binary; default build/dna)
+    make                                  # python3 build.py: build/dna (native, 64-bit on x86-64) + build/corlib.dll
+    make ARGS="--m32"                     # build/dna32 (32-bit)
+    make test                             # the whole suite (--32 / --64 pick the binary; default build/dna)
     python3 tests/crust_conformance.py    # Crust's own C# programs, DNA vs Mono (same flags)
+    python3 build.py --wasm               # WebAssembly: build/dna.js, build/dna.wasm (needs emcc)
+
+`native/src/MetaDataLayout.gen.h` is generated, not committed: `build.py` runs `tools/gen_metadata_layout.py` when it
+is missing or older than the files it is generated from, and `--clean` removes it. The generator works out the
+32-bit layout itself from the struct declarations and the typedefs in `Types.h`, so it needs no compiler;
+`--verify-with-compiler` (which the test suite passes when a 32-bit gcc exists) cross-checks it against `gcc -m32`.
 
 Run a program with `build/dna prog.exe` (or `dna32`), compiled with `mcs -nostdlib -r:build/corlib.dll prog.cs` and
-with `corlib.dll` beside the exe. `--debug` gives `-O0 -g`. `native/build.sh` (Emscripten) lowers the Crust module
-first via `build.py --lower-only` but has not been run as part of this work.
+with `corlib.dll` beside the exe. `--debug` gives `-O0 -g`.
 
 Both word sizes pass the same suite, and the tests do not depend on the pointer size: they compare with Mono (or
 .NET), not with stored output. Tested on Linux x86-64 with gcc only.
+
+**WebAssembly.** `build.py --wasm` carries over the flags of the old `native/build.sh` (all sources except
+`NativeHost.c`, plus the lowered Crust module). It is only partly verified: every source compiles under Emscripten
+3.1.6, which is the only version that was available, but that packaging links no `main` even for a four-line
+program, so the link and the resulting `dna.js`/`dna.wasm` have never been run. `EXTRA_EXPORTED_RUNTIME_METHODS` is
+deprecated in newer Emscripten (it warns) and the flags otherwise date from 1.38.
 
 ## What was added
 
@@ -144,7 +156,7 @@ Results: `tests/run_tests.py` passes 38/38 on both `build/dna32` and `build/dna`
 library differ, because a 32-bit process calls the i386 `libm` (see "Where DNA deliberately differs").
 
 Not done: x86-only P/Invoke has not been exercised on 64-bit (Prowl and the tests use internal calls); other
-operating systems and architectures are untested; the Emscripten/wasm build has not been run.
+operating systems and architectures are untested; the WebAssembly build has never been linked or run (see above).
 
 ## Known gaps
 

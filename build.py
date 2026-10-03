@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
-"""Build DotNetAnywhere (native/src/*.c) with gcc.
+"""Build DotNetAnywhere. This is the only build script: gcc for a native runtime, emcc for WebAssembly.
 
 Usage:
-    python build.py --m32 --corlib  # what you want: 32-bit runtime build/dna32 + build/corlib.dll
-    python build.py                 # release build  -> build/dna (64-bit: compiles, cannot run .NET code)
+    python build.py                 # the native runtime build/dna, and build/corlib.dll if mcs is installed
+    python build.py --m32           # 32-bit runtime -> build/dna32 (needs gcc-multilib)
+    python build.py --wasm          # WebAssembly: build/dna.js and build/dna.wasm (needs Emscripten's emcc)
     python build.py --debug         # -O0 -g
-    python build.py --clean         # remove build/
-    python build.py --cc clang      # use another compiler
-    python build.py --m32           # 32-bit build -> build/dna32 (DNA targets 32-bit)
+    python build.py --clean         # remove build/ and the generated header
+    python build.py --cc clang      # use another C compiler
     python build.py -j 8            # parallel jobs
-    python build.py --corlib        # also build build/corlib.dll from corlib/ (needs mcs)
-    python build.py --lower-only    # only run cpprust (used by native/build.sh for emcc)
+    python build.py --no-corlib     # skip build/corlib.dll
+    python build.py --lower-only    # only run cpprust on native/src/cpp/*.cpp
     python build.py --run X.exe     # build, then run: build/dna X.exe
+
+`make` is a one-line wrapper around `python3 build.py`.
+
+native/src/MetaDataLayout.gen.h is generated, not committed: this script runs tools/gen_metadata_layout.py to
+create it when it is missing or older than what it is generated from.
 
 Objects are cached in build/obj and rebuilt only when the source or any
 header is newer than the object.
@@ -35,7 +40,7 @@ OBJ = os.path.join(BUILD, "obj")
 GEN = os.path.join(BUILD, "gen")
 
 def sources():
-    # NativeHost.c stubs out what js-interop.js provides under Emscripten (native/build.sh leaves it out)
+    # NativeHost.c stubs out what js-interop.js provides under Emscripten, so the --wasm build leaves it out
     return sorted(f for f in os.listdir(SRC) if f.endswith(".c"))
 
 
@@ -96,6 +101,10 @@ def build_corlib():
     srcs = sorted(os.path.join(dp, f) for dp, _, fs in os.walk(os.path.join(ROOT, "corlib"))
                   for f in fs if f.endswith(".cs") and "/obj/" not in dp and "/bin/" not in dp)
     out = os.path.join(BUILD, "corlib.dll")
+    if os.path.exists(out) and os.path.getmtime(out) >= max(os.path.getmtime(f) for f in srcs):
+        print("build/corlib.dll is up to date")
+        return 0
+    os.makedirs(BUILD, exist_ok=True)
     r = subprocess.run([mcs, "-nostdlib", "-unsafe", "-target:library", "-nowarn:0219,0414,0649",
                         "-out:" + out] + srcs, capture_output=True, text=True)
     if r.returncode:
@@ -105,17 +114,102 @@ def build_corlib():
     return 0
 
 
+LAYOUT_GEN = os.path.join(SRC, "MetaDataLayout.gen.h")
+LAYOUT_TOOL = os.path.join(ROOT, "tools", "gen_metadata_layout.py")
+
+
+def ensure_layout_header():
+    """Generate native/src/MetaDataLayout.gen.h if it is missing or older than what it is generated from."""
+    inputs = [LAYOUT_TOOL] + [os.path.join(SRC, n) for n in ("MetaDataTables.h", "Types.h", "Compat.h")]
+    newest = max(os.path.getmtime(i) for i in inputs if os.path.exists(i))
+    if os.path.exists(LAYOUT_GEN) and os.path.getmtime(LAYOUT_GEN) >= newest:
+        return 0
+    r = subprocess.run([sys.executable, LAYOUT_TOOL], capture_output=True, text=True)
+    if r.returncode != 0:
+        print("error: could not generate native/src/MetaDataLayout.gen.h\n" + (r.stderr or r.stdout), file=sys.stderr)
+        return 1
+    if "wrote" in r.stdout:
+        print("  generated", os.path.relpath(LAYOUT_GEN, ROOT))
+    return 0
+
+
+def lower_all(crust_dir):
+    """Lower every native/src/cpp/*.cpp to C. Returns (generated C files, exit code)."""
+    gen = []
+    cpps = cpp_sources()
+    if cpps:
+        crust = find_crust(crust_dir)
+        if not crust:
+            print("error: Crust not found (needed for native/src/cpp/*.cpp).\n"
+                  "  git clone https://github.com/brentharts/crust.git ../crust\n"
+                  "  or pass --crust DIR / set CRUST_ROOT",
+                  file=sys.stderr)
+            return [], 1
+        for name in cpps:
+            out, err = lower_cpp(crust, name, force=False)
+            if err:
+                print(f"cpprust REFUSED  cpp/{name}\n{err}", file=sys.stderr)
+                return [], 1
+            print(f"  cpprust  cpp/{name} -> {os.path.relpath(out, ROOT)}")
+            gen.append(out)
+    return gen, 0
+
+
+def build_wasm(gen_units, verbose):
+    """WebAssembly with Emscripten: build/dna.js and build/dna.wasm. (This replaced native/build.sh and build.cmd.)"""
+    emcc = os.environ.get("EMCC") or shutil.which("emcc")
+    if not emcc:
+        print("error: emcc not found. Install Emscripten (https://emscripten.org), or set EMCC to its path.",
+              file=sys.stderr)
+        return 1
+    srcs = [os.path.join(SRC, n) for n in sources() if n != "NativeHost.c"] + gen_units
+    exports = ["_main", "_JSInterop_CallDotNet", "_Debugger_Continue", "_Debugger_SetBreakPoint",
+               "_Debugger_Step", "_Debugger_Reset", "_Debugger_Clear_BreakPoints"]
+    cmd = [emcc] + srcs + ["-I", SRC, "-Wno-pointer-sign", "-Oz"]
+    for setting in (
+            "NO_EXIT_RUNTIME=1",
+            "RESERVED_FUNCTION_POINTERS=20",
+            "ASSERTIONS=1",
+            "EXPORTED_FUNCTIONS=" + repr(exports),
+            "EXTRA_EXPORTED_RUNTIME_METHODS=['ccall']",
+            "DEFAULT_LIBRARY_FUNCS_TO_INCLUDE=['$Browser']",
+            "MODULARIZE=1",
+            "EXPORT_NAME='DotNetAnywhere'",
+            "FORCE_FILESYSTEM=1"):
+        cmd += ["-s", setting]
+    cmd += ["--js-library", os.path.join(ROOT, "native", "js-interop.js"),
+            "-o", os.path.join(BUILD, "dna.js")]
+    if verbose:
+        print(" ".join(cmd))
+    print(f"compiling {len(srcs)} file(s) with emcc...")
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print("EMCC FAILED")
+        print(r.stderr[-3000:])
+        return 1
+    if r.stderr.strip() and verbose:
+        print(r.stderr)
+    for f in ("dna.js", "dna.wasm"):
+        if os.path.exists(os.path.join(BUILD, f)):
+            print("built", os.path.join("build", f))
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--cc", default=os.environ.get("CC", "gcc"))
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--m32", action="store_true",
-                    help="build 32-bit (-m32); needs gcc-multilib. DNA was written for 32-bit pointers")
+                    help="build 32-bit (-m32); needs gcc-multilib. The default is the native word size")
     ap.add_argument("--clean", action="store_true")
     ap.add_argument("--crust", help="path to a crust checkout (for cpprust.py)")
     ap.add_argument("--corlib", action="store_true",
-                    help="also compile corlib/*.cs to build/corlib.dll with mcs")
+                    help="compile corlib/*.cs to build/corlib.dll with mcs (the default if mcs is installed; "
+                         "this makes a missing mcs an error)")
+    ap.add_argument("--no-corlib", action="store_true", help="do not build build/corlib.dll")
+    ap.add_argument("--wasm", action="store_true",
+                    help="build for WebAssembly with Emscripten (emcc): build/dna.js and build/dna.wasm")
     ap.add_argument("--lower-only", action="store_true",
                     help="only lower native/src/cpp/*.cpp to build/gen/*.c, then stop")
     ap.add_argument("--verbose", "-v", action="store_true")
@@ -126,8 +220,20 @@ def main():
 
     if args.clean:
         shutil.rmtree(BUILD, ignore_errors=True)
+        if os.path.exists(LAYOUT_GEN):
+            os.remove(LAYOUT_GEN)       # generated; the next build makes it again
         print("cleaned", BUILD)
         return 0
+
+    rc = ensure_layout_header()
+    if rc:
+        return rc
+
+    if args.wasm:
+        os.makedirs(BUILD, exist_ok=True)
+        os.makedirs(GEN, exist_ok=True)
+        gen_units, rc = lower_all(args.crust)
+        return rc or build_wasm(gen_units, args.verbose)
 
     if not shutil.which(args.cc):
         print(f"error: compiler '{args.cc}' not found", file=sys.stderr)
@@ -167,22 +273,10 @@ def main():
 
     # Step 1: lower Crust C++ subset modules to C.
     units = [os.path.join(SRC, n) for n in sources()]
-    cpps = cpp_sources()
-    if cpps:
-        crust = find_crust(args.crust)
-        if not crust:
-            print("error: Crust not found (needed for native/src/cpp/*.cpp).\n"
-                  "  git clone https://github.com/brentharts/crust.git ../crust\n"
-                  "  or pass --crust DIR / set CRUST_ROOT",
-                  file=sys.stderr)
-            return 1
-        for name in cpps:
-            out, err = lower_cpp(crust, name, force=False)
-            if err:
-                print(f"cpprust REFUSED  cpp/{name}\n{err}", file=sys.stderr)
-                return 1
-            print(f"  cpprust  cpp/{name} -> {os.path.relpath(out, ROOT)}")
-            units.append(out)
+    gen_units, rc = lower_all(args.crust)
+    if rc:
+        return rc
+    units += gen_units
 
     if args.lower_only:
         return 0
@@ -228,14 +322,13 @@ def main():
         print(r.stderr)
         return 1
     print("built", os.path.relpath(out, ROOT))
-    if not args.m32:
-        print("note: DNA assumes 32-bit pointers. This 64-bit build compiles but cannot run .NET\n"
-              "      programs (it fails loading corlib); use --m32 (needs gcc-multilib) to run code.")
-
-    if args.corlib:
+    if args.corlib or (not args.no_corlib and shutil.which("mcs")):
         rc = build_corlib()
         if rc:
             return rc
+    elif not args.no_corlib:
+        print("note: mcs not found, so build/corlib.dll was not built (apt install mono-mcs); "
+              "the runtime needs it to run anything")
 
     if args.run is not None:
         return subprocess.call([out] + args.run)

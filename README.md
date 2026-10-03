@@ -29,17 +29,22 @@ scripting layer inside a native program. Compared with the version it started fr
 
 ### Build and test
 
-You need `gcc` (plus `gcc-multilib` for the 32-bit build), `python3`, a [Crust](https://github.com/brentharts/crust)
-checkout next to this one, and `mono-mcs`, `mono-runtime` and `mono-devel` for the corlib and the tests.
+Everything is built by `build.py`; `make` just calls it. You need `gcc`, `python3`, a
+[Crust](https://github.com/brentharts/crust) checkout next to this one, and `mono-mcs`, `mono-runtime` and
+`mono-devel` for the corlib and the tests (`gcc-multilib` only for the 32-bit build).
 
 ```
 git clone https://github.com/brentharts/crust.git ../crust
 
-python3 build.py --corlib             # build/dna (native, 64-bit on x86-64) and build/corlib.dll
-python3 build.py --m32 --corlib       # build/dna32 (32-bit)
-python3 tests/run_tests.py            # the whole suite   (--32 or --64 chooses the binary)
-python3 tests/crust_conformance.py    # Crust's C# programs, DNA against Mono
+make                                  # python3 build.py: build/dna (native, 64-bit on x86-64) and build/corlib.dll
+make ARGS="--m32"                     # python3 build.py --m32: build/dna32 (32-bit)
+make test                             # build, then the whole suite     (python3 tests/run_tests.py)
+python3 tests/crust_conformance.py    # Crust's C# programs, DNA against Mono   (--32 / --64 choose the binary)
+make clean
 ```
+
+`native/src/MetaDataLayout.gen.h` is not in the repository: `build.py` generates it (with
+`tools/gen_metadata_layout.py`, which needs no compiler) when it is missing or out of date.
 
 Run a program with `build/dna prog.exe`. Compile it against the bundled class library:
 
@@ -64,8 +69,10 @@ matches on both. Tested on Linux x86-64 with gcc only.
 ### Not done
 
 * `stackalloc` (`localloc`) and `__arglist` are not implemented.
-* The WebAssembly build (`native/build.sh`) was not run as part of this work, and other operating systems and
-  architectures are untested. P/Invoke has not been exercised on a 64-bit build.
+* The WebAssembly build (`python3 build.py --wasm`) is untested beyond compiling: all of the sources compile under
+  Emscripten 3.1.6, but the only `emcc` available while this was written cannot link even a hello-world, so the
+  link and the result have never been run. Other operating systems and architectures are untested, and P/Invoke
+  has not been exercised on a 64-bit build.
 * 64-bit enums are handled as 32-bit values; `Enum.Parse` and `List<T>.Sort` do not exist.
 
 [NATIVE.md](NATIVE.md) has the details: what was added, every runtime bug fixed, how the 64-bit port was done, where
@@ -75,20 +82,20 @@ DNA deliberately differs from the reference runtimes, and the known gaps.
 
 | | |
 |---|---|
-| `build.py` | the gcc build: cached, parallel, lowers the Crust module first; `--m32`, `--debug`, `--corlib` |
+| `build.py` | the one build script: gcc (cached, parallel, lowers the Crust module first, generates the layout header) or `--wasm` for emcc; `--m32`, `--debug`, `--clean` |
+| `Makefile` | `make` calls `python3 build.py`; `ARGS="..."` passes options, and `wasm`, `test`, `clean` forward too |
 | `tools/gen_metadata_layout.py` | generates `native/src/MetaDataLayout.gen.h`, how each metadata table row maps onto its C struct, for any word size |
 | `tools/check_internalcall_params.py` | checks every native method's argument reads against its registered signature, for 32- and 64-bit pointers (`--fix` rewrites them) |
 | `tests/gen_*.py` | generate the large test programs |
 
 ## Build for WebAssembly
 
-You would need Emscripten 1.38.6 (or above). You can build the WebAssembly interpreter by running the following:
+You need the Emscripten SDK (1.38.6 or above) with `emcc` on the PATH (or set `EMCC`):
 
 ```
-cd native
-build.cmd
+python3 build.py --wasm      # or: make wasm
 ```
 
-Two files will be generated in the `build` folder:
+Two files are generated in the `build` folder:
 - `dna.wasm`
 - `dna.js`
