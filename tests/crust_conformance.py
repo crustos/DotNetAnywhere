@@ -21,6 +21,11 @@ import argparse, ast, collections, concurrent.futures as cf, glob, hashlib, os, 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build")
 WORK = os.path.join(BUILD, "conformance")
+# runtime under test: build/dna32 by default, `--64` or DNA_BIN=path for the 64-bit build
+if "--64" in sys.argv:
+    sys.argv.remove("--64")
+    os.environ["DNA_BIN"] = os.path.join(BUILD, "dna")
+DNA_BIN = os.environ.get("DNA_BIN", os.path.join(BUILD, "dna32"))
 
 
 # Crust's blittable tests build `public int Run()` programs with a _program() helper
@@ -172,7 +177,7 @@ def run_one(item):
         key = errs[0] if errs else ("?", out.strip()[:80])
         return name, "dna-compile", "%s %s" % (key[0], re.sub(r"`[^']*'", "`X'", key[1])[:90])
     # 3. run on DNA
-    rc, out = sh([os.path.join(BUILD, "dna32"), "dna.exe"], cwd=d)
+    rc, out = sh([DNA_BIN, "dna.exe"], cwd=d)
     if ref_exc is not None:
         m = re.search(r"Unhandled exception in [^:\n]*:\s*([\w.]+)", out)
         got = m.group(1) if m else None
@@ -201,7 +206,7 @@ def main():
     for need in ("mcs", "mono"):
         if not shutil.which(need):
             sys.exit("need %s (apt install mono-mcs mono-runtime)" % need)
-    for f in ("dna32", "corlib.dll"):
+    for f in (os.path.basename(DNA_BIN), "corlib.dll"):
         if not os.path.exists(os.path.join(BUILD, f)):
             sys.exit("missing build/%s; run: python build.py --m32 --corlib" % f)
     progs = extract(a.crust)

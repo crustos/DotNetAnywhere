@@ -4,6 +4,24 @@ import glob, os, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build")
+# The runtime under test: build/dna32 by default; `--64` (or DNA_BIN=path) tests the 64-bit build, build/dna.
+# The tests compare with Mono / .NET, so they do not depend on the pointer size.
+if "--64" in sys.argv:
+    sys.argv.remove("--64")
+    os.environ["DNA_BIN"] = os.path.join(BUILD, "dna")
+DNA_BIN = os.environ.get("DNA_BIN", os.path.join(BUILD, "dna32"))
+
+# Every external run gets a timeout, so one hanging program (a runtime that spins) fails its own check
+# instead of stalling the whole suite. DNA_TEST_TIMEOUT overrides the 60 seconds.
+_real_run = subprocess.run
+def _run_with_timeout(*a, **kw):
+    kw.setdefault("timeout", int(os.environ.get("DNA_TEST_TIMEOUT", "60")))
+    try:
+        return _real_run(*a, **kw)
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout.decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        return subprocess.CompletedProcess(a[0], -999, stdout=out, stderr="TIMEOUT after %ss" % kw["timeout"])
+subprocess.run = _run_with_timeout
 SRC = os.path.join(ROOT, "native", "src")
 
 
@@ -24,6 +42,31 @@ def heaptree_difftest():
     return ok
 
 
+def metadata_layout_current():
+    """native/src/MetaDataLayout.gen.h is generated from tools/gen_metadata_layout.py and the row structs;
+    it must be what they produce now (it needs gcc with 32-bit support to measure the structs)."""
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "gen_metadata_layout.py"), "--check"],
+                       capture_output=True, text=True)
+    if r.returncode and "needs gcc with 32-bit support" in (r.stderr + r.stdout):
+        print("  SKIP (needs gcc with 32-bit support)")
+        return True
+    msg = (r.stdout + r.stderr).strip().splitlines()
+    print("  %s %s" % ("ok  " if r.returncode == 0 else "FAIL", msg[-1] if msg else "metadata layout"))
+    return r.returncode == 0
+
+
+def internalcall_params_ok():
+    """Every native method reads its arguments at their real offsets, for 32- and 64-bit pointers
+    (tools/check_internalcall_params.py compares each read with the native's registered signature)."""
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "check_internalcall_params.py")],
+                       capture_output=True, text=True)
+    out = (r.stdout + r.stderr).strip().splitlines()
+    print("  %s %s" % ("ok  " if r.returncode == 0 else "FAIL", out[-1] if out else "native parameter reads"))
+    for l in out[:-1]:
+        print("   ", l)
+    return r.returncode == 0
+
+
 def jit_uninitialised_locals():
     """Deterministic guard for the JIT.c bug where `goto cilCallVirtConstrained`
     skipped the initialiser of `dynamicallyBoxReturnValue`. The crash it caused
@@ -38,13 +81,43 @@ def jit_uninitialised_locals():
     return not bad
 
 
-def dotnet_programs():
-    """Compile tests/dotnet/*.cs against corlib.dll and run them on build/dna32."""
+def net8_run(cs, out):
+    """Compile `cs` with Roslyn against the real .NET reference assemblies and run it on the .NET runtime.
+    Returns its stdout, or None if no .NET SDK/runtime is installed (the caller then skips)."""
     import shutil
-    dna = os.path.join(BUILD, "dna32")
+    dotnet = shutil.which("dotnet")
+    csc = (glob.glob("/usr/lib/dotnet/sdk/*/Roslyn/bincore/csc.dll") or glob.glob("/usr/share/dotnet/sdk/*/Roslyn/bincore/csc.dll") or [None])[0]
+    refs = (glob.glob("/usr/lib/dotnet/packs/Microsoft.NETCore.App.Ref/*/ref/net*") or glob.glob("/usr/share/dotnet/packs/Microsoft.NETCore.App.Ref/*/ref/net*") or [None])[0]
+    rts = sorted(glob.glob("/usr/lib/dotnet/shared/Microsoft.NETCore.App/*") + glob.glob("/usr/share/dotnet/shared/Microsoft.NETCore.App/*"))
+    if not (dotnet and csc and refs and rts):
+        return None
+    dll = os.path.join(out, os.path.basename(cs)[:-3] + ".net.dll")
+    cmd = ["dotnet", csc, "-noconfig", "-nologo", "-unsafe", "-nullable:disable", "-target:exe", "-out:" + dll, cs]
+    cmd += ["-r:" + f for f in glob.glob(os.path.join(refs, "*.dll"))]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode:
+        print("   .NET compile failed:", (r.stdout + r.stderr)[:200]); return ""
+    rt = rts[-1]
+    open(dll[:-4] + ".runtimeconfig.json", "w").write(
+        '{"runtimeOptions":{"tfm":"net8.0","framework":{"name":"Microsoft.NETCore.App","version":"%s"}}}' % os.path.basename(rt))
+    r = subprocess.run(["dotnet", "exec", "--runtimeconfig", dll[:-4] + ".runtimeconfig.json", dll], capture_output=True, text=True)
+    return r.stdout
+
+
+# The results of these depend on the C library underneath: a 32-bit process (DNA) calls the i386 libm and
+# .NET on x86-64 calls the x86-64 one, and those return different bits for these functions. They are
+# reported by the MathBits test but not asserted. (Everything else must agree bit for bit.)
+LIBM_DEPENDENT = {"MathF.Tan", "MathF.Atan", "MathF.Sinh", "MathF.Tanh", "MathF.Log10", "MathF.Cbrt", "MathF.Atan2",
+                  "Math.Sinh", "Math.Cosh", "Math.Tanh", "Math.Exp", "Math.Log10", "Math.Cbrt", "Math.Atan2", "Math.Pow"}
+
+
+def dotnet_programs():
+    """Compile tests/dotnet/*.cs against corlib.dll and run them on the runtime under test (build/dna32 or build/dna)."""
+    import shutil
+    dna = DNA_BIN
     if not shutil.which("mcs") or not os.path.exists(dna) \
             or not os.path.exists(os.path.join(BUILD, "corlib.dll")):
-        print("  SKIP (needs: mcs, `python build.py --m32 --corlib`)")
+        print("  SKIP (needs: mcs, %s and build/corlib.dll)" % os.path.basename(DNA_BIN))
         return True
     expected = {"GcStress": "live nodes: 5000\nchecksum: 91323100"}
     # Programs whose expectations must also hold on the reference runtime. Run under Mono
@@ -62,11 +135,30 @@ def dotnet_programs():
         name = os.path.basename(cs)[:-3]
         dna_only_cs = name.endswith(".dnaonly")   # self-checking; the reference runtime cannot run it
         exe = os.path.join(out, name + ".exe")
-        r = subprocess.run(["mcs", "-nostdlib", "-r:" + os.path.join(out, "corlib.dll"),
+        r = subprocess.run(["mcs", "-nostdlib", "-unsafe", "-r:" + os.path.join(out, "corlib.dll"),
                             "-nowarn:0219", "-out:" + exe, cs], capture_output=True, text=True)
         if r.returncode:
             print("  compile failed:", name, r.stdout + r.stderr); ok = False; continue
         ref_out = None
+        if name == "MathBits":
+            ref = net8_run(cs, out)
+            if ref is None:
+                print("  SKIP MathBits (needs a .NET SDK for the reference run)")
+                continue
+            d = subprocess.run([dna, exe], cwd=out, capture_output=True, text=True)
+            key = lambda t: dict((l.rsplit(" ", 1)[0], l.rsplit(" ", 1)[1].strip()) for l in t.splitlines() if " " in l and not l.startswith("Total execution time"))
+            a, b = key(ref), key(d.stdout)
+            bad = [k for k in a if a[k] != b.get(k) and k not in LIBM_DEPENDENT]
+            soft = [k for k in a if a[k] != b.get(k) and k in LIBM_DEPENDENT]
+            good = d.returncode == 0 and not bad and len(b) == len(a) and len(a) > 0
+            print("  %s MathBits (%d of %d results bit-identical to .NET%s)" % (
+                "ok  " if good else "FAIL", len(a) - len(bad) - len(soft), len(a),
+                "; %d libm-dependent not asserted" % len(soft) if soft else ""))
+            if bad:
+                print("    differ:", ", ".join(bad)); ok = False
+            elif not good:
+                ok = False
+            continue
         if dna_only_cs:
             d = subprocess.run([dna, exe], cwd=out, capture_output=True, text=True)
             print("  %s %s (DNA only, rc=%d, expected 0)" % ("ok  " if d.returncode == 0 else "FAIL", name, d.returncode))
@@ -112,7 +204,7 @@ def il_programs():
     (mscorlib for Mono, corlib for DNA). Assembled once for each; the exit code and the output
     must be identical."""
     import shutil
-    dna = os.path.join(BUILD, "dna32")
+    dna = DNA_BIN
     if not (shutil.which("ilasm") and shutil.which("mono")) or not os.path.exists(dna) \
             or not os.path.exists(os.path.join(BUILD, "corlib.dll")):
         print("  SKIP (needs: ilasm, mono, `python build.py --m32 --corlib`)")
@@ -167,8 +259,10 @@ def il_programs():
 
 
 TESTS = [("heaptree_difftest (C reference vs cpprust-lowered C++)", heaptree_difftest),
+         ("metadata layout (generated) is current", metadata_layout_current),
+         ("native parameter reads match their signatures", internalcall_params_ok),
          ("JIT.c: no conditionally-initialised locals", jit_uninitialised_locals),
-         ("dotnet programs on dna32", dotnet_programs),
+         ("dotnet programs on " + os.path.basename(DNA_BIN), dotnet_programs),
          ("IL programs (opcodes C# does not emit), DNA vs Mono", il_programs)]
 
 if __name__ == "__main__":
