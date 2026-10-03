@@ -199,18 +199,25 @@ U32 Type_IsValueType(tMD_TypeDef *pTypeDef) {
 	if (TYPE_ISINTERFACE(pTypeDef)) {
 		return 0;
 	}
-	// If this type is Object or ValueType then return an answer
+	// System.Object, System.ValueType and System.Enum are themselves classes, i.e. reference types.
+	// Only the types derived from ValueType (structs) and from Enum (enums) are value types.
+	// (ValueType used to answer 1, which made Enum, and so a variable declared as `Enum`, a value
+	// type of size 0: copying one moved nothing, and calling through it crashed.)
 	if (strcmp(pTypeDef->nameSpace, "System") == 0) {
-		if (strcmp(pTypeDef->name, "ValueType") == 0) {
-			return 1;
-		}
-		if (strcmp(pTypeDef->name, "Object") == 0) {
+		if (strcmp(pTypeDef->name, "ValueType") == 0 ||
+			strcmp(pTypeDef->name, "Enum") == 0 ||
+			strcmp(pTypeDef->name, "Object") == 0) {
 			return 0;
 		}
 	}
-	// Return the isValueType determined by parent type
+	// A type derived directly from ValueType or Enum is a value type; any other type is one if its
+	// parent is.
 	pTypeDef = MetaData_GetTypeDefFromDefRefOrSpec(pTypeDef->pMetaData, pTypeDef->extends, NULL, NULL);
 	MetaData_Fill_TypeDef(pTypeDef, NULL, NULL);
+	if (strcmp(pTypeDef->nameSpace, "System") == 0 &&
+		(strcmp(pTypeDef->name, "ValueType") == 0 || strcmp(pTypeDef->name, "Enum") == 0)) {
+		return 1;
+	}
 	return pTypeDef->isValueType;
 }
 
@@ -222,9 +229,19 @@ tMD_TypeDef* Type_GetTypeFromSig(tMetaData *pMetaData, SIG *pSig, tMD_TypeDef **
 	U32 entry;
 
 	entry = MetaData_DecodeSigEntry(pSig);
+	// Custom modifiers (modreq/modopt, e.g. the IsVolatile on a volatile field) come before the type
+	// they decorate and do not change it: read past each one's TypeDefOrRef token.
+	while (entry == ELEMENT_TYPE_CMOD_REQD || entry == ELEMENT_TYPE_CMOD_OPT) {
+		MetaData_DecodeSigEntry(pSig);
+		entry = MetaData_DecodeSigEntry(pSig);
+	}
 	switch (entry) {
 		case ELEMENT_TYPE_VOID:
 			return NULL;
+
+		case ELEMENT_TYPE_TYPEDBYREF:
+			// a System.TypedReference, which signatures give an element type of its own
+			return types[TYPE_SYSTEM_TYPEDREFERENCE];
 
 		case ELEMENT_TYPE_BOOLEAN:
 			return types[TYPE_SYSTEM_BOOLEAN];
@@ -343,9 +360,11 @@ struct tTypeInit_ {
 	char *nameSpace;
 	char *name;
 	U8 stackType;
-	U8 stackSize;
-	U8 arrayElementSize;
-	U8 instanceMemSize;
+	// These were U8, which silently truncated any size over 255 (sizeof(tThread) is more than that
+	// now that it holds the filter contexts, and the thread object would have been under-allocated).
+	U32 stackSize;
+	U32 arrayElementSize;
+	U32 instanceMemSize;
 };
 
 static char mscorlib[] = "mscorlib";
@@ -387,7 +406,7 @@ static tTypeInit typeInit[] = {
 	{mscorlib, System, "Type", EVALSTACK_O,			4, 4, 0},
 	{mscorlib, System, "RuntimeTypeHandle", EVALSTACK_O, 4, 4, 0},
 	{mscorlib, System, "RuntimeMethodHandle", EVALSTACK_O, 4, 4, 0},
-	{mscorlib, System, "Enum", EVALSTACK_VALUETYPE, 0, 0, 0},
+	{mscorlib, System, "Enum", EVALSTACK_O, 4, 4, 0},
 	{NULL, NULL, (char*)TYPE_SYSTEM_STRING, 0, 0, 0, 0},
 	{NULL, NULL, (char*)TYPE_SYSTEM_INT32, 0, 0, 0, 0},
 	{mscorlib, SystemThreading, "Thread", EVALSTACK_O, 4, 4, sizeof(tThread)},
@@ -411,6 +430,8 @@ static tTypeInit typeInit[] = {
 	{mscorlib, SystemReflection, "MemberInfo", EVALSTACK_O, 4, 4, sizeof(tMemberInfo)},
 	{mscorlib, System, "Attribute", EVALSTACK_O, 4, 4, sizeof(tSystemAttribute)},
 	{mscorlib, SystemReflection, "InternalCustomAttributeInfo", EVALSTACK_VALUETYPE, sizeof(tInternalCustomAttributeInfo), sizeof(tInternalCustomAttributeInfo), sizeof(tInternalCustomAttributeInfo) },
+	{mscorlib, System, "DivideByZeroException", EVALSTACK_O, 0, 0, 0},
+	{mscorlib, System, "TypedReference", EVALSTACK_VALUETYPE, 0, 0, 0},
 };
 
 int CorLibDone = 0;

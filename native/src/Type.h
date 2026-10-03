@@ -40,11 +40,14 @@
 #define ELEMENT_TYPE_STRING		0x0e
 #define ELEMENT_TYPE_PTR		0x0f
 #define ELEMENT_TYPE_BYREF		0x10
+#define ELEMENT_TYPE_CMOD_REQD	0x1f
+#define ELEMENT_TYPE_CMOD_OPT	0x20
 #define ELEMENT_TYPE_VALUETYPE	0x11
 #define ELEMENT_TYPE_CLASS		0x12
 #define ELEMENT_TYPE_VAR		0x13 // Generic argument type
 
 #define ELEMENT_TYPE_GENERICINST 0x15
+#define ELEMENT_TYPE_TYPEDBYREF 0x16
 
 #define ELEMENT_TYPE_INTPTR		0x18
 #define ELEMENT_TYPE_UINTPTR	0x19
@@ -109,6 +112,8 @@ extern tMD_TypeDef **types;
 #define TYPE_SYSTEM_REFLECTION_MEMBERINFO 51
 #define TYPE_SYSTEM_ATTRIBUTE 52
 #define TYPE_SYSTEM_REFLECTION_INTERNALCUSTOMATTRIBUTEINFO 53
+#define TYPE_SYSTEM_DIVIDEBYZEROEXCEPTION 54
+#define TYPE_SYSTEM_TYPEDREFERENCE 55
 
 //U32 Type_IsMethod(tMD_MethodDef *pMethod, STRING name, tMD_TypeDef *pReturnType, U32 numParams, ...);
 U32 Type_IsMethod(tMD_MethodDef *pMethod, STRING name, tMD_TypeDef *pReturnType, U32 numParams, U8 *pParamTypeIndexs);
