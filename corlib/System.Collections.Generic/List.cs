@@ -205,6 +205,9 @@ namespace System.Collections.Generic {
 		}
 
 		public void RemoveAt(int index) {
+			if (index < 0 || index >= this.size) {
+				throw new ArgumentOutOfRangeException("index");
+			}
 			this.Shift(index, -1);
 		}
 
@@ -228,7 +231,10 @@ namespace System.Collections.Generic {
 		}
 
 		public bool Remove(T item) {
-			int idx = Array.IndexOf(this.items, item);
+			// Search only the live elements. Searching the whole backing array also matched
+			// the default(T) slots past `size`, so Remove(default) on a list lacking that
+			// value reported success and deleted the last element.
+			int idx = this.IndexOf(item);
 			if (idx >= 0) {
 				this.RemoveAt(idx);
 				return true;
