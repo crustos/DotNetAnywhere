@@ -47,15 +47,18 @@ def heaptree_difftest():
 
 
 def metadata_layout_current():
-    """native/src/MetaDataLayout.gen.h is generated from tools/gen_metadata_layout.py and the row structs;
-    it must be what they produce now (it needs gcc with 32-bit support to measure the structs)."""
-    r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "gen_metadata_layout.py"), "--check"],
-                       capture_output=True, text=True)
-    if r.returncode and "needs gcc with 32-bit support" in (r.stderr + r.stdout):
-        print("  SKIP (needs gcc with 32-bit support)")
-        return True
-    msg = (r.stdout + r.stderr).strip().splitlines()
-    print("  %s %s" % ("ok  " if r.returncode == 0 else "FAIL", msg[-1] if msg else "metadata layout"))
+    """native/src/MetaDataLayout.gen.h is generated (by build.py) from tools/gen_metadata_layout.py and the row
+    structs; it must be what they produce now."""
+    # --verify-with-compiler also cross-checks the layout the generator computes against gcc -m32's, when there is one
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "gen_metadata_layout.py"), "--check",
+                        "--verify-with-compiler"], capture_output=True, text=True)
+    out = (r.stdout + r.stderr).strip().splitlines()
+    cross = [l for l in out if l.startswith("layout cross-check") or "cross-check skipped" in l]
+    print("  %s MetaDataLayout.gen.h is up to date%s" % ("ok  " if r.returncode == 0 else "FAIL",
+          ("; " + cross[0]) if cross and r.returncode == 0 else ""))
+    if r.returncode:
+        for l in out[-4:]:
+            print("   ", l)
     return r.returncode == 0
 
 
