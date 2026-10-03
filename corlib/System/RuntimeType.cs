@@ -57,8 +57,12 @@ namespace System {
 		public override string FullName {
 			get {
 				StringBuilder ret = new StringBuilder(32);
-				ret.Append(this.Namespace);
-				ret.Append('.');
+				// A type in the global namespace has no "namespace." prefix (this used to give ".Name")
+				string ns = this.Namespace;
+				if (ns != null && ns.Length > 0) {
+					ret.Append(ns);
+					ret.Append('.');
+				}
 				RuntimeType nestingParentType = this.GetNestingParentType();
 				if (nestingParentType != null) {
 					List<Type> nestingParents = new List<Type>();

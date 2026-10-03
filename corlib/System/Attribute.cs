@@ -21,6 +21,10 @@
 #if !LOCALTEST
 
 namespace System {
+	// As in the reference framework. Compilers (mcs, csc) read this off the base
+	// class when a user-defined attribute declares no [AttributeUsage] of its own;
+	// without it mcs crashes while emitting any custom attribute.
+	[AttributeUsage(AttributeTargets.All, Inherited = true, AllowMultiple = false)]
 	public abstract class Attribute {
 	}
 }

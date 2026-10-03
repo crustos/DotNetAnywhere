@@ -133,14 +133,24 @@ namespace System {
         [MethodImpl(MethodImplOptions.InternalCall)]
         extern private object GetMethodInternal(string name);
 
+        // Null-safe. The previous version, `t1?.FullName.Equals(t2?.FullName) == true`, made
+        // (Type)null == null evaluate to false, and `null != t` false as well.
         public static bool operator ==(Type t1, Type t2)
         {
-            return t1?.FullName.Equals(t2?.FullName) == true;
+            if (object.ReferenceEquals(t1, t2))
+            {
+                return true; // the same object, or both null
+            }
+            if (object.ReferenceEquals(t1, null) || object.ReferenceEquals(t2, null))
+            {
+                return false;
+            }
+            return t1.FullName.Equals(t2.FullName);
         }
 
         public static bool operator !=(Type t1, Type t2)
         {
-            return t1?.FullName.Equals(t2?.FullName) == false;
+            return !(t1 == t2);
         }
     }
 #pragma warning restore 0660, 0661
