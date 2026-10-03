@@ -61,12 +61,16 @@ namespace System {
 			return (v >= 0) ? v : -v;
 		}
 
-		public static float Abs(float v) {
-			return (v >= 0) ? v : -v;
+		// Clear the sign bit, as the reference runtime does: Abs(-0.0) is +0.0 (the comparison
+		// version returned -0.0 for it), and the sign of a NaN is cleared too.
+		public static unsafe float Abs(float v) {
+			uint bits = *(uint*)&v & 0x7FFFFFFFu;
+			return *(float*)&bits;
 		}
 
-		public static double Abs(double v) {
-			return (v >= 0) ? v : -v;
+		public static unsafe double Abs(double v) {
+			ulong bits = *(ulong*)&v & 0x7FFFFFFFFFFFFFFFUL;
+			return *(double*)&bits;
 		}
 
 		#endregion
@@ -105,18 +109,26 @@ namespace System {
 			return (v1 < v2) ? v1 : v2;
 		}
 
+		// Of two equal values the sign of zero decides: Min(-0, +0) and Min(+0, -0) are both -0.
+		// A NaN in either position gives NaN.
 		public static float Min(float v1, float v2) {
-			if (float.IsNaN(v1) || float.IsNaN(v2)) {
-				return float.NaN;
+			if (v1 != v2) {
+				if (!float.IsNaN(v1)) {
+					return v1 < v2 ? v1 : v2;
+				}
+				return v1;
 			}
-			return (v1 < v2) ? v1 : v2;
+			return IsNegative(v1) ? v1 : v2;
 		}
 
 		public static double Min(double v1, double v2) {
-			if (double.IsNaN(v1) || double.IsNaN(v2)) {
-				return double.NaN;
+			if (v1 != v2) {
+				if (!double.IsNaN(v1)) {
+					return v1 < v2 ? v1 : v2;
+				}
+				return v1;
 			}
-			return (v1 < v2) ? v1 : v2;
+			return IsNegative(v1) ? v1 : v2;
 		}
 
 		#endregion
@@ -155,19 +167,28 @@ namespace System {
 			return (v1 > v2) ? v1 : v2;
 		}
 
+		// Of two equal values the sign of zero decides: Max(-0, +0) and Max(+0, -0) are both +0.
 		public static float Max(float v1, float v2) {
-			if (float.IsNaN(v1) || float.IsNaN(v2)) {
-				return float.NaN;
+			if (v1 != v2) {
+				if (!float.IsNaN(v1)) {
+					return v1 < v2 ? v2 : v1;
+				}
+				return v1;
 			}
-			return (v1 > v2) ? v1 : v2;
+			return IsNegative(v2) ? v1 : v2;
 		}
 
 		public static double Max(double v1, double v2) {
-			if (double.IsNaN(v1) || double.IsNaN(v2)) {
-				return double.NaN;
+			if (v1 != v2) {
+				if (!double.IsNaN(v1)) {
+					return v1 < v2 ? v2 : v1;
+				}
+				return v1;
 			}
-			return (v1 > v2) ? v1 : v2;
+			return IsNegative(v2) ? v1 : v2;
 		}
+		private static bool IsNegative(float f) { return f < 0 || (f == 0 && 1.0f / f < 0); }
+		private static bool IsNegative(double d) { return d < 0 || (d == 0 && 1.0 / d < 0); }
 
 		#endregion
 
@@ -219,5 +240,133 @@ namespace System {
 
 		[MethodImplAttribute(MethodImplOptions.InternalCall)]
 		public extern static double Sqrt(double x);
+
+		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+		public extern static double Asin(double x);
+
+		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+		public extern static double Acos(double x);
+
+		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+		public extern static double Atan(double x);
+
+		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+		public extern static double Sinh(double x);
+
+		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+		public extern static double Cosh(double x);
+
+		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+		public extern static double Tanh(double x);
+
+		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+		public extern static double Exp(double x);
+
+		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+		public extern static double Log(double x);
+
+		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+		public extern static double Log10(double x);
+
+		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+		public extern static double Log2(double x);
+
+		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+		public extern static double Floor(double x);
+
+		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+		public extern static double Ceiling(double x);
+
+		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+		public extern static double Round(double x);
+
+		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+		public extern static double Truncate(double x);
+
+		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+		public extern static double Cbrt(double x);
+
+		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+		public extern static double Atan2(double x, double y);
+
+		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+		public extern static double IEEERemainder(double x, double y);
+
+		public static double Log(double a, double newBase) {
+			return Log(a) / Log(newBase);
+		}
+
+		#region Clamp()
+
+		public static sbyte Clamp(sbyte value, sbyte min, sbyte max) {
+			if (min > max) {
+				throw new ArgumentException("min is greater than max");
+			}
+			return (value < min) ? min : ((value > max) ? max : value);
+		}
+
+		public static short Clamp(short value, short min, short max) {
+			if (min > max) {
+				throw new ArgumentException("min is greater than max");
+			}
+			return (value < min) ? min : ((value > max) ? max : value);
+		}
+
+		public static int Clamp(int value, int min, int max) {
+			if (min > max) {
+				throw new ArgumentException("min is greater than max");
+			}
+			return (value < min) ? min : ((value > max) ? max : value);
+		}
+
+		public static long Clamp(long value, long min, long max) {
+			if (min > max) {
+				throw new ArgumentException("min is greater than max");
+			}
+			return (value < min) ? min : ((value > max) ? max : value);
+		}
+
+		public static byte Clamp(byte value, byte min, byte max) {
+			if (min > max) {
+				throw new ArgumentException("min is greater than max");
+			}
+			return (value < min) ? min : ((value > max) ? max : value);
+		}
+
+		public static ushort Clamp(ushort value, ushort min, ushort max) {
+			if (min > max) {
+				throw new ArgumentException("min is greater than max");
+			}
+			return (value < min) ? min : ((value > max) ? max : value);
+		}
+
+		public static uint Clamp(uint value, uint min, uint max) {
+			if (min > max) {
+				throw new ArgumentException("min is greater than max");
+			}
+			return (value < min) ? min : ((value > max) ? max : value);
+		}
+
+		public static ulong Clamp(ulong value, ulong min, ulong max) {
+			if (min > max) {
+				throw new ArgumentException("min is greater than max");
+			}
+			return (value < min) ? min : ((value > max) ? max : value);
+		}
+
+		public static float Clamp(float value, float min, float max) {
+			if (min > max) {
+				throw new ArgumentException("min is greater than max");
+			}
+			return (value < min) ? min : ((value > max) ? max : value);
+		}
+
+		public static double Clamp(double value, double min, double max) {
+			if (min > max) {
+				throw new ArgumentException("min is greater than max");
+			}
+			return (value < min) ? min : ((value > max) ? max : value);
+		}
+		#endregion
 	}
 }
