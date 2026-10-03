@@ -355,6 +355,9 @@ tMD_TypeDef **types;
 static U32 numInitTypes;
 
 typedef struct tTypeInit_ tTypeInit;
+// The size of a reference (and so of a reference-typed value on the evaluation stack, and an array element)
+#define PTRSZ ((U32)sizeof(void*))
+
 struct tTypeInit_ {
 	char *assemblyName;
 	char *nameSpace;
@@ -376,43 +379,43 @@ static char SystemIO[] = "System.IO";
 static char SystemGlobalization[] = "System.Globalization";
 
 static tTypeInit typeInit[] = {
-	{mscorlib, System, "Object", EVALSTACK_O,		4, 4, 0},
-	{mscorlib, System, "Array", EVALSTACK_O,		4, 4, 0},
-	{mscorlib, System, "Void", EVALSTACK_O,			4, 4, 0},
+	{mscorlib, System, "Object", EVALSTACK_O,		PTRSZ, PTRSZ, 0},
+	{mscorlib, System, "Array", EVALSTACK_O,		PTRSZ, PTRSZ, 0},
+	{mscorlib, System, "Void", EVALSTACK_O,			PTRSZ, PTRSZ, 0},
 	{mscorlib, System, "Boolean", EVALSTACK_INT32,	4, 4, 4},
 	{mscorlib, System, "Byte", EVALSTACK_INT32,		4, 1, 4},
 	{mscorlib, System, "SByte", EVALSTACK_INT32,	4, 1, 4},
 	{mscorlib, System, "Char", EVALSTACK_INT32,		4, 2, 4},
 	{mscorlib, System, "Int16", EVALSTACK_INT32,	4, 2, 4},
 	{mscorlib, System, "Int32", EVALSTACK_INT32,	4, 4, 4},
-	{mscorlib, System, "String", EVALSTACK_O,		4, 4, 0},
+	{mscorlib, System, "String", EVALSTACK_O,		PTRSZ, PTRSZ, 0},
 	{mscorlib, System, "IntPtr", EVALSTACK_PTR,		sizeof(void*), sizeof(void*), 0},
-	{mscorlib, System, "RuntimeFieldHandle", EVALSTACK_O, 4, 4, 0},
+	{mscorlib, System, "RuntimeFieldHandle", EVALSTACK_O, PTRSZ, PTRSZ, 0},
 	{mscorlib, System, "InvalidCastException", EVALSTACK_O, 0, 0, 0},
 	{mscorlib, System, "UInt32", EVALSTACK_INT32,	4, 4, 4},
 	{mscorlib, System, "UInt16", EVALSTACK_INT32,	4, 2, 4},
 	{NULL, NULL, (char*)TYPE_SYSTEM_CHAR, 0, 0, 0, 0},
 	{NULL, NULL, (char*)TYPE_SYSTEM_OBJECT, 0, 0, 0, 0},
-	{mscorlib, SystemCollectionsGeneric, "IEnumerable`1", EVALSTACK_O,	4, 4, 0},
-	{mscorlib, SystemCollectionsGeneric, "ICollection`1", EVALSTACK_O,	4, 4, 0},
-	{mscorlib, SystemCollectionsGeneric, "IList`1", EVALSTACK_O,		4, 4, 0},
+	{mscorlib, SystemCollectionsGeneric, "IEnumerable`1", EVALSTACK_O,	PTRSZ, PTRSZ, 0},
+	{mscorlib, SystemCollectionsGeneric, "ICollection`1", EVALSTACK_O,	PTRSZ, PTRSZ, 0},
+	{mscorlib, SystemCollectionsGeneric, "IList`1", EVALSTACK_O,		PTRSZ, PTRSZ, 0},
 	{mscorlib, System, "MulticastDelegate", EVALSTACK_O,				0, 0, 0},
 	{mscorlib, System, "NullReferenceException", EVALSTACK_O,			0, 0, 0},
 	{mscorlib, System, "Single", EVALSTACK_F32,		4, 4, 4},
 	{mscorlib, System, "Double", EVALSTACK_F64,		8, 8, 8},
 	{mscorlib, System, "Int64", EVALSTACK_INT64,	8, 8, 8},
 	{mscorlib, System, "UInt64", EVALSTACK_INT64,	8, 8, 8},
-	{mscorlib, System, "RuntimeType", EVALSTACK_O,	4, 4, sizeof(tRuntimeType)},
-	{mscorlib, System, "Type", EVALSTACK_O,			4, 4, 0},
-	{mscorlib, System, "RuntimeTypeHandle", EVALSTACK_O, 4, 4, 0},
-	{mscorlib, System, "RuntimeMethodHandle", EVALSTACK_O, 4, 4, 0},
-	{mscorlib, System, "Enum", EVALSTACK_O, 4, 4, 0},
+	{mscorlib, System, "RuntimeType", EVALSTACK_O,	PTRSZ, PTRSZ, sizeof(tRuntimeType)},
+	{mscorlib, System, "Type", EVALSTACK_O,			PTRSZ, PTRSZ, 0},
+	{mscorlib, System, "RuntimeTypeHandle", EVALSTACK_O, PTRSZ, PTRSZ, 0},
+	{mscorlib, System, "RuntimeMethodHandle", EVALSTACK_O, PTRSZ, PTRSZ, 0},
+	{mscorlib, System, "Enum", EVALSTACK_O, PTRSZ, PTRSZ, 0},
 	{NULL, NULL, (char*)TYPE_SYSTEM_STRING, 0, 0, 0, 0},
 	{NULL, NULL, (char*)TYPE_SYSTEM_INT32, 0, 0, 0, 0},
-	{mscorlib, SystemThreading, "Thread", EVALSTACK_O, 4, 4, sizeof(tThread)},
+	{mscorlib, SystemThreading, "Thread", EVALSTACK_O, PTRSZ, PTRSZ, sizeof(tThread)},
 	{mscorlib, SystemThreading, "ThreadStart", EVALSTACK_O, 0, 0, 0},
 	{mscorlib, SystemThreading, "ParameterizedThreadStart", EVALSTACK_O, 0, 0, 0},
-	{mscorlib, System, "WeakReference", EVALSTACK_O, 4, 4, 0},
+	{mscorlib, System, "WeakReference", EVALSTACK_O, PTRSZ, PTRSZ, 0},
 	{mscorlib, SystemIO, "FileMode", EVALSTACK_O, 0, 0, 0},
 	{mscorlib, SystemIO, "FileAccess", EVALSTACK_O, 0, 0, 0},
 	{mscorlib, SystemIO, "FileShare", EVALSTACK_O, 0, 0, 0},
@@ -424,11 +427,11 @@ static tTypeInit typeInit[] = {
 	{mscorlib, System, "UIntPtr", EVALSTACK_PTR,		sizeof(void*), sizeof(void*), 0},
 	{mscorlib, System, "Nullable`1", EVALSTACK_VALUETYPE, 0, 0, 0},
 	{NULL, NULL, (char*)TYPE_SYSTEM_TYPE, 0, 0, 0, 0},
-	{mscorlib, SystemReflection, "PropertyInfo", EVALSTACK_O, 4, 4, sizeof(tPropertyInfo)},
-	{mscorlib, SystemReflection, "MethodInfo", EVALSTACK_O, 4, 4, sizeof(tMethodInfo)},
-	{mscorlib, SystemReflection, "MethodBase", EVALSTACK_O, 4, 4, sizeof(tMethodBase)},
-	{mscorlib, SystemReflection, "MemberInfo", EVALSTACK_O, 4, 4, sizeof(tMemberInfo)},
-	{mscorlib, System, "Attribute", EVALSTACK_O, 4, 4, sizeof(tSystemAttribute)},
+	{mscorlib, SystemReflection, "PropertyInfo", EVALSTACK_O, PTRSZ, PTRSZ, sizeof(tPropertyInfo)},
+	{mscorlib, SystemReflection, "MethodInfo", EVALSTACK_O, PTRSZ, PTRSZ, sizeof(tMethodInfo)},
+	{mscorlib, SystemReflection, "MethodBase", EVALSTACK_O, PTRSZ, PTRSZ, sizeof(tMethodBase)},
+	{mscorlib, SystemReflection, "MemberInfo", EVALSTACK_O, PTRSZ, PTRSZ, sizeof(tMemberInfo)},
+	{mscorlib, System, "Attribute", EVALSTACK_O, PTRSZ, PTRSZ, sizeof(tSystemAttribute)},
 	{mscorlib, SystemReflection, "InternalCustomAttributeInfo", EVALSTACK_VALUETYPE, sizeof(tInternalCustomAttributeInfo), sizeof(tInternalCustomAttributeInfo), sizeof(tInternalCustomAttributeInfo) },
 	{mscorlib, System, "DivideByZeroException", EVALSTACK_O, 0, 0, 0},
 	{mscorlib, System, "TypedReference", EVALSTACK_VALUETYPE, 0, 0, 0},
@@ -548,4 +551,17 @@ HEAP_PTR Type_GetTypeObject(tMD_TypeDef *pTypeDef) {
 		pTypeDef->typeObject = RuntimeType_New(pTypeDef);
 	}
 	return pTypeDef->typeObject;
+}
+tMD_FieldDef* Type_NullableValueField(tMD_TypeDef *pNullable) {
+	U32 i;
+
+	MetaData_Fill_TypeDef(pNullable, NULL, NULL);
+	for (i=0; i<pNullable->numFields; i++) {
+		tMD_FieldDef *pField = pNullable->ppFields[i];
+		if (!FIELD_ISSTATIC(pField) && strcmp(pField->name, "value") == 0) {
+			return pField;
+		}
+	}
+	Crash("Nullable type has no 'value' field");
+	FAKE_RETURN;
 }
