@@ -4,12 +4,16 @@ import glob, os, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build")
-# The runtime under test: build/dna32 by default; `--64` (or DNA_BIN=path) tests the 64-bit build, build/dna.
-# The tests compare with Mono / .NET, so they do not depend on the pointer size.
-if "--64" in sys.argv:
-    sys.argv.remove("--64")
-    os.environ["DNA_BIN"] = os.path.join(BUILD, "dna")
-DNA_BIN = os.environ.get("DNA_BIN", os.path.join(BUILD, "dna32"))
+# The runtime under test. `--64` tests build/dna, `--32` tests build/dna32, DNA_BIN=path names one; with none of
+# those it is build/dna if that exists, else build/dna32. The tests compare with Mono / .NET, so they do not depend
+# on the pointer size.
+for _flag, _name in (("--64", "dna"), ("--32", "dna32")):
+    if _flag in sys.argv:
+        sys.argv.remove(_flag)
+        os.environ["DNA_BIN"] = os.path.join(BUILD, _name)
+if "DNA_BIN" not in os.environ:
+    os.environ["DNA_BIN"] = os.path.join(BUILD, "dna" if os.path.exists(os.path.join(BUILD, "dna")) else "dna32")
+DNA_BIN = os.environ["DNA_BIN"]
 
 # Every external run gets a timeout, so one hanging program (a runtime that spins) fails its own check
 # instead of stalling the whole suite. DNA_TEST_TIMEOUT overrides the 60 seconds.
@@ -104,9 +108,10 @@ def net8_run(cs, out):
     return r.stdout
 
 
-# The results of these depend on the C library underneath: a 32-bit process (DNA) calls the i386 libm and
-# .NET on x86-64 calls the x86-64 one, and those return different bits for these functions. They are
-# reported by the MathBits test but not asserted. (Everything else must agree bit for bit.)
+# The results of these depend on the C library underneath: a 32-bit process (dna32) calls the i386 libm and
+# .NET on x86-64 calls the x86-64 one, and those return different bits for these functions. For the 32-bit
+# build they are reported by the MathBits test but not asserted. (Everything else must agree bit for bit, and
+# the 64-bit build must match on all of them.)
 LIBM_DEPENDENT = {"MathF.Tan", "MathF.Atan", "MathF.Sinh", "MathF.Tanh", "MathF.Log10", "MathF.Cbrt", "MathF.Atan2",
                   "Math.Sinh", "Math.Cosh", "Math.Tanh", "Math.Exp", "Math.Log10", "Math.Cbrt", "Math.Atan2", "Math.Pow"}
 
@@ -148,8 +153,11 @@ def dotnet_programs():
             d = subprocess.run([dna, exe], cwd=out, capture_output=True, text=True)
             key = lambda t: dict((l.rsplit(" ", 1)[0], l.rsplit(" ", 1)[1].strip()) for l in t.splitlines() if " " in l and not l.startswith("Total execution time"))
             a, b = key(ref), key(d.stdout)
-            bad = [k for k in a if a[k] != b.get(k) and k not in LIBM_DEPENDENT]
-            soft = [k for k in a if a[k] != b.get(k) and k in LIBM_DEPENDENT]
+            # The libm-dependent results are only excused for the 32-bit build (which calls the i386 C library);
+            # a 64-bit build calls the same x86-64 one .NET does, so there every result must match.
+            excused = LIBM_DEPENDENT if os.path.basename(dna) == "dna32" else set()
+            bad = [k for k in a if a[k] != b.get(k) and k not in excused]
+            soft = [k for k in a if a[k] != b.get(k) and k in excused]
             good = d.returncode == 0 and not bad and len(b) == len(a) and len(a) > 0
             print("  %s MathBits (%d of %d results bit-identical to .NET%s)" % (
                 "ok  " if good else "FAIL", len(a) - len(bad) - len(soft), len(a),

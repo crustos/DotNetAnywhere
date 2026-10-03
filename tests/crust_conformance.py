@@ -9,7 +9,7 @@ Crust's tests, then for each one:
      tests assert specific codes, not just 0). Programs Mono can't compile or run
      are skipped, with the reason.
   2. dna-compile: compile against DNA's corlib.dll. Failure = a corlib API gap.
-  3. dna-run / dna-wrong: run on build/dna32. dna-run = DNA crashed; dna-wrong =
+  3. dna-run / dna-wrong: run on the runtime under test (build/dna or build/dna32). dna-run = DNA crashed; dna-wrong =
      it ran but returned a different exit code than Mono.
 
 Usage:
@@ -21,11 +21,16 @@ import argparse, ast, collections, concurrent.futures as cf, glob, hashlib, os, 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build")
 WORK = os.path.join(BUILD, "conformance")
-# runtime under test: build/dna32 by default, `--64` or DNA_BIN=path for the 64-bit build
-if "--64" in sys.argv:
-    sys.argv.remove("--64")
-    os.environ["DNA_BIN"] = os.path.join(BUILD, "dna")
-DNA_BIN = os.environ.get("DNA_BIN", os.path.join(BUILD, "dna32"))
+# The runtime under test. `--64` tests build/dna, `--32` tests build/dna32, DNA_BIN=path names one; with none of
+# those it is build/dna if that exists, else build/dna32. The tests compare with Mono / .NET, so they do not depend
+# on the pointer size.
+for _flag, _name in (("--64", "dna"), ("--32", "dna32")):
+    if _flag in sys.argv:
+        sys.argv.remove(_flag)
+        os.environ["DNA_BIN"] = os.path.join(BUILD, _name)
+if "DNA_BIN" not in os.environ:
+    os.environ["DNA_BIN"] = os.path.join(BUILD, "dna" if os.path.exists(os.path.join(BUILD, "dna")) else "dna32")
+DNA_BIN = os.environ["DNA_BIN"]
 
 
 # Crust's blittable tests build `public int Run()` programs with a _program() helper
