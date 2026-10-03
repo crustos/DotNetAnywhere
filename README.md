@@ -14,3 +14,7 @@ build.cmd
 Two files will be generated in the `build` folder:
 - `dna.wasm`
 - `dna.js`
+
+## Native build and tests
+
+For the gcc build (`build.py`), the Crust integration and the test suite, see [NATIVE.md](NATIVE.md).
