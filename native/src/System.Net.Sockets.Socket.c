@@ -75,7 +75,8 @@ tAsyncCall* System_Net_Sockets_Internal_CreateSocket(PTR pThis_, PTR pParams, PT
 	fcntl(s, F_SETFL, O_NONBLOCK);
 #endif
 
-	*(int*)pReturnValue = s;
+	// The socket is returned as an IntPtr, which is pointer-sized
+	*(PTR*)pReturnValue = (PTR)(intptr_t)s;
 
 	return NULL;
 }
@@ -86,9 +87,9 @@ tAsyncCall* System_Net_Sockets_Internal_Bind(PTR pThis_, PTR pParams, PTR pRetur
 	int r;
 
 	int s = INTERNALCALL_PARAM(0, int);
-	U32 addr = INTERNALCALL_PARAM(4, U32);
-	U32 port = INTERNALCALL_PARAM(8, U32);
-	U32 *pError = INTERNALCALL_PARAM(12, U32*);
+	U32 addr = INTERNALCALL_PARAM(PSZ, U32);
+	U32 port = INTERNALCALL_PARAM(PSZ+4, U32);
+	U32 *pError = INTERNALCALL_PARAM(PSZ+8, U32*);
 
 	sa.sin_family = AF_INET;
 #ifdef _WIN32
@@ -119,8 +120,8 @@ tAsyncCall* System_Net_Sockets_Internal_Close(PTR pThis_, PTR pParams, PTR pRetu
 
 tAsyncCall* System_Net_Sockets_Internal_Listen(PTR pThis_, PTR pParams, PTR pReturnValue) {
 	int s = INTERNALCALL_PARAM(0, int);
-	U32 backlog = INTERNALCALL_PARAM(4, U32);
-	U32 *pError = INTERNALCALL_PARAM(8, U32*);
+	U32 backlog = INTERNALCALL_PARAM(PSZ, U32);
+	U32 *pError = INTERNALCALL_PARAM(PSZ+4, U32*);
 
 	int r = listen(s, backlog);
 

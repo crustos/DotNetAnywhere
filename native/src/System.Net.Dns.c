@@ -39,7 +39,7 @@ tAsyncCall* System_Net_Dns_Internal_GetHostEnt(PTR pThis_, PTR pParams, PTR pRet
 	U8 nameU8[256];
 
 	HEAP_PTR name = INTERNALCALL_PARAM(0, STRING);
-	HEAP_PTR *pHostName = INTERNALCALL_PARAM(4, STRING*);
+	HEAP_PTR *pHostName = INTERNALCALL_PARAM(PSZ, STRING*);
 
 	name2 = SystemString_GetString(name, &len);
 	for (i=0; i<len && i<256; i++) {

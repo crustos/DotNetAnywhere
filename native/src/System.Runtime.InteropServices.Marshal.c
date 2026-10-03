@@ -154,7 +154,7 @@ tAsyncCall* System_Runtime_InteropServices_MemoryMarshal_Serialize(PTR pThis_, P
 	tMD_TypeDef *pType = RuntimeType_DeRef((PTR)((tMD_TypeDef**)pParams)[0]);
 	HEAP_PTR boxed = ((HEAP_PTR*)pParams)[1];
 	HEAP_PTR dst = ((HEAP_PTR*)pParams)[2];
-	I32 offset = INTERNALCALL_PARAM(12, I32);
+	I32 offset = INTERNALCALL_PARAM(3*PSZ, I32);
 	U32 size, align;
 
 	if (!HostIsLittleEndian()) {
@@ -173,7 +173,7 @@ tAsyncCall* System_Runtime_InteropServices_MemoryMarshal_Serialize(PTR pThis_, P
 tAsyncCall* System_Runtime_InteropServices_MemoryMarshal_Deserialize(PTR pThis_, PTR pParams, PTR pReturnValue) {
 	tMD_TypeDef *pType = RuntimeType_DeRef((PTR)((tMD_TypeDef**)pParams)[0]);
 	HEAP_PTR src = ((HEAP_PTR*)pParams)[1];
-	I32 offset = INTERNALCALL_PARAM(8, I32);
+	I32 offset = INTERNALCALL_PARAM(2*PSZ, I32);
 	U32 size, align;
 	HEAP_PTR boxed;
 

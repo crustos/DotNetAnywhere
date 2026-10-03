@@ -53,10 +53,10 @@ tAsyncCall* System_IO_FileInternal_Open(PTR pThis_, PTR pParams, PTR pReturnValu
 	int flags, error = 0;
 	
 	filename2 = SystemString_GetString(((HEAP_PTR*)pParams)[0], &filenameLen);
-	mode = ((U32*)pParams)[1];
-	access = ((U32*)pParams)[2];
-	share = ((U32*)pParams)[3];
-	pError = ((U32**)pParams)[4];
+	mode = INTERNALCALL_PARAM(PSZ, U32);
+	access = INTERNALCALL_PARAM(PSZ+4, U32);
+	share = INTERNALCALL_PARAM(PSZ+8, U32);
+	pError = INTERNALCALL_PARAM(PSZ+12, U32*);
 
 	for (i=0; i<filenameLen; i++) {
 		filename[i] = (unsigned char)filename2[i];
@@ -80,7 +80,8 @@ tAsyncCall* System_IO_FileInternal_Open(PTR pThis_, PTR pParams, PTR pReturnValu
 	}
 
 done:
-	*(I32*)pReturnValue = f;
+	// The handle is returned as an IntPtr, which is pointer-sized (-1 for failure stays -1)
+	*(PTR*)pReturnValue = (PTR)(intptr_t)f;
 	*pError = error;
 	return NULL;
 }
@@ -95,9 +96,9 @@ tAsyncCall* System_IO_FileInternal_Read(PTR pThis_, PTR pParams, PTR pReturnValu
 
 	f = ((U32*)pParams)[0];
 	dst = ((HEAP_PTR*)pParams)[1];
-	startOfs = ((U32*)pParams)[2];
-	count = ((U32*)pParams)[3];
-	pError = ((U32**)pParams)[4];
+	startOfs = INTERNALCALL_PARAM(2*PSZ, U32);
+	count = INTERNALCALL_PARAM(2*PSZ+4, U32);
+	pError = INTERNALCALL_PARAM(2*PSZ+8, U32*);
 	pFirstElement = SystemArray_LoadElementAddress(dst, startOfs);
 
 	ret = read(f, pFirstElement, count);
@@ -115,7 +116,7 @@ tAsyncCall* System_IO_FileInternal_Close(PTR pThis_, PTR pParams, PTR pReturnVal
 	U32 *pError;
 
 	f = ((U32*)pParams)[0];
-	pError = ((U32**)pParams)[1];
+	pError = INTERNALCALL_PARAM(PSZ, U32*);
 
 	close(f);
 
@@ -164,7 +165,7 @@ static U32 Attrs(unsigned char *pPath, U32 *pError) {
 
 tAsyncCall* System_IO_FileInternal_GetFileAttributes(PTR pThis_, PTR pParams, PTR pReturnValue) {
 	HEAP_PTR pathHeapPtr = ((HEAP_PTR*)pParams)[0];
-	U32 *pError = ((U32**)pParams)[1];
+	U32 *pError = INTERNALCALL_PARAM(PSZ, U32*);
 	U32 pathLen;
 	STRING2 path = SystemString_GetString(pathHeapPtr, &pathLen);
 	U32 ret;
@@ -193,9 +194,9 @@ tAsyncCall* System_IO_FileInternal_GetFileAttributes(PTR pThis_, PTR pParams, PT
 tAsyncCall* System_IO_FileInternal_GetFileSystemEntries(PTR pThis_, PTR pParams, PTR pReturnValue) {
 	//HEAP_PTR pathHP = ((HEAP_PTR*)pParams)[0];
 	HEAP_PTR pathPatternHP = ((HEAP_PTR*)pParams)[1];
-	U32 attrs = ((U32*)pParams)[2];
-	U32 mask = ((U32*)pParams)[3];
-	U32* pError = ((U32**)pParams)[4];
+	U32 attrs = INTERNALCALL_PARAM(2*PSZ, U32);
+	U32 mask = INTERNALCALL_PARAM(2*PSZ+4, U32);
+	U32* pError = INTERNALCALL_PARAM(2*PSZ+8, U32*);
 	U32 /*pathLen,*/ pathPatternLen;
 	//STRING2 path = SystemString_GetString(pathHP, &pathLen);
 	STRING2 pathPattern = SystemString_GetString(pathPatternHP, &pathPatternLen);

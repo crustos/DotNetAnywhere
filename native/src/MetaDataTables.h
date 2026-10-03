@@ -471,8 +471,9 @@ struct tMD_ImplMap_ {
 
 // Table 0x1D - FieldRVA
 struct tMD_FieldRVA_ {
-	// The RVA of the initial data for the field
-	U32 rva;
+	// The initial data for the field: the loader turns the RVA in the file into a pointer to the data.
+	// (This was U32, which held a pointer only by coincidence on a 32-bit target.)
+	PTR rva;
 	// Index into the field table
 	IDX_TABLE field;
 };

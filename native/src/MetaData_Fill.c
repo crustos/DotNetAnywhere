@@ -58,7 +58,7 @@ void MetaData_Fill_FieldDef(tMD_TypeDef *pParentType, tMD_FieldDef *pFieldDef, U
 
 			pFieldRVA = (tMD_FieldRVA*)MetaData_GetTableRow(pMetaData, MAKE_TABLE_INDEX(MD_TABLE_FIELDRVA, i));
 			if (pFieldRVA->field == pFieldDef->tableIndex) {
-				pFieldDef->pMemory = (PTR)pFieldRVA->rva;
+				pFieldDef->pMemory = pFieldRVA->rva;
 				break;
 			}
 		}
@@ -109,17 +109,19 @@ void MetaData_Fill_MethodDef(tMD_TypeDef *pParentType, tMD_MethodDef *pMethodDef
 	if (!METHOD_ISSTATIC(pMethodDef)) {
 		// Fill in parameter info for the 'this' pointer
 		pMethodDef->pParams->offset = 0;
+		// ('this' is a pointer, so it is pointer-sized: this was a hard-coded 4)
 		if (pParentType->isValueType) {
 			// If this is a value-type then the 'this' pointer is actually an IntPtr to the value-type's location
-			pMethodDef->pParams->size = 4;
+			pMethodDef->pParams->size = sizeof(void*);
 			pMethodDef->pParams->pTypeDef = types[TYPE_SYSTEM_INTPTR];
 		} else {
-			pMethodDef->pParams->size = 4;
+			pMethodDef->pParams->size = sizeof(void*);
 			pMethodDef->pParams->pTypeDef = pParentType;
 		}
-		totalSize = 4;
+		totalSize = sizeof(void*);
 	}
-	for (i=totalSize>>2; i<pMethodDef->numberOfParameters; i++) {
+	// The remaining parameters: all of them for a static method, all but 'this' for an instance one
+	for (i=METHOD_ISSTATIC(pMethodDef)?0:1; i<pMethodDef->numberOfParameters; i++) {
 		tMD_TypeDef *pTypeDef;
 		U32 size;
 

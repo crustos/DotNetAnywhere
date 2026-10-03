@@ -89,7 +89,7 @@ tJITCodeInfo jitCodeGoNext;
 // Pop an arbitrarily-sized value-type from the stack (copies it to the specified memory location)
 #define POP_VALUETYPE(ptr, valueSize, stackDec) memcpy(ptr, pCurEvalStack -= stackDec, valueSize)
 // Pop a Object (heap) pointer value from the stack
-#define POP_O() (*(HEAP_PTR*)(pCurEvalStack -= 4))
+#define POP_O() (*(HEAP_PTR*)(pCurEvalStack -= sizeof(void*)))
 // POP() returns nothing - it just alters the stack offset correctly
 #define POP(numBytes) pCurEvalStack -= numBytes
 // POP_ALL() empties the evaluation stack
@@ -307,7 +307,7 @@ static void CreateParameters(PTR pParamsLocals, tMD_MethodDef *pCallMethod, PTR 
 		// If this is being called from JIT_NEW_OBJECT then need to specially push the new object
 		// onto parameter stack position 0
 		*(HEAP_PTR*)pParamsLocals = newObj;
-		ofs = 4;
+		ofs = sizeof(void*);   // 'this' is a pointer (this was a hard-coded 4)
 	} else {
 		ofs = 0;
 	}
@@ -410,9 +410,9 @@ U32 JIT_Execute(tThread *pThread, U32 numInst) {
 
 	// Local copies of thread state variables, to speed up execution
 	// Pointer to next op-code
-	U32 *pOps;
+	tOpWord *pOps;
 	I32 *pOpSequencePoints;
-	register U32 *pCurOp;
+	register tOpWord *pCurOp;
 	// Pointer to eval-stack position
 	register PTR pCurEvalStack;
 	PTR pTempPtr;
@@ -674,6 +674,8 @@ U32 JIT_Execute(tThread *pThread, U32 numInst) {
 		GET_LABELS_DYNAMIC(JIT_SHR_UN_I64, 0);
 
 		GET_LABELS(JIT_BRANCH_FALSE);
+		GET_LABELS(JIT_BRANCH_FALSE_PTR);
+		GET_LABELS(JIT_BRANCH_TRUE_PTR);
 		GET_LABELS(JIT_BRANCH_TRUE);
 		GET_LABELS(JIT_LOADTOKEN_TYPE);
 		
@@ -734,6 +736,8 @@ U32 JIT_Execute(tThread *pThread, U32 numInst) {
 		GET_LABELS_DYNAMIC(JIT_CONV_R64_R64, 0);
 
 		GET_LABELS(JIT_STORE_ELEMENT_32);
+		GET_LABELS(JIT_STORE_ELEMENT_PTR);
+		GET_LABELS(JIT_LOAD_ELEMENT_PTR);
 		GET_LABELS(JIT_STORE_ELEMENT_64);
 
 		GET_LABELS(JIT_LOAD_ELEMENT_I8);
@@ -904,8 +908,13 @@ JIT_LOAD_I64_start:
 JIT_LOAD_F64_start:
 	OPCODE_USE(JIT_LOAD_I64);
 	{
-		U64 value = *(U64*)pCurOp;
-		pCurOp += 2;
+		U64 value;
+		if (sizeof(tOpWord) >= sizeof(U64)) {
+			value = (U64)GET_OP();      // one word holds all 64 bits
+		} else {
+			value = *(U64*)pCurOp;      // two words, low half first
+			pCurOp += 2;
+		}
 		PUSH_U64(value);
 	}
 JIT_LOAD_I64_end:
@@ -914,9 +923,6 @@ JIT_LOAD_F64_end:
 
 JIT_LOADPARAMLOCAL_INT32_start:
 JIT_LOADPARAMLOCAL_F32_start:
-JIT_LOADPARAMLOCAL_O_start:
-JIT_LOADPARAMLOCAL_INTNATIVE_start: // Only on 32-bit
-JIT_LOADPARAMLOCAL_PTR_start: // Only on 32-bit
 	OPCODE_USE(JIT_LOADPARAMLOCAL_INT32);
 	{
 		U32 ofs = GET_OP();
@@ -925,6 +931,19 @@ JIT_LOADPARAMLOCAL_PTR_start: // Only on 32-bit
 	}
 JIT_LOADPARAMLOCAL_INT32_end:
 JIT_LOADPARAMLOCAL_F32_end:
+	GO_NEXT();
+
+// References, native ints and managed pointers are pointer-sized. (These used to share the 4-byte handler
+// above, marked "only on 32-bit".)
+JIT_LOADPARAMLOCAL_O_start:
+JIT_LOADPARAMLOCAL_INTNATIVE_start:
+JIT_LOADPARAMLOCAL_PTR_start:
+	OPCODE_USE(JIT_LOADPARAMLOCAL_PTR);
+	{
+		U32 ofs = GET_OP();
+		PTR value = *(PTR*)(pParamsLocals + ofs);
+		PUSH_PTR(value);
+	}
 JIT_LOADPARAMLOCAL_O_end:
 JIT_LOADPARAMLOCAL_INTNATIVE_end:
 JIT_LOADPARAMLOCAL_PTR_end:
@@ -1017,9 +1036,6 @@ JIT_LOAD_PARAMLOCAL_ADDR_end:
 
 JIT_STOREPARAMLOCAL_INT32_start:
 JIT_STOREPARAMLOCAL_F32_start:
-JIT_STOREPARAMLOCAL_O_start:
-JIT_STOREPARAMLOCAL_INTNATIVE_start: // Only on 32-bit
-JIT_STOREPARAMLOCAL_PTR_start: // Onlt on 32-bit
 	OPCODE_USE(JIT_STOREPARAMLOCAL_INT32);
 	{
 		U32 ofs = GET_OP();
@@ -1028,6 +1044,17 @@ JIT_STOREPARAMLOCAL_PTR_start: // Onlt on 32-bit
 	}
 JIT_STOREPARAMLOCAL_INT32_end:
 JIT_STOREPARAMLOCAL_F32_end:
+	GO_NEXT();
+
+JIT_STOREPARAMLOCAL_O_start:
+JIT_STOREPARAMLOCAL_INTNATIVE_start:
+JIT_STOREPARAMLOCAL_PTR_start:
+	OPCODE_USE(JIT_STOREPARAMLOCAL_PTR);
+	{
+		U32 ofs = GET_OP();
+		PTR value = POP_PTR();
+		*(PTR*)(pParamsLocals + ofs) = value;
+	}
 JIT_STOREPARAMLOCAL_O_end:
 JIT_STOREPARAMLOCAL_INTNATIVE_end:
 JIT_STOREPARAMLOCAL_PTR_end:
@@ -1159,7 +1186,6 @@ JIT_LOADINDIRECT_U16_end:
 JIT_LOADINDIRECT_I32_start:
 JIT_LOADINDIRECT_U32_start:
 JIT_LOADINDIRECT_R32_start:
-JIT_LOADINDIRECT_REF_start:
 	OPCODE_USE(JIT_LOADINDIRECT_U32);
 	{
 		PTR pMem = POP_PTR();
@@ -1173,6 +1199,17 @@ JIT_LOADINDIRECT_REF_start:
 JIT_LOADINDIRECT_I32_end:
 JIT_LOADINDIRECT_U32_end:
 JIT_LOADINDIRECT_R32_end:
+	GO_NEXT();
+
+JIT_LOADINDIRECT_REF_start:
+	OPCODE_USE(JIT_LOADINDIRECT_REF);
+	{
+		PTR pMem = POP_PTR();
+		if (pMem == NULL) {
+			THROW_NULLREF();
+		}
+		PUSH_PTR(*(PTR*)pMem);
+	}
 JIT_LOADINDIRECT_REF_end:
 	GO_NEXT();
 
@@ -1239,7 +1276,6 @@ JIT_STOREINDIRECT_U16_end:
 	GO_NEXT();
 
 JIT_STOREINDIRECT_U32_start:
-JIT_STOREINDIRECT_REF_start:
 JIT_STOREINDIRECT_R32_start:
 	OPCODE_USE(JIT_STOREINDIRECT_U32);
 	{
@@ -1251,8 +1287,20 @@ JIT_STOREINDIRECT_R32_start:
 		*(U32*)pMem = value;
 	}
 JIT_STOREINDIRECT_U32_end:
-JIT_STOREINDIRECT_REF_end:
 JIT_STOREINDIRECT_R32_end:
+	GO_NEXT();
+
+JIT_STOREINDIRECT_REF_start:
+	OPCODE_USE(JIT_STOREINDIRECT_REF);
+	{
+		PTR value = POP_PTR(); // The reference (or native int) to store
+		PTR pMem = POP_PTR(); // The address to store to
+		if (pMem == NULL) {
+			THROW_NULLREF();
+		}
+		*(PTR*)pMem = value;
+	}
+JIT_STOREINDIRECT_REF_end:
 	GO_NEXT();
 
 JIT_STOREINDIRECT_U64_start:
@@ -1310,7 +1358,7 @@ JIT_CALL_NATIVE_start:
 			thisOfs = 0;
 		} else {
 			pThis = *(PTR*)pCurrentMethodState->pParamsLocals;
-			thisOfs = 4;
+			thisOfs = sizeof(void*);
 		}
 		// Internal constructors MUST leave the newly created object in the return value
 		// (ie on top of the evaluation stack)
@@ -1639,6 +1687,30 @@ JIT_SWITCH_start:
 		pCurOp = pOps + ofs;
 	}
 JIT_SWITCH_end:
+	GO_NEXT_CHECK();
+
+JIT_BRANCH_FALSE_PTR_start:
+	OPCODE_USE(JIT_BRANCH_FALSE_PTR);
+	{
+		PTR value = POP_PTR();
+		U32 ofs = GET_OP();
+		if (value == NULL) {
+			pCurOp = pOps + ofs;
+		}
+	}
+JIT_BRANCH_FALSE_PTR_end:
+	GO_NEXT_CHECK();
+
+JIT_BRANCH_TRUE_PTR_start:
+	OPCODE_USE(JIT_BRANCH_TRUE_PTR);
+	{
+		PTR value = POP_PTR();
+		U32 ofs = GET_OP();
+		if (value != NULL) {
+			pCurOp = pOps + ofs;
+		}
+	}
+JIT_BRANCH_TRUE_PTR_end:
 	GO_NEXT_CHECK();
 
 JIT_BRANCH_TRUE_start:
@@ -3072,9 +3144,9 @@ JIT_CONV_R64_R32_end:
 JIT_LOADFUNCTION_start:
 	OPCODE_USE(JIT_LOADFUNCTION);
 	{
-		// This is actually a pointer not a U32
-		U32 value = GET_OP();
-		PUSH_U32(value);
+		// A pointer to the method (this used to be pushed as a U32, which truncated it)
+		PTR value = (PTR)GET_OP();
+		PUSH_PTR(value);
 	}
 JIT_LOADFUNCTION_end:
 	GO_NEXT();
@@ -3441,6 +3513,29 @@ JIT_LOAD_ELEMENT_ADDR_start:
 JIT_LOAD_ELEMENT_ADDR_end:
 	GO_NEXT();
 
+JIT_LOAD_ELEMENT_PTR_start:
+	OPCODE_USE(JIT_LOAD_ELEMENT_PTR);
+	{
+		PTR value;
+		U32 idx = POP_U32(); // Array index
+		HEAP_PTR heapPtr = POP_O();
+		SystemArray_LoadElement(heapPtr, idx, (PTR)&value);
+		PUSH_PTR(value);
+	}
+JIT_LOAD_ELEMENT_PTR_end:
+	GO_NEXT();
+
+JIT_STORE_ELEMENT_PTR_start:
+	OPCODE_USE(JIT_STORE_ELEMENT_PTR);
+	{
+		PTR value = POP_PTR(); // Value
+		U32 idx = POP_U32(); // Array index
+		PTR heapPtr = POP_O();
+		SystemArray_StoreElement(heapPtr, idx, (PTR)&value);
+	}
+JIT_STORE_ELEMENT_PTR_end:
+	GO_NEXT();
+
 JIT_STORE_ELEMENT_32_start:
 	OPCODE_USE(JIT_STORE_ELEMENT_32);
 	{
@@ -3478,10 +3573,32 @@ JIT_STORE_ELEMENT_start:
 JIT_STORE_ELEMENT_end:
 	GO_NEXT();
 
-JIT_STOREFIELD_INT32_start:
 JIT_STOREFIELD_O_start:
-JIT_STOREFIELD_INTNATIVE_start: // only for 32-bit
-JIT_STOREFIELD_PTR_start: // only for 32-bit
+JIT_STOREFIELD_INTNATIVE_start:
+JIT_STOREFIELD_PTR_start:
+	OPCODE_USE(JIT_STOREFIELD_PTR);
+	{
+		// pointer-sized (these were aliased to the 4-byte store below, "only for 32-bit")
+		tMD_FieldDef *pFieldDef;
+		PTR pMem;
+		PTR value;
+		HEAP_PTR heapPtr;
+
+		pFieldDef = (tMD_FieldDef*)GET_OP();
+		value = POP_PTR();
+		heapPtr = POP_O();
+		if (heapPtr == NULL) {
+			THROW_NULLREF();
+		}
+		pMem = heapPtr + pFieldDef->memOffset;
+		*(PTR*)pMem = value;
+	}
+JIT_STOREFIELD_O_end:
+JIT_STOREFIELD_INTNATIVE_end:
+JIT_STOREFIELD_PTR_end:
+	GO_NEXT();
+
+JIT_STOREFIELD_INT32_start:
 JIT_STOREFIELD_F32_start:
 	OPCODE_USE(JIT_STOREFIELD_INT32);
 	{
@@ -3500,9 +3617,6 @@ JIT_STOREFIELD_F32_start:
 		*(U32*)pMem = value;
 	}
 JIT_STOREFIELD_INT32_end:
-JIT_STOREFIELD_O_end:
-JIT_STOREFIELD_INTNATIVE_end:
-JIT_STOREFIELD_PTR_end:
 JIT_STOREFIELD_F32_end:
 	GO_NEXT();
 
@@ -3615,11 +3729,23 @@ JIT_LOAD_FIELD_ADDR_start:
 JIT_LOAD_FIELD_ADDR_end:
 	GO_NEXT();
 
+JIT_STORESTATICFIELD_O_start:
+JIT_STORESTATICFIELD_INTNATIVE_start:
+JIT_STORESTATICFIELD_PTR_start:
+	OPCODE_USE(JIT_STORESTATICFIELD_PTR);
+	{
+		// pointer-sized (these were aliased to the 4-byte store below, "only for 32-bit")
+		tMD_FieldDef *pFieldDef = (tMD_FieldDef*)GET_OP();
+		PTR value = POP_PTR();
+		*(PTR*)pFieldDef->pMemory = value;
+	}
+JIT_STORESTATICFIELD_O_end:
+JIT_STORESTATICFIELD_INTNATIVE_end:
+JIT_STORESTATICFIELD_PTR_end:
+	GO_NEXT();
+
 JIT_STORESTATICFIELD_INT32_start:
 JIT_STORESTATICFIELD_F32_start:
-JIT_STORESTATICFIELD_O_start: // only for 32-bit
-JIT_STORESTATICFIELD_INTNATIVE_start: // only for 32-bit
-JIT_STORESTATICFIELD_PTR_start: // only for 32-bit
 	OPCODE_USE(JIT_STORESTATICFIELD_INT32);
 	{
 		tMD_FieldDef *pFieldDef;
@@ -3633,9 +3759,6 @@ JIT_STORESTATICFIELD_PTR_start: // only for 32-bit
 	}
 JIT_STORESTATICFIELD_INT32_end:
 JIT_STORESTATICFIELD_F32_end:
-JIT_STORESTATICFIELD_O_end:
-JIT_STORESTATICFIELD_INTNATIVE_end:
-JIT_STORESTATICFIELD_PTR_end:
 	GO_NEXT();
 
 JIT_STORESTATICFIELD_F64_start:
@@ -3678,11 +3801,17 @@ JIT_LOADSTATICFIELD_CHECKTYPEINIT_VALUETYPE_start:
 JIT_LOADSTATICFIELD_CHECKTYPEINIT_F64_start:
 	op = JIT_LOADSTATICFIELD_CHECKTYPEINIT_F64;
 	goto loadStaticFieldStart;
+JIT_LOADSTATICFIELD_CHECKTYPEINIT_O_start:
+	op = JIT_LOADSTATICFIELD_CHECKTYPEINIT_O;
+	goto loadStaticFieldStart;
+JIT_LOADSTATICFIELD_CHECKTYPEINIT_INTNATIVE_start:
+	op = JIT_LOADSTATICFIELD_CHECKTYPEINIT_INTNATIVE;
+	goto loadStaticFieldStart;
+JIT_LOADSTATICFIELD_CHECKTYPEINIT_PTR_start:
+	op = JIT_LOADSTATICFIELD_CHECKTYPEINIT_PTR;
+	goto loadStaticFieldStart;
 JIT_LOADSTATICFIELD_CHECKTYPEINIT_INT32_start:
 JIT_LOADSTATICFIELD_CHECKTYPEINIT_F32_start:
-JIT_LOADSTATICFIELD_CHECKTYPEINIT_O_start: // Only for 32-bit
-JIT_LOADSTATICFIELD_CHECKTYPEINIT_INTNATIVE_start: // Only for 32-bit
-JIT_LOADSTATICFIELD_CHECKTYPEINIT_PTR_start: // Only for 32-bit
 	op = 0;
 loadStaticFieldStart:
 	OPCODE_USE(JIT_LOADSTATICFIELD_CHECKTYPEINIT_INT32);
@@ -3716,13 +3845,16 @@ loadStaticFieldStart:
 			PUSH_U64(value);
 		} else if (op == JIT_LOADSTATICFIELD_CHECKTYPEINIT_VALUETYPE) {
 			PUSH_VALUETYPE(pFieldDef->pMemory, pFieldDef->memSize, pFieldDef->memSize);
+		} else if (op == JIT_LOADSTATICFIELDADDRESS_CHECKTYPEINIT) {
+			// the address of the field: a pointer (this was cast to U32 and pushed as 4 bytes)
+			PUSH_PTR(pFieldDef->pMemory);
+		} else if (op == JIT_LOADSTATICFIELD_CHECKTYPEINIT_O ||
+				op == JIT_LOADSTATICFIELD_CHECKTYPEINIT_INTNATIVE ||
+				op == JIT_LOADSTATICFIELD_CHECKTYPEINIT_PTR) {
+			// references, native ints and managed pointers are pointer-sized
+			PUSH_PTR(*(PTR*)pFieldDef->pMemory);
 		} else {
-			U32 value;
-			if (op == JIT_LOADSTATICFIELDADDRESS_CHECKTYPEINIT) {
-				value = (U32)(pFieldDef->pMemory);
-			} else {
-				value = *(U32*)pFieldDef->pMemory;
-			}
+			U32 value = *(U32*)pFieldDef->pMemory;
 			PUSH_U32(value);
 		}
 	}
@@ -3757,9 +3889,19 @@ JIT_INIT_OBJECT_start:
 JIT_INIT_OBJECT_end:
 	GO_NEXT();
 
+JIT_BOX_INTNATIVE_start:
+	OPCODE_USE(JIT_BOX_INTNATIVE);
+	{
+		tMD_TypeDef *pTypeDef = (tMD_TypeDef*)GET_OP();
+		heapPtr = Heap_AllocType(pTypeDef);
+		*(PTR*)heapPtr = POP_PTR();    // a native int is pointer-sized
+		PUSH_O(heapPtr);
+	}
+JIT_BOX_INTNATIVE_end:
+	GO_NEXT();
+
 JIT_BOX_INT32_start:
 JIT_BOX_F32_start:
-JIT_BOX_INTNATIVE_start:
 	OPCODE_USE(JIT_BOX_INT32);
 	{
 		tMD_TypeDef *pTypeDef;
@@ -3772,7 +3914,6 @@ JIT_BOX_INTNATIVE_start:
 	}
 JIT_BOX_INT32_end:
 JIT_BOX_F32_end:
-JIT_BOX_INTNATIVE_end:
 	GO_NEXT();
 
 JIT_BOX_INT64_start:

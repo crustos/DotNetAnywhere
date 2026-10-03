@@ -50,7 +50,7 @@
 
 typedef struct tOps_ tOps;
 struct tOps_ {
-	U32 *p;
+	tOpWord *p;
 	I32 *pSequencePoints;
 	U32 capacity;
 	U32 ofs;
@@ -63,11 +63,11 @@ struct tTypeStack_ {
 	U32 maxBytes; // The max size of the stack in bytes
 };
 
-#define InitOps(ops_, initialCapacity) ops_.capacity = initialCapacity; ops_.ofs = 0; ops_.p = malloc((initialCapacity) * sizeof(U32)); ops_.pSequencePoints = malloc((initialCapacity) * sizeof(I32));
+#define InitOps(ops_, initialCapacity) ops_.capacity = initialCapacity; ops_.ofs = 0; ops_.p = malloc((initialCapacity) * sizeof(tOpWord)); ops_.pSequencePoints = malloc((initialCapacity) * sizeof(I32));
 #define DeleteOps(ops_) free(ops_.p); free(ops_.pSequencePoints)
 
 // Turn this into a MACRO at some point?
-static U32 Translate(U32 op, U32 getDynamic) {
+static tOpWord Translate(U32 op, U32 getDynamic) {
 	if (op >= JIT_OPCODE_MAXNUM) {
 		Crash("Illegal opcode: %d", op);
 	}
@@ -75,9 +75,9 @@ static U32 Translate(U32 op, U32 getDynamic) {
 		Crash("Opcode not available: 0x%08x", op);
 	}
 	if (getDynamic) {
-		return (U32)jitCodeInfo[op].isDynamic;
+		return (tOpWord)jitCodeInfo[op].isDynamic;
 	} else {
-		return (U32)jitCodeInfo[op].pStart;
+		return (tOpWord)jitCodeInfo[op].pStart;
 	}
 }
 
@@ -93,8 +93,11 @@ static U32 Translate(U32 op, U32 getDynamic) {
 #define PushU32(v) PushU32_(&ops, (U32)(v), -1)
 #define PushI32(v) PushU32_(&ops, (U32)(v), -1)
 #define PushFloat(v) convFloat.f=(float)(v); PushU32_(&ops, convFloat.u32, -1)
-#define PushDouble(v) convDouble.d=(double)(v); PushU32_(&ops, convDouble.u32.a, -1); PushU32_(&ops, convDouble.u32.b, -1)
-#define PushPTR(ptr) PushU32_(&ops, (U32)(ptr), -1)
+#define PushDouble(v) convDouble.d=(double)(v); PushU64(((U64)convDouble.u32.b << 32) | convDouble.u32.a)
+#define PushPTR(ptr) PushU32_(&ops, (tOpWord)(ptr), -1)
+// A 64-bit constant: one op word on a 64-bit target, otherwise two (low half first, which the interpreter
+// reads back as a single U64 in memory order).
+#define PushU64(v) PushU64_(&ops, (U64)(v))
 #define PushOp(op) PushU32_(&ops, Translate((U32)(op), 0), nextOpSequencePoint)
 #define PushOpParam(op, param) PushOp(op); PushU32_(&ops, (U32)(param), -1)
 #endif
@@ -125,16 +128,27 @@ static void PushStackType_(tTypeStack *pTypeStack, tMD_TypeDef *pType) {
 	//printf("Stack ofs = %d; Max stack size: %d (0x%x)\n", pTypeStack->ofs, size, size);
 }
 
-static void PushU32_(tOps *pOps, U32 v, I32 opSequencePoint) {
+static void PushU32_(tOps *pOps, tOpWord v, I32 opSequencePoint) {
 	if (pOps->ofs >= pOps->capacity) {
 		pOps->capacity <<= 1;
 //		printf("a.pOps->p = 0x%08x size=%d\n", pOps->p, pOps->capacity * sizeof(U32));
-		pOps->p = realloc(pOps->p, pOps->capacity * sizeof(U32));
+		pOps->p = realloc(pOps->p, pOps->capacity * sizeof(tOpWord));
 		pOps->pSequencePoints = realloc(pOps->pSequencePoints, pOps->capacity * sizeof(U32));
 	}
 	pOps->pSequencePoints[pOps->ofs] = opSequencePoint;
 	pOps->p[pOps->ofs++] = v;
 }
+
+#ifndef GEN_COMBINED_OPCODES
+static void PushU64_(tOps *pOps, U64 v) {
+	if (sizeof(tOpWord) >= sizeof(U64)) {
+		PushU32_(pOps, (tOpWord)v, -1);
+	} else {
+		PushU32_(pOps, (tOpWord)(U32)v, -1);
+		PushU32_(pOps, (tOpWord)(U32)(v >> 32), -1);
+	}
+}
+#endif
 
 static U32 GetUnalignedU32(U8 *pCIL, U32 *pCILOfs) {
 	U32 a,b,c,d;
@@ -262,14 +276,15 @@ static I32 ConvOvfTarget(U32 op, U32 *pUnsigned) {
 	case CIL_CONV_OVF_I2: return OVF_TO_I2;
 	case CIL_CONV_OVF_U2_UN: *pUnsigned = 1; /* fall through */
 	case CIL_CONV_OVF_U2: return OVF_TO_U2;
-	case CIL_CONV_OVF_I4_UN:
+	case CIL_CONV_OVF_I4_UN: *pUnsigned = 1; /* fall through */
+	case CIL_CONV_OVF_I4: return OVF_TO_I4;
+	// a native int is as wide as a pointer: 32 bits on a 32-bit target, 64 on a 64-bit one
 	case CIL_CONV_OVF_I_UN: *pUnsigned = 1; /* fall through */
-	case CIL_CONV_OVF_I4:
-	case CIL_CONV_OVF_I: return OVF_TO_I4;
-	case CIL_CONV_OVF_U4_UN:
+	case CIL_CONV_OVF_I: return (sizeof(void*) > 4) ? OVF_TO_I8 : OVF_TO_I4;
+	case CIL_CONV_OVF_U4_UN: *pUnsigned = 1; /* fall through */
+	case CIL_CONV_OVF_U4: return OVF_TO_U4;
 	case CIL_CONV_OVF_U_UN: *pUnsigned = 1; /* fall through */
-	case CIL_CONV_OVF_U4:
-	case CIL_CONV_OVF_U: return OVF_TO_U4;
+	case CIL_CONV_OVF_U: return (sizeof(void*) > 4) ? OVF_TO_U8 : OVF_TO_U4;
 	case CIL_CONV_OVF_I8_UN: *pUnsigned = 1; /* fall through */
 	case CIL_CONV_OVF_I8: return OVF_TO_I8;
 	case CIL_CONV_OVF_U8_UN: *pUnsigned = 1; /* fall through */
@@ -291,7 +306,7 @@ static int ConvSourceIsUnsigned(U32 op) {
 	return ConvOvfTarget(op, &isUn) >= 0 && isUn;
 }
 
-static U32* JITit(tMD_MethodDef *pMethodDef, U8 *pCIL, U32 codeSize, tParameter *pLocals, tJITted *pJITted, U32 genCombinedOpcodes, I32 **ppSequencePoints) {
+static tOpWord* JITit(tMD_MethodDef *pMethodDef, U8 *pCIL, U32 codeSize, tParameter *pLocals, tJITted *pJITted, U32 genCombinedOpcodes, I32 **ppSequencePoints) {
 	U32 maxStack = pJITted->maxStack;
 	U32 i;
 	U32 cilOfs;
@@ -300,7 +315,7 @@ static U32* JITit(tMD_MethodDef *pMethodDef, U8 *pCIL, U32 codeSize, tParameter 
 	U32 *pJITOffsets;	// To store the JITted code offset of each CIL byte.
 						// Only CIL bytes that are the first byte of an instruction will have meaningful data
 	tTypeStack **ppTypeStacks; // To store the evaluation stack state for forward jumps
-	U32 *pFinalOps;
+	tOpWord *pFinalOps;
 	tMD_TypeDef *pStackType;
 	tTypeStack typeStack;
 	U32 jmpPending = 0; // set while translating a jmp as "load args; call; ret"
@@ -611,10 +626,11 @@ cilLdcI4:
 
 			case CIL_LDC_I8:
 				PushOp(JIT_LOAD_I64);
-				u32Value = GetUnalignedU32(pCIL, &cilOfs);
-				PushU32(u32Value);
-				u32Value = GetUnalignedU32(pCIL, &cilOfs);
-				PushU32(u32Value);
+				{
+					U64 lo = GetUnalignedU32(pCIL, &cilOfs);
+					U64 hi = GetUnalignedU32(pCIL, &cilOfs);
+					PushU64((hi << 32) | lo);
+				}
 				PushStackType(types[TYPE_SYSTEM_INT64]);
 				break;
 
@@ -777,7 +793,7 @@ cilLdInd:
 				PushStackType(types[u32Value]);
 				break;
 
-			case CIL_STIND_I: // native int: 4 bytes here, same as a reference
+			case CIL_STIND_I: // native int: pointer-sized, same as a reference
 				PopStackTypeMulti(2); // Don't care what they are
 				PushOp(JIT_STOREINDIRECT_REF);
 				break;
@@ -885,7 +901,7 @@ cilCallVirtConstrained:
 					} else {
 						switch (pStackType->stackType)
 						{
-						case EVALSTACK_INTNATIVE: // Not really right, but it'll work on 32-bit
+						case EVALSTACK_INTNATIVE: // a native-int `this` is called like a reference: both are pointer-sized
 						case EVALSTACK_O:
 							if (derefRefType) {
 								PushOp(JIT_DEREF_CALLVIRT);
@@ -979,11 +995,16 @@ cilBr:
 				u32Value = GetUnalignedU32(pCIL, &cilOfs);
 				u32Value2 = JIT_BRANCH_FALSE + (op - CIL_BRFALSE);
 cilBrFalseTrue:
-				PopStackTypeDontCare(); // Don't care what it is
+				pStackType = PopStackType();
 				// Put a temporary CIL offset value into the JITted code. This will be updated later
 				u32Value = cilOfs + (I32)u32Value;
 				MayCopyTypeStack();
-				PushOp(u32Value2);
+				if (sizeof(void*) > 4 && pStackType->stackSize == 8) {
+					// an 8-byte operand (a reference on a 64-bit target): test all of it, and pop all of it
+					PushOp(u32Value2 - JIT_BRANCH_FALSE + JIT_BRANCH_FALSE_PTR);
+				} else {
+					PushOp(u32Value2);
+				}
 				PushBranch();
 				PushU32(u32Value);
 				break;
@@ -1019,7 +1040,10 @@ cilBrCond:
 				pTypeA = PopStackType();
 				u32Value = cilOfs + (I32)u32Value;
 				MayCopyTypeStack();
-				if ((pTypeA->stackType == EVALSTACK_INT32 && pTypeB->stackType == EVALSTACK_INT32) ||
+				if (pTypeA->stackType == EVALSTACK_O && pTypeB->stackType == EVALSTACK_O && sizeof(void*) > 4) {
+					// references are 8 bytes here, so compare them as 64-bit values
+					PushOp(JIT_BEQ_I64I64 + (op - u32Value2));
+				} else if ((pTypeA->stackType == EVALSTACK_INT32 && pTypeB->stackType == EVALSTACK_INT32) ||
 					(pTypeA->stackType == EVALSTACK_O && pTypeB->stackType == EVALSTACK_O)) {
 					PushOp(JIT_BEQ_I32I32 + (op - u32Value2));
 				} else if (pTypeA->stackType == EVALSTACK_INT64 && pTypeB->stackType == EVALSTACK_INT64) {
@@ -1127,12 +1151,21 @@ cilBinaryArithOp:
 				toBitCount = 16;
 				toType = TYPE_SYSTEM_INT16;
 				goto cilConvInt32;
+			case CIL_CONV_I:
+			case CIL_CONV_OVF_I:
+			case CIL_CONV_OVF_I_UN:
+				// A native int is handled on the evaluation stack as an integer of pointer width: an
+				// int64 on a 64-bit target (so arithmetic on it uses the 64-bit ops and it can be stored
+				// through a pointer-sized slot), an int32 on a 32-bit one.
+				if (sizeof(void*) > 4) {
+					toType = TYPE_SYSTEM_INT64;
+					convOpOffset = JIT_CONV_OFFSET_I64;
+					goto cilConv;
+				}
+				// fall through
 			case CIL_CONV_I4:
 			case CIL_CONV_OVF_I4: // Fix this later - will never overflow
 			case CIL_CONV_OVF_I4_UN: // Fix this later - will never overflow
-			case CIL_CONV_I: // Only on 32-bit
-			case CIL_CONV_OVF_I: // Only on 32-bit
-			case CIL_CONV_OVF_I_UN: // Only on 32-bit; Fix this later - will never overflow
 				toBitCount = 32;
 				toType = TYPE_SYSTEM_INT32;
 cilConvInt32:
@@ -1150,12 +1183,19 @@ cilConvInt32:
 				toBitCount = 16;
 				toType = TYPE_SYSTEM_UINT16;
 				goto cilConvUInt32;
+			case CIL_CONV_U:
+			case CIL_CONV_OVF_U:
+			case CIL_CONV_OVF_U_UN:
+				// (see conv.i above: pointer width, zero-extended)
+				if (sizeof(void*) > 4) {
+					toType = TYPE_SYSTEM_UINT64;
+					convOpOffset = JIT_CONV_OFFSET_U64;
+					goto cilConv;
+				}
+				// fall through
 			case CIL_CONV_U4:
 			case CIL_CONV_OVF_U4: // Fix this later - will never overflow
 			case CIL_CONV_OVF_U4_UN: // Fix this later - will never overflow
-			case CIL_CONV_U: // Only on 32-bit
-			case CIL_CONV_OVF_U: // Only on 32-bit
-			case CIL_CONV_OVF_U_UN: // Only on 32-bit; Fix this later - will never overflow
 				toBitCount = 32;
 				toType = TYPE_SYSTEM_UINT32;
 cilConvUInt32:
@@ -1196,6 +1236,9 @@ cilConv:
 						if (ovfTo >= 0) {
 							U32 ovfFrom;
 							switch (pStackType->stackType) {
+							case EVALSTACK_PTR: // pointer-sized: a 64-bit value on a 64-bit target
+								ovfFrom = (sizeof(void*) > 4) ? (ovfUnsigned ? 3 : 2) : (ovfUnsigned ? 1 : 0);
+								break;
 							case EVALSTACK_INT64: ovfFrom = ovfUnsigned ? 3 : 2; break;
 							case EVALSTACK_F32: ovfFrom = 4; break;
 							case EVALSTACK_F64: ovfFrom = 5; break;
@@ -1206,12 +1249,18 @@ cilConv:
 					}
 					// This is the types that the conversion is from.
 					switch (pStackType->stackType) {
+					case EVALSTACK_PTR:
+						if (sizeof(void*) > 4) {
+							// a pointer is 8 bytes here, so convert from it as from a 64-bit value
+							opCodeBase = ConvSourceIsUnsigned(op)?JIT_CONV_FROM_U64:JIT_CONV_FROM_I64;
+							break;
+						}
+						// fall through: on a 32-bit target a pointer is a 32-bit value
+					case EVALSTACK_INT32:
+						opCodeBase = ConvSourceIsUnsigned(op)?JIT_CONV_FROM_U32:JIT_CONV_FROM_I32;
+						break;
 					case EVALSTACK_INT64:
 						opCodeBase = ConvSourceIsUnsigned(op)?JIT_CONV_FROM_U64:JIT_CONV_FROM_I64;
-						break;
-					case EVALSTACK_INT32:
-					case EVALSTACK_PTR: // Only on 32-bit
-						opCodeBase = ConvSourceIsUnsigned(op)?JIT_CONV_FROM_U32:JIT_CONV_FROM_I32;
 						break;
 					case EVALSTACK_F64:
 						opCodeBase = JIT_CONV_FROM_R64;
@@ -1340,9 +1389,13 @@ conv2:
 					if (pTypeDef->isValueType && pTypeDef->arrayElementSize != 4) {
 						// If it's a value-type then do this
 						PushOpParam(JIT_STORE_OBJECT_VALUETYPE, pTypeDef->arrayElementSize);
+					} else if (pTypeDef->isValueType) {
+						// A value-type with size 4 can use the plain 4-byte store (it executes faster).
+						// (This used to share one op with reference types, which are only 4 bytes on a
+						// 32-bit target.)
+						PushOp(JIT_STOREINDIRECT_U32);
 					} else {
-						// If it's a ref type, or a value-type with size 4, then can do this instead
-						// (it executes faster)
+						// A reference: pointer-sized
 						PushOp(JIT_STOREINDIRECT_REF);
 					}
 					break;
@@ -1452,13 +1505,13 @@ conv2:
 
 			case CIL_LDELEM_REF:
 				PopStackTypeMulti(2); // Don't care what any of these are
-				PushOp(JIT_LOAD_ELEMENT_U32);
+				PushOp(JIT_LOAD_ELEMENT_PTR);
 				PushStackType(types[TYPE_SYSTEM_OBJECT]);
 				break;
 
-			case CIL_LDELEM_I: // native int: 4 bytes here
+			case CIL_LDELEM_I: // native int: pointer-sized
 				PopStackTypeMulti(2); // Don't care what any of these are
-				PushOp(JIT_LOAD_ELEMENT_U32);
+				PushOp(JIT_LOAD_ELEMENT_PTR);
 				PushStackType(types[TYPE_SYSTEM_INTPTR]);
 				break;
 
@@ -1480,11 +1533,15 @@ conv2:
 			case CIL_STELEM_I1:
 			case CIL_STELEM_I2:
 			case CIL_STELEM_I4:
-			case CIL_STELEM_I:
 			case CIL_STELEM_R4:
-			case CIL_STELEM_REF:
 				PopStackTypeMulti(3); // Don't care what any of these are
 				PushOp(JIT_STORE_ELEMENT_32);
+				break;
+
+			case CIL_STELEM_I:   // native int and references are pointer-sized
+			case CIL_STELEM_REF:
+				PopStackTypeMulti(3); // Don't care what any of these are
+				PushOp(JIT_STORE_ELEMENT_PTR);
 				break;
 
 			case CIL_STELEM_I8:
@@ -1786,9 +1843,13 @@ cilLeave:
 				case CILX_CLT_UN:
 					pTypeB = PopStackType();
 					pTypeA = PopStackType();
-					if ((pTypeA->stackType == EVALSTACK_INT32 && pTypeB->stackType == EVALSTACK_INT32) ||
+					if (sizeof(void*) > 4 &&
+						((pTypeA->stackType == EVALSTACK_O && pTypeB->stackType == EVALSTACK_O) ||
+						 (pTypeA->stackType == EVALSTACK_PTR && pTypeB->stackType == EVALSTACK_PTR))) {
+						// references and pointers are 8 bytes here, so compare them as 64-bit values
+						PushOp(JIT_CEQ_I64I64 + (op - CILX_CEQ));
+					} else if ((pTypeA->stackType == EVALSTACK_INT32 && pTypeB->stackType == EVALSTACK_INT32) ||
 						(pTypeA->stackType == EVALSTACK_O && pTypeB->stackType == EVALSTACK_O) ||
-						// Next line: only on 32-bit
 						(pTypeA->stackType == EVALSTACK_PTR && pTypeB->stackType == EVALSTACK_PTR)) {
 						PushOp(JIT_CEQ_I32I32 + (op - CILX_CEQ));
 					} else if (pTypeA->stackType == EVALSTACK_INT64 && pTypeB->stackType == EVALSTACK_INT64) {
@@ -2007,14 +2068,16 @@ combineDone:
 	free(pJITOffsets);
 
 	// Copy ops to some memory of exactly the correct size. To not waste memory.
-	u32Value = ops.ofs * sizeof(U32);
+	// (The op stream is made of tOpWord, and the sequence points of I32: they are different sizes on 64-bit.)
+	u32Value = ops.ofs * sizeof(tOpWord);
 	pFinalOps = genCombinedOpcodes?malloc(u32Value):mallocForever(u32Value);
 	memcpy(pFinalOps, ops.p, u32Value);
 	
 	pJITted->pDebugMetadataEntry = pDebugMetadataEntry;
 	if (pDebugMetadataEntry != NULL) {
-		*ppSequencePoints = mallocForever(u32Value);
-		memcpy(*ppSequencePoints, ops.pSequencePoints, u32Value);
+		U32 seqBytes = ops.ofs * sizeof(I32);
+		*ppSequencePoints = mallocForever(seqBytes);
+		memcpy(*ppSequencePoints, ops.pSequencePoints, seqBytes);
 	} else {
 		// This method has no debug info
 		*ppSequencePoints = NULL;
@@ -2077,7 +2140,7 @@ void JIT_Prepare(tMD_MethodDef *pMethodDef, U32 genCombinedOpcodes) {
 		pCallNative->retOpCode = Translate(JIT_RETURN, 0);
 
 		pJITted->localsStackSize = 0;
-		pJITted->pOps = (U32*)pCallNative;
+		pJITted->pOps = (tOpWord*)pCallNative;
 		pJITted->pOpSequencePoints = NULL;
 
 		return;
@@ -2100,7 +2163,7 @@ void JIT_Prepare(tMD_MethodDef *pMethodDef, U32 genCombinedOpcodes) {
 
 		pJITted->localsStackSize = 0;
 		pJITted->maxStack = (pMethodDef->pReturnType == NULL)?0:pMethodDef->pReturnType->stackSize; // For return value
-		pJITted->pOps = (U32*)pCallPInvoke;
+		pJITted->pOps = (tOpWord*)pCallPInvoke;
 		pJITted->pOpSequencePoints = NULL;
 
 		return;

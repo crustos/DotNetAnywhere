@@ -36,7 +36,12 @@ void* mallocTrace(int s, char *pFile, int line);
 
 #define FAKE_RETURN exit(101)
 
-#define INTERNALCALL_PARAM(ofs, type) *(type*)(pParams + ofs)
+// The size of a pointer. A native method's arguments are laid out one after another, each taking its
+// evaluation-stack slot: 4 bytes for an int/bool/char/float, 8 for a long/double, PSZ for a reference or a
+// pointer. So the argument after a reference and an int is at PSZ+4. (tools/check_internalcall_params.py
+// checks every native's reads against its registered signature, for both pointer sizes.)
+#define PSZ ((U32)sizeof(void*))
+#define INTERNALCALL_PARAM(ofs, type) (*(type*)(pParams + (ofs)))
 
 #include "MetaData.h"
 

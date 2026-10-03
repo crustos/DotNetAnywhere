@@ -21,6 +21,18 @@
 #if !defined (__JIT_H)
 #define __JIT_H
 
+#include <stdint.h>
+
+// One word of the JITted instruction stream. Wide enough for a pointer, because an instruction's first
+// word is the address of the interpreter code that runs it (dispatch is `goto **(void**)pCurOp`) and many
+// operands are pointers. It is 32 bits on a 32-bit target (so nothing changes there, including wasm) and
+// 64 on a 64-bit one. It was U32, which truncated both.
+typedef uintptr_t tOpWord;
+
+#if defined(GEN_COMBINED_OPCODES) && UINTPTR_MAX > 0xFFFFFFFFu
+#error "GEN_COMBINED_OPCODES copies raw instruction bytes and has not been ported to 64-bit targets"
+#endif
+
 typedef struct tJITted_ tJITted;
 typedef struct tExceptionHeader_ tExceptionHeader;
 
@@ -48,7 +60,7 @@ struct tCombinedOpcodesMem_ {
 
 struct tJITted_ {
 	// The JITted opcodes
-	U32 *pOps;
+	tOpWord *pOps;
 	// The corresponding sequence points in the original CIL
 	U32 *pOpSequencePoints;
 	// The maximum size of the evaluation stack
@@ -97,18 +109,19 @@ struct tExceptionHeader_ {
 
 typedef struct tJITCallNative_ tJITCallNative;
 struct tJITCallNative_ {
-	U32 opCode;
+	// These are instruction words (the struct is overlaid on the op stream), so they are tOpWord
+	tOpWord opCode;
 	// The method meta-data
 	tMD_MethodDef *pMethodDef;
 	// the native pointer to the function
 	fnInternalCall fn;
 	// The RET instruction. This is needed when the native function has blocking IO or sleep
-	U32 retOpCode;
+	tOpWord retOpCode;
 };
 
 typedef struct tJITCallPInvoke_ tJITCallPInvoke;
 struct tJITCallPInvoke_ {
-	U32 opCode;
+	tOpWord opCode;
 	// The native function to call
 	fnPInvoke fn;
 	// The method that is being called

@@ -155,18 +155,19 @@ static void GarbageCollect() {
 		U32 i;
 		U32 moreRootsAdded = 0;
 		U32 rootsEntryNumPointers;
-		void **pRootsEntryMem;
+		char *pRootsEntryMem;
 
 		// Get a piece of memory off the list of heap memory roots.
 		pRootsEntry = &heapRoots.pHeapEntries[heapRoots.num - 1];
 		rootsEntryNumPointers = pRootsEntry->numPointers;
-		pRootsEntryMem = pRootsEntry->pMem;
+		pRootsEntryMem = (char*)pRootsEntry->pMem;
 		// Mark this entry as done
 		pRootsEntry->numPointers = 0;
 		pRootsEntry->pMem = NULL;
 		// Iterate through all pointers in it
 		for (i=0; i<rootsEntryNumPointers; i++) {
-			void *pMemRef = pRootsEntryMem[i];
+			void *pMemRef;
+			memcpy(&pMemRef, pRootsEntryMem + ((size_t)i << 2), sizeof(void*));   // 4-byte steps, maybe unaligned
 			// Quick escape for known non-memory 
 			if (pMemRef == NULL) {
 				continue;
@@ -316,7 +317,8 @@ void Heap_SetRoots(tHeapRoots *pHeapRoots, void *pRoots, U32 sizeInBytes) {
 		pHeapRoots->pHeapEntries = (tHeapRootEntry*)realloc(pHeapRoots->pHeapEntries, pHeapRoots->capacity * sizeof(tHeapRootEntry));
 	}
 	pRootEntry = &pHeapRoots->pHeapEntries[pHeapRoots->num++];
-	pRootEntry->numPointers = sizeInBytes >> 2;
+	// The 4-byte steps at which a whole pointer still fits inside the region
+	pRootEntry->numPointers = (sizeInBytes >= sizeof(void*)) ? ((sizeInBytes - sizeof(void*)) >> 2) + 1 : 0;
 	pRootEntry->pMem = pRoots;
 }
 

@@ -485,6 +485,16 @@
 // unbox: type-check a boxed value and push a pointer to the value inside the box.
 #define JIT_UNBOX                                        0x174
 
+// Array elements that are references or native ints: pointer-sized, so 8 bytes on a 64-bit target.
+// (ldelem.ref / stelem.ref used the 32-bit element ops, which copy the element size into a 4-byte variable.)
+#define JIT_LOAD_ELEMENT_PTR                             0x176
+#define JIT_STORE_ELEMENT_PTR                            0x177
+
+// brfalse / brtrue on an 8-byte operand (a reference, on a 64-bit target). Keep FALSE before TRUE:
+// the JIT adds (op - CIL_BRFALSE) to the first of them.
+#define JIT_BRANCH_FALSE_PTR                             0x178
+#define JIT_BRANCH_TRUE_PTR                              0x179
+
 // endfilter: ends the code of an exception filter, with the verdict (nonzero = handle it) on the stack.
 #define JIT_ENDFILTER                                    0x175
 

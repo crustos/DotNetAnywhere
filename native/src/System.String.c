@@ -74,8 +74,8 @@ tAsyncCall* System_String_ctor_CharAIntInt(PTR pThis_, PTR pParams, PTR pReturnV
 	U32 startIndex, length;
 
 	charArray = ((HEAP_PTR*)pParams)[0];
-	startIndex = ((U32*)pParams)[1];
-	length = ((U32*)pParams)[2];
+	startIndex = INTERNALCALL_PARAM(PSZ, U32);
+	length = INTERNALCALL_PARAM(PSZ+4, U32);
 
 	charElements = SystemArray_GetElements(charArray);
 	pSystemString = CreateStringHeapObj(length);
@@ -90,8 +90,8 @@ tAsyncCall* System_String_ctor_StringIntInt(PTR pThis_, PTR pParams, PTR pReturn
 	U32 startIndex, length;
 
 	pStr = ((tSystemString**)pParams)[0];
-	startIndex = ((U32*)pParams)[1];
-	length = ((U32*)pParams)[2];
+	startIndex = INTERNALCALL_PARAM(PSZ, U32);
+	length = INTERNALCALL_PARAM(PSZ+4, U32);
 
 	pThis = CreateStringHeapObj(length);
 	memcpy(pThis->chars, &pStr->chars[startIndex], length << 1);
@@ -134,7 +134,7 @@ tAsyncCall* System_String_InternalTrim(PTR pThis_, PTR pParams, PTR pReturnValue
 	U16 c;
 
 	pWhiteChars = ((HEAP_PTR*)pParams)[0];
-	trimType = ((U32*)pParams)[1];
+	trimType = INTERNALCALL_PARAM(PSZ, U32);
 	pCheckChars = (U16*)SystemArray_GetElements(pWhiteChars);
 	checkCharsLen = SystemArray_GetLength(pWhiteChars);
 
@@ -318,9 +318,9 @@ tAsyncCall* System_String_InternalIndexOf(PTR pThis_, PTR pParams, PTR pReturnVa
 tAsyncCall* System_String_InternalIndexOfAny(PTR pThis_, PTR pParams, PTR pReturnValue) {
 	tSystemString *pThis = (tSystemString*)pThis_;
 	HEAP_PTR valueArray = ((HEAP_PTR*)pParams)[0];
-	I32 startIndex = ((I32*)pParams)[1];
-	I32 count = ((I32*)pParams)[2];
-	U32 forwards = ((U32*)pParams)[3];
+	I32 startIndex = INTERNALCALL_PARAM(PSZ, I32);
+	I32 count = INTERNALCALL_PARAM(PSZ+4, I32);
+	U32 forwards = INTERNALCALL_PARAM(PSZ+8, U32);
 
 	PTR valueChars = SystemArray_GetElements(valueArray);
 	U32 numValueChars = SystemArray_GetLength(valueArray);

@@ -70,8 +70,8 @@ tAsyncCall* System_Array_Internal_GetValue(PTR pThis_, PTR pParams, PTR pReturnV
 		}
 		*(HEAP_PTR*)pReturnValue = boxedValue;
 	} else {
-		// This must be a reference type, so it must be 32-bits wide
-		*(U32*)pReturnValue = *(U32*)pElement;
+		// This must be a reference type, so it is pointer-sized (it was assumed to be 32 bits wide)
+		*(HEAP_PTR*)pReturnValue = *(HEAP_PTR*)pElement;
 	}
 
 	return NULL;
@@ -99,7 +99,7 @@ tAsyncCall* System_Array_Internal_SetValue(PTR pThis_, PTR pParams, PTR pReturnV
 		return NULL;
 	}
 
-	index = ((U32*)pParams)[1];
+	index = INTERNALCALL_PARAM(PSZ, U32);
 
 #if defined(_WIN32) && defined(_DEBUG)
 	// Do a bounds-check
@@ -139,8 +139,8 @@ tAsyncCall* System_Array_Clear(PTR pThis_, PTR pParams, PTR pReturnValue) {
 	tMD_TypeDef *pArrayType;
 
 	pArray = ((tSystemArray**)pParams)[0];
-	index = ((U32*)pParams)[1];
-	length = ((U32*)pParams)[2];
+	index = INTERNALCALL_PARAM(PSZ, U32);
+	length = INTERNALCALL_PARAM(PSZ+4, U32);
 	pArrayType = Heap_GetType((HEAP_PTR)pArray);
 	elementSize = pArrayType->pArrayElementType->arrayElementSize;
 	memset(pArray->elements + index * elementSize, 0, length * elementSize);
@@ -153,7 +153,7 @@ tAsyncCall* System_Array_Internal_Copy(PTR pThis_, PTR pParams, PTR pReturnValue
 	tMD_TypeDef *pSrcType, *pDstType, *pSrcElementType;
 
 	pSrc = ((tSystemArray**)pParams)[0];
-	pDst = ((tSystemArray**)pParams)[2];
+	pDst = INTERNALCALL_PARAM(PSZ+4, tSystemArray*);
 	
 	// Check if we can do a fast-copy with these two arrays
 	pSrcType = Heap_GetType((HEAP_PTR)pSrc);
@@ -163,9 +163,9 @@ tAsyncCall* System_Array_Internal_Copy(PTR pThis_, PTR pParams, PTR pReturnValue
 		// Can do fast-copy
 		U32 srcIndex, dstIndex, length, elementSize;
 
-		srcIndex = ((U32*)pParams)[1];
-		dstIndex = ((U32*)pParams)[3];
-		length = ((U32*)pParams)[4];
+		srcIndex = INTERNALCALL_PARAM(PSZ, U32);
+		dstIndex = INTERNALCALL_PARAM(2*PSZ+4, U32);
+		length = INTERNALCALL_PARAM(2*PSZ+8, U32);
 
 #if defined(_WIN32) && defined(_DEBUG)
 		// Do bounds check
@@ -195,7 +195,7 @@ tAsyncCall* System_Array_Resize(PTR pThis_, PTR pParams, PTR pReturnValue) {
 	tMD_TypeDef *pArrayTypeDef;
 
 	ppArray_ = ((HEAP_PTR**)pParams)[0];
-	newSize = ((U32*)pParams)[1];
+	newSize = INTERNALCALL_PARAM(PSZ, U32);
 
 	pOldArray = (tSystemArray*)*ppArray_;
 	oldSize = pOldArray->length;
@@ -222,8 +222,8 @@ tAsyncCall* System_Array_Reverse(PTR pThis_, PTR pParams, PTR pReturnValue) {
 	U8 *pE1, *pE2;
 
 	pArray = INTERNALCALL_PARAM(0, tSystemArray*);
-	index = INTERNALCALL_PARAM(4, U32);
-	length = INTERNALCALL_PARAM(8, U32);
+	index = INTERNALCALL_PARAM(PSZ, U32);
+	length = INTERNALCALL_PARAM(PSZ+4, U32);
 
 	pArrayType = Heap_GetType((HEAP_PTR)pArray);
 	elementSize = pArrayType->pArrayElementType->arrayElementSize;
@@ -330,7 +330,7 @@ U32 SystemArray_GetNumBytes(HEAP_PTR pThis_, tMD_TypeDef *pElementType) {
 tAsyncCall* System_Array_CreateInstance(PTR pThis_, PTR pParams, PTR pReturnValue) {
 	tMD_TypeDef *pElementType = RuntimeType_DeRef((PTR)(INTERNALCALL_PARAM(0, tRuntimeType*)));
 	tMD_TypeDef *pArrayType = Type_GetArrayTypeDef(pElementType, NULL, NULL);
-	U32 length = INTERNALCALL_PARAM(4, U32);
+	U32 length = INTERNALCALL_PARAM(PSZ, U32);
 	*(HEAP_PTR*)pReturnValue = SystemArray_NewVector(pArrayType, length);
 	return NULL;
 }

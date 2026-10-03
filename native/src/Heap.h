@@ -32,8 +32,12 @@ extern U64 gcTotalTime;
 #endif
 
 struct tHeapRootEntry_ {
-	U32 numPointers; // The number of pointers within this memory area
-	void **pMem;
+	// A region of memory is scanned for references at every 4-byte step, reading a pointer-sized value at
+	// each (so unaligned references are found: an int slot on the evaluation stack or in the locals can put
+	// a reference at any multiple of 4). This is how many such positions the region has.
+	// On a 32-bit target that is size/4, as it always was.
+	U32 numPointers;
+	void *pMem;
 };
 
 struct tHeapRoots_ {
