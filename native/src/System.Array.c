@@ -58,8 +58,11 @@ tAsyncCall* System_Array_Internal_GetValue(PTR pThis_, PTR pParams, PTR pReturnV
 			if (*(U32*)pElement) {
 				// Nullable has value
 				boxedValue = Heap_AllocType(pElementType->ppClassTypeArgs[0]);
-				// Don't copy the .hasValue part
-				memcpy(boxedValue, pElement + 4, elementSize - 4);
+				// Don't copy the .hasValue part (nor any padding): just the .Value field
+				{
+					tMD_FieldDef *pValueField = Type_NullableValueField(pElementType);
+					memcpy(boxedValue, pElement + pValueField->memOffset, pValueField->memSize);
+				}
 			} else {
 				// Nullable does not have value
 				boxedValue = NULL;
@@ -117,8 +120,10 @@ tAsyncCall* System_Array_Internal_SetValue(PTR pThis_, PTR pParams, PTR pReturnV
 			if (obj == NULL) {
 				memset(pElement, 0, elementSize);
 			} else {
+				tMD_FieldDef *pValueField = Type_NullableValueField(pElementType);
+				memset(pElement, 0, elementSize);
 				*(U32*)pElement = 1;
-				memcpy(pElement + 4, obj, elementSize - 4);
+				memcpy(pElement + pValueField->memOffset, obj, pValueField->memSize);
 			}
 		} else {
 			// Get the value out of the box

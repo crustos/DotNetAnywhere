@@ -3955,16 +3955,18 @@ JIT_UNBOX2OBJECT_end:
 JIT_BOX_NULLABLE_start:
 	OPCODE_USE(JIT_BOX_NULLABLE);
 	{
-		// Get the underlying type of the nullable type
+		// Get the underlying type of the nullable type, and the nullable type itself
 		tMD_TypeDef *pType = (tMD_TypeDef*)GET_OP();
+		tMD_TypeDef *pNullable = (tMD_TypeDef*)GET_OP();
 
-		// Take the nullable type off the stack. The +4 is because the of the HasValue field (Bool, size = 4 bytes)
-		pCurEvalStack -= pType->stackSize + 4;
+		// Take the nullable type off the stack: its whole size, which is the hasValue flag, any padding,
+		// and .Value (not simply "+4": where .Value sits depends on its alignment)
+		pCurEvalStack -= pNullable->stackSize;
 		// If .HasValue
 		if (*(U32*)pCurEvalStack) {
 			// Box the underlying type
 			HEAP_PTR boxed;
-			boxed = Heap_Box(pType, pCurEvalStack + 4);
+			boxed = Heap_Box(pType, pCurEvalStack + Type_NullableValueField(pNullable)->memOffset);
 			PUSH_O(boxed);
 		} else {
 			// Put a NULL pointer on the stack
@@ -4013,20 +4015,16 @@ JIT_UNBOX_NULLABLE_start:
 	OPCODE_USE(JIT_UNBOX_NULLABLE);
 	{
 		tMD_TypeDef *pTypeDef = (tMD_TypeDef*)GET_OP();
+		tMD_TypeDef *pNullable = (tMD_TypeDef*)GET_OP();
 		HEAP_PTR heapPtr;
 		heapPtr = POP_O();
-		if (heapPtr == NULL) {
-			// Push .HasValue (= false)
-			PUSH_U32(0);
-			// And increase the stack pointer by the size of the underlying type
-			// (the contents don't matter)
-			pCurEvalStack += pTypeDef->stackSize;
-		} else {
-			// Push .HasValue (= true)
-			PUSH_U32(1);
-			// Push the contents of .Value
-			PUSH_VALUETYPE(heapPtr, pTypeDef->stackSize, pTypeDef->stackSize);
+		// Build the whole Nullable<T> on the stack: zero it (so padding is clean), then set hasValue and .Value
+		memset(pCurEvalStack, 0, pNullable->stackSize);
+		if (heapPtr != NULL) {
+			*(U32*)pCurEvalStack = 1;      // .HasValue
+			memcpy(pCurEvalStack + Type_NullableValueField(pNullable)->memOffset, heapPtr, pTypeDef->stackSize);
 		}
+		pCurEvalStack += pNullable->stackSize;
 	}
 JIT_UNBOX_NULLABLE_end:
 	GO_NEXT();

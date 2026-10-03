@@ -122,6 +122,16 @@ void Type_Init();
 
 U32 Type_IsValueType(tMD_TypeDef *pTypeDef);
 
+// The alignment of an instance field whose size in memory is memSize. On a 32-bit target every field is 4-byte
+// aligned (all sizes are multiples of 4), so layout there is exactly what it always was. On a 64-bit target a
+// field whose size is a multiple of 8 (a reference, a long, a double, a pointer, a struct holding one) is
+// 8-aligned, which is how the C compiler lays out the structs that managed classes share with C.
+#define Type_FieldAlignment(memSize) ((sizeof(void*) >= 8 && (memSize) >= 8 && ((memSize) & 7) == 0) ? 8 : 4)
+
+// The `value` field of an instantiated Nullable<T>: where its .Value lives, which depends on T's size and so
+// on alignment (it was assumed to be at +4, right after the 4-byte hasValue flag).
+tMD_FieldDef* Type_NullableValueField(tMD_TypeDef *pNullable);
+
 tMD_TypeDef* Type_GetTypeFromSig(tMetaData *pMetaData, SIG *pSig, tMD_TypeDef **ppClassTypeArgs, tMD_TypeDef **ppMethodTypeArgs);
 
 // Is TestType derived from BaseType or the same as BaseType?

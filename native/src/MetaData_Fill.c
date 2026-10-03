@@ -184,7 +184,7 @@ static tMD_MethodDef* FindVirtualOverriddenMethod(tMD_TypeDef *pTypeDef, tMD_Met
 
 void MetaData_Fill_TypeDef_(tMD_TypeDef *pTypeDef, tMD_TypeDef **ppClassTypeArgs, tMD_TypeDef **ppMethodTypeArgs) {
 	IDX_TABLE firstIdx, lastIdx, token;
-	U32 instanceMemSize, staticMemSize, virtualOfs, i, j;
+	U32 instanceMemSize, staticMemSize, virtualOfs, i, j, hasAligned8;
 	tMetaData *pMetaData;
 	tMD_TypeDef *pParent;
 
@@ -280,6 +280,7 @@ void MetaData_Fill_TypeDef_(tMD_TypeDef *pTypeDef, tMD_TypeDef **ppClassTypeArgs
 			pTypeDef->ppFields = mallocForever(pTypeDef->numFields * sizeof(tMD_FieldDef*));
 		}
 		instanceMemSize = (pTypeDef->pParent == NULL)?0:pTypeDef->pParent->instanceMemSize;
+		hasAligned8 = 0;
 		for (token = firstIdx, i=0; token <= lastIdx; token++, i++) {
 			tMD_FieldDef *pFieldDef;
 
@@ -298,11 +299,25 @@ void MetaData_Fill_TypeDef_(tMD_TypeDef *pTypeDef, tMD_TypeDef **ppClassTypeArgs
 					// If is has an RVA, then analyse the field, but don't include it in any memory allocation
 					MetaData_Fill_FieldDef(pTypeDef, pFieldDef, 0, ppClassTypeArgs);
 				} else {
+					U32 align;
 					MetaData_Fill_FieldDef(pTypeDef, pFieldDef, instanceMemSize, ppClassTypeArgs);
+					// Fields are naturally aligned, as the C compiler lays out the structs that managed
+					// classes share with C (Thread, delegates, ...). They used to be packed one after another,
+					// which only agreed with those structs while every field was 4 bytes.
+					align = Type_FieldAlignment(pFieldDef->memSize);
+					instanceMemSize = (instanceMemSize + align - 1) & ~(align - 1);
+					pFieldDef->memOffset = instanceMemSize;
 					instanceMemSize += pFieldDef->memSize;
+					if (align == 8) {
+						hasAligned8 = 1;
+					}
 				}
 				pTypeDef->ppFields[i] = pFieldDef;
 			}
+		}
+		if (hasAligned8) {
+			// like a C struct, a type with an 8-aligned field is a multiple of 8 in size
+			instanceMemSize = (instanceMemSize + 7) & ~(U32)7;
 		}
 		if (pTypeDef->instanceMemSize == 0) {
 			pTypeDef->instanceMemSize = instanceMemSize;
