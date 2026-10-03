@@ -139,7 +139,10 @@ def main():
     cflags = ["-std=gnu99", "-Wno-pointer-sign", "-Wno-unused-result",
               "-fno-strict-aliasing", "-I", SRC]
     if args.m32:
-        cflags += ["-m32"]
+        # -msse2 -mfpmath=sse: IEEE single/double arithmetic. The 32-bit default is the x87 FPU, which
+        # computes in 80 bits and rounds a second time when storing, so some double divisions come out
+        # one ulp from what .NET (SSE2) gives.
+        cflags += ["-m32", "-msse2", "-mfpmath=sse"]
         # Debian/Ubuntu multiarch keeps asm/*.h here; -m32 doesn't search it
         if os.path.isdir("/usr/include/x86_64-linux-gnu/asm"):
             cflags += ["-idirafter", "/usr/include/x86_64-linux-gnu"]
