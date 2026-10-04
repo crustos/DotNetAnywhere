@@ -48,11 +48,22 @@ namespace System {
 
 		protected override Delegate RemoveImpl(Delegate d) {
 
+			// Only the LAST occurrence of the delegate is removed, as in .NET (every occurrence used to be)
+			MulticastDelegate last = null;
+			for (MulticastDelegate del = this; del != null; del = (MulticastDelegate)del.pNext) {
+				if (del.Equals(d)) {
+					last = del;
+				}
+			}
+			if (last == null) {
+				return this;
+			}
+
 			MulticastDelegate ret = null, cur = null;
 
 			for (MulticastDelegate del = this; del != null; del = (MulticastDelegate)del.pNext) {
 				// Miss out the one we're removing
-				if (!del.Equals(d)) {
+				if (del != last) {
 					if (ret == null) {
 						ret = (MulticastDelegate)System.Object.Clone(del);
 						cur = ret;
