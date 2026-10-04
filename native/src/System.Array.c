@@ -29,14 +29,6 @@
 #include "Heap.h"
 #include "Type.h"
 
-typedef struct tSystemArray_ tSystemArray;
-struct tSystemArray_ {
-	// How many elements in array
-	U32 length;
-	// The elements
-	U8 elements[0];
-};
-
 // Must return a boxed version of value-types
 tAsyncCall* System_Array_Internal_GetValue(PTR pThis_, PTR pParams, PTR pReturnValue) {
 	tSystemArray *pArray = (tSystemArray*)pThis_;

@@ -127,25 +127,32 @@ tMethodState* MethodState_Direct(tThread *pThread, tMD_MethodDef *pMethod, tMeth
 		MetaData_Fill_TypeDef(pTypeDef, NULL, NULL);
 	}
 
-	pThis = (tMethodState*)Thread_StackAlloc(pThread, sizeof(tMethodState));
-	pThis->finalizerThis = NULL;
-	pThis->pCaller = pCaller;
-	pThis->pMetaData = pMethod->pMetaData;
-	pThis->pMethod = pMethod;
 	if (pMethod->pJITted == NULL) {
 		// If method has not already been JITted
 		JIT_Prepare(pMethod, 0);
 	}
+	{
+		// The frame, its evaluation stack, and its parameters and locals are laid out one after another, and
+		// allocated in one step (they were three allocations, each a function call; the layout is the same).
+		tJITted *pJITted = pMethod->pJITted;
+		U32 paramsLocalsSize = pMethod->parameterStackSize + pJITted->localsStackSize;
+		PTR pBlock = (PTR)Thread_StackAlloc(pThread, sizeof(tMethodState) + pJITted->maxStack + paramsLocalsSize);
+		pThis = (tMethodState*)pBlock;
+		pThis->pEvalStack = pBlock + sizeof(tMethodState);
+		pThis->pParamsLocals = pThis->pEvalStack + pJITted->maxStack;
+		SmallZero(pThis->pParamsLocals, paramsLocalsSize);
+	}
+	pThis->finalizerThis = NULL;
+	pThis->nativeEntry = 0;
+	pThis->pCaller = pCaller;
+	pThis->pMetaData = pMethod->pMetaData;
+	pThis->pMethod = pMethod;
 	pThis->pJIT = pMethod->pJITted;
 	pThis->ipOffset = 0;
-	pThis->pEvalStack = (PTR)Thread_StackAlloc(pThread, pThis->pMethod->pJITted->maxStack);
 	pThis->stackOfs = 0;
 	pThis->isInternalNewObjCall = isInternalNewObjCall;
 	pThis->pNextDelegate = NULL;
 	pThis->pDelegateParams = NULL;
-
-	pThis->pParamsLocals = (PTR)Thread_StackAlloc(pThread, pMethod->parameterStackSize + pMethod->pJITted->localsStackSize);
-	memset(pThis->pParamsLocals, 0, pMethod->parameterStackSize + pMethod->pJITted->localsStackSize);
 
 #ifdef GEN_COMBINED_OPCODES
 	AddCall(pMethod);

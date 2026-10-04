@@ -73,14 +73,26 @@ static U32 heapSizeMax;
 static U32 numNodes = 0;
 // The number of collections done
 static U32 numCollections = 0;
+// The lowest and highest address of any heap entry ever allocated: a candidate pointer outside [heapLow, heapHigh] cannot point into the heap,
+// which is nearly every integer the collector looks at (it reads the contents of arrays of structs 4 bytes at a time)
+static char *heapLow = NULL, *heapHigh = NULL;
 
 #ifdef DIAG_GC
 // Track how much time GC's are taking
 U64 gcTotalTime = 0;
 #endif
 
+// After a collection the next one is scheduled when the heap has grown to about twice the live size, but never
+// sooner than MIN_HEAP_SIZE of headroom and never later than MAX_HEAP_EXCESS of it. The ceiling used to be 200,000
+// bytes, which for a program whose live heap keeps growing meant a collection every 200 KB of allocation, each one
+// marking everything live and sweeping the whole heap: quadratic. (Growing a 60,000-entry Dictionary took 13 s; with
+// this ceiling 0.8 s.) A small-memory target can still lower either with -D.
+#ifndef MIN_HEAP_SIZE
 #define MIN_HEAP_SIZE 50000
-#define MAX_HEAP_EXCESS 200000
+#endif
+#ifndef MAX_HEAP_EXCESS
+#define MAX_HEAP_EXCESS (64U * 1024 * 1024)
+#endif
 
 void Heap_Init() {
 	// Initialise vars
@@ -168,21 +180,31 @@ static void GarbageCollect() {
 		for (i=0; i<rootsEntryNumPointers; i++) {
 			void *pMemRef;
 			memcpy(&pMemRef, pRootsEntryMem + ((size_t)i << 2), sizeof(void*));   // 4-byte steps, maybe unaligned
-			// Quick escape for known non-memory 
-			if (pMemRef == NULL) {
+			// Quick escape for known non-memory (nothing, or outside the addresses of every heap entry: most integers)
+			if (pMemRef == NULL || (char*)pMemRef < heapLow || (char*)pMemRef > heapHigh) {
 				continue;
 			}
 			// Find this piece of heap memory in the tracking tree.
 			// Note that the 2nd memory address comparison MUST be >, not >= as might be expected,
 			// to allow for a zero-sized memory to be detected (and not garbage collected) properly.
 			// E.g. The object class has zero memory.
-			pNode = pHeapTreeRoot;
-			while (pNode != nil) {
-				if (pMemRef < (void*)pNode) {
-					pNode = pNode->pLink[0];
-				} else if ((char*)pMemRef > ((char*)pNode) + GetSize(pNode) + sizeof(tHeapEntry)) {
-					pNode = pNode->pLink[1];
-				} else {
+			// The entry containing pMemRef is the last one that starts at or before it: descend comparing start addresses only, and
+			// work out the size of that one entry, not of every one on the way down (that was most of the cost of a collection).
+			{
+				tHeapEntry *pCandidate = NULL;
+				pNode = pHeapTreeRoot;
+				while (pNode != nil) {
+					if (pMemRef < (void*)pNode) {
+						pNode = pNode->pLink[0];
+					} else {
+						pCandidate = pNode;
+						pNode = pNode->pLink[1];
+					}
+				}
+				pNode = pCandidate;
+			}
+			if (pNode != NULL && (char*)pMemRef <= ((char*)pNode) + GetSize(pNode) + sizeof(tHeapEntry)) {
+				{
 					// Found memory. See if it's already been marked.
 					// If it's already marked, then don't do anything.
 					// It it's not marked, then add all of its memory to the roots, and mark it.
@@ -210,7 +232,6 @@ static void GarbageCollect() {
 							}
 						}
 					}
-					break;
 				}
 			}
 		}
@@ -348,6 +369,8 @@ HEAP_PTR Heap_Alloc(tMD_TypeDef *pTypeDef, U32 size) {
 	pHeapEntry->needToFinalize = (pTypeDef->pFinalizer != NULL);
 	memset(pHeapEntry->memory, 0, size);
 	trackHeapSize += totalSize;
+	if (heapLow == NULL || (char*)pHeapEntry < heapLow) { heapLow = (char*)pHeapEntry; }
+	if ((char*)pHeapEntry + totalSize > heapHigh) { heapHigh = (char*)pHeapEntry + totalSize; }
 
 	HeapTree_Insert(pHeapEntry);
 	numNodes++;

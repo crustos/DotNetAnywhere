@@ -29,9 +29,11 @@
 #include "Heap.h"
 #include "Type.h"
 #include "MethodState.h"
+#include "NativeBlocks.h"
 #include "Finalizer.h"
 #include "Delegate.h"
 #include "PInvoke.h"
+#include "FFI.h"
 
 #include "System.String.h"
 #include "System.Array.h"
@@ -118,6 +120,15 @@ tJITCodeInfo jitCodeGoNext;
 	pOps = pJIT->pOps; \
 	pOpSequencePoints = pJIT->pOpSequencePoints; \
 	pCurOp = pOps + pCurrentMethodState->ipOffset
+
+// The fast call and return (below) do what MethodState_Direct and MethodState_Delete do, for the usual frame. Those functions have
+// more to do when GEN_COMBINED_OPCODES or DIAG_METHOD_CALLS is on (and _DEBUG makes the thread stack write guard words), so then the
+// general path is used. -DNO_FAST_CALL turns it off.
+#if !defined(GEN_COMBINED_OPCODES) && !defined(DIAG_METHOD_CALLS) && !defined(NO_FAST_CALL) && !defined(_DEBUG)
+#define FAST_CALL_PATH 1
+#else
+#define FAST_CALL_PATH 0
+#endif
 
 #define CHANGE_METHOD_STATE(pNewMethodState) \
 	SAVE_METHOD_STATE(); \
@@ -288,6 +299,12 @@ static void CopyObject(tMD_TypeDef *pType, PTR pDst, PTR pSrc) {
 // For handlers that declare their own local `heapPtr` (which would shadow the one the shared
 // throw code reads): jump to a stub that allocates into the function-level variable.
 #define THROW_NULLREF() goto throwNullRef
+// Array access: a null array is a NullReferenceException, an index outside 0..length-1 (a negative one is a huge unsigned
+// number) an IndexOutOfRangeException. (None of the element handlers used to check: reading or writing past the end of an
+// array touched whatever was there, and a null array crashed the process.)
+#define CHECK_ARRAY(arr, index) \
+	if ((arr) == NULL) { THROW_NULLREF(); } \
+	if ((U32)(index) >= ((tSystemArray*)(arr))->length) { THROW(types[TYPE_SYSTEM_INDEXOUTOFRANGEEXCEPTION]); }
 
 static void CheckIfCurrentInstructionHasBreakpoint(tMethodState* pMethodState, U32 opOffset, I32* pOpSequencePoints)
 {
@@ -312,7 +329,7 @@ static void CreateParameters(PTR pParamsLocals, tMD_MethodDef *pCallMethod, PTR 
 		ofs = 0;
 	}
 	*ppCurEvalStack -= pCallMethod->parameterStackSize - ofs;
-	memcpy(pParamsLocals + ofs, *ppCurEvalStack, pCallMethod->parameterStackSize - ofs);
+	SmallCopy(pParamsLocals + ofs, *ppCurEvalStack, pCallMethod->parameterStackSize - ofs);
 }
 
 static tMethodState* RunFinalizer(tThread *pThread) {
@@ -403,6 +420,23 @@ U32 opcodeNumUses[JIT_OPCODE_MAXNUM];
 
 #define RUN_FINALIZER() {tMethodState *pMS = RunFinalizer(pThread);if(pMS) {CHANGE_METHOD_STATE(pMS);}}
 
+// The next finally clause, from clause `from` on, that a `leave` at op `src` going to op `target` has to run: one whose
+// try block contains the leave but not the target. Clauses are listed innermost first, which is the order they run in.
+// (A leave used to run just the first one, so `return` from nested try/finally blocks skipped all the outer ones.)
+static tExceptionHeader* FindLeaveFinally(tJITted *pJIT, U32 from, U32 src, U32 target, U32 *pNext) {
+	U32 i;
+	for (i = from; i < pJIT->numExceptionHandlers; i++) {
+		tExceptionHeader *pEx = &pJIT->pExceptionHeaders[i];
+		if (pEx->flags == COR_ILEXCEPTION_CLAUSE_FINALLY &&
+			src >= pEx->tryStart && src < pEx->tryEnd &&
+			!(target >= pEx->tryStart && target < pEx->tryEnd)) {
+			*pNext = i + 1;
+			return pEx;
+		}
+	}
+	return NULL;
+}
+
 U32 JIT_Execute(tThread *pThread, U32 numInst) {
 	tJITted *pJIT;
 	tMethodState *pCurrentMethodState;
@@ -452,6 +486,8 @@ U32 JIT_Execute(tThread *pThread, U32 numInst) {
 		GET_LABELS_DYNAMIC(JIT_LOAD_I32, 4);
 		GET_LABELS(JIT_BRANCH);
 		GET_LABELS(JIT_LOAD_STRING);
+		GET_LABELS(JIT_LOAD_STRING_MD);
+		GET_LABELS(JIT_FFI_CALL);
 		GET_LABELS(JIT_CALLVIRT_O);
 		GET_LABELS(JIT_CALL_NATIVE);
 		GET_LABELS(JIT_CALL_O);
@@ -551,6 +587,7 @@ U32 JIT_Execute(tThread *pThread, U32 numInst) {
 		GET_LABELS(JIT_LOADSTATICFIELD_CHECKTYPEINIT_PTR);
 		GET_LABELS(JIT_LOADSTATICFIELD_CHECKTYPEINIT_F32);
 		GET_LABELS(JIT_LOADSTATICFIELD_CHECKTYPEINIT_F64);
+		GET_LABELS(JIT_LOADSTATICFIELD_CHECKTYPEINIT_INT64);
 
 		GET_LABELS(JIT_STORESTATICFIELD_INT32);
 		GET_LABELS(JIT_STORESTATICFIELD_INT64);
@@ -564,6 +601,7 @@ U32 JIT_Execute(tThread *pThread, U32 numInst) {
 		GET_LABELS(JIT_BOX_INT64);
 		GET_LABELS(JIT_BOX_INT32);
 		GET_LABELS(JIT_BOX_INTNATIVE);
+		GET_LABELS(JIT_BOX_PTR);
 		GET_LABELS(JIT_BOX_F32);
 		GET_LABELS(JIT_BOX_F64);
 		GET_LABELS(JIT_BOX_O);
@@ -676,6 +714,18 @@ U32 JIT_Execute(tThread *pThread, U32 numInst) {
 		GET_LABELS(JIT_BRANCH_FALSE);
 		GET_LABELS(JIT_BRANCH_FALSE_PTR);
 		GET_LABELS(JIT_BRANCH_TRUE_PTR);
+#define FUSED_LABELS
+#include "JIT_Fused.gen.h"
+#undef FUSED_LABELS
+		GET_LABELS(JIT_NATIVE_BLOCK);
+		GET_LABELS(JIT_NATIVE_LOOP);
+		GET_LABELS(JIT_NATIVE_RESUME);
+		GET_LABELS(JIT_STORE_ELEMENT_I1);
+		GET_LABELS(JIT_STORE_ELEMENT_I2);
+		GET_LABELS(JIT_STORE_ELEMENT_I4);
+		GET_LABELS(JIT_LOAD_ELEMENT_ADDR_N);
+		GET_LABELS(JIT_LOAD_ELEMENT_U8_1);
+		GET_LABELS(JIT_LOAD_ELEMENT_U8_4);
 		GET_LABELS(JIT_BRANCH_TRUE);
 		GET_LABELS(JIT_LOADTOKEN_TYPE);
 		
@@ -1325,7 +1375,7 @@ JIT_STORE_OBJECT_VALUETYPE_start:
 		U32 memSize = (size<4)?4:size;
 		PTR pMem = pCurEvalStack - memSize - sizeof(void*);
 		POP_VALUETYPE(*(void**)pMem, size, memSize);
-		POP(4);
+		POP(sizeof(void*));   // the destination address (this was POP(4): a pointer is 8 bytes on a 64-bit target)
 	}
 JIT_STORE_OBJECT_VALUETYPE_end:
 	GO_NEXT();
@@ -1406,11 +1456,21 @@ JIT_RETURN_start:
 		LOAD_METHOD_STATE();
 		// Copy return value to callers evaluation stack
 		if (u32Value > 0) {
-			memmove(pCurEvalStack, pMem, u32Value);
+			SmallCopy(pCurEvalStack, pMem, u32Value);   // the two evaluation stacks are separate blocks
 			pCurEvalStack += u32Value;
 		}
 		// Delete the current method state and go back to callers method state
+#if FAST_CALL_PATH
+		if (pOldMethodState->finalizerThis == NULL && pOldMethodState->pDelegateParams == NULL) {
+			// the usual frame: freeing it is giving back its space on the thread stack
+			tThreadStack *pOldStack = pThread->pThreadStack;
+			pOldStack->ofs = (U32)((unsigned char*)pOldMethodState - pOldStack->memory);
+		} else {
+			MethodState_Delete(pThread, &pOldMethodState);
+		}
+#else
 		MethodState_Delete(pThread, &pOldMethodState);
+#endif
 	}
 	if (pCurrentMethodState->pNextDelegate == NULL) {
 		GO_NEXT();
@@ -1433,7 +1493,29 @@ JIT_INVOKE_DELEGATE_start:
 			// Take the params off the stack. This is the pointer to the tDelegate & params
 			//pCurrentMethodState->stackOfs -= pDelegateMethod->parameterStackSize;
 			pCurEvalStack -= pDelegateMethod->parameterStackSize;
-			// Allocate memory for delegate params
+			{
+				// The usual delegate has one target. Then the arguments are still on the evaluation stack, just above the delegate, and
+				// the target's frame is filled from there: nothing is allocated or copied twice. (A multicast delegate needs its
+				// arguments again for each target, so those are kept, below.)
+				void *pSingle = *(void**)pCurEvalStack;
+				if (pSingle != NULL) {
+					void *pSingleNext;
+					HEAP_PTR pSingleThis;
+					tMD_MethodDef *pSingleMethod = Delegate_GetMethodAndStore(pSingle, &pSingleThis, &pSingleNext);
+					if (pSingleNext == NULL) {
+						U32 sofs = (pSingleThis != NULL) ? (U32)sizeof(void*) : 0;
+						tMethodState *pSingleState = MethodState_Direct(pThread, pSingleMethod, pCurrentMethodState, 0);
+						if (pSingleThis != NULL) {
+							*(HEAP_PTR*)pSingleState->pParamsLocals = pSingleThis;
+						}
+						SmallCopy(pSingleState->pParamsLocals + sofs, pCurEvalStack + sizeof(void*), pSingleMethod->parameterStackSize - sofs);
+						CHANGE_METHOD_STATE(pSingleState);
+						GO_NEXT();
+					}
+				}
+			}
+			// Allocate memory for delegate params (the previous invocation's, if there was one, is finished with: it used to be lost here)
+			free(pCurrentMethodState->pDelegateParams);
 			pCurrentMethodState->pDelegateParams = malloc(pDelegateMethod->parameterStackSize - sizeof(void*));
 			memcpy(
 				pCurrentMethodState->pDelegateParams,
@@ -1552,6 +1634,62 @@ JIT_DEREF_CALLVIRT_start:
 JIT_BOX_CALLVIRT_start:
 	op = JIT_BOX_CALLVIRT;
 	goto allCallStart;
+#if FAST_CALL_PATH
+// The common calls, call and callvirt: the target is known (callvirt finds it in the vtable), its frame is made right here out of the
+// thread stack, and only its locals are cleared (the parameters are written by the copy of the arguments). Anything unusual (a
+// method not yet filled in or compiled, a null `this`) is left to the general code below, which does all of it as it always did.
+#define FAST_CALL(pM) do { \
+	tMD_MethodDef *fm_ = (pM); \
+	tJITted *fj_ = fm_->pJITted; \
+	tThreadStack *fs_ = pThread->pThreadStack; \
+	U32 fpsz_ = fm_->parameterStackSize, fls_ = fj_->localsStackSize, fms_ = fj_->maxStack; \
+	PTR fblock_ = fs_->memory + fs_->ofs; \
+	tMethodState *fnew_ = (tMethodState*)fblock_; \
+	fs_->ofs += (U32)sizeof(tMethodState) + fms_ + fpsz_ + fls_; \
+	if (fs_->ofs > THREADSTACK_CHUNK_SIZE) { Crash("Thread-local stack is too large"); } \
+	fnew_->pEvalStack = fblock_ + sizeof(tMethodState); \
+	fnew_->pParamsLocals = fnew_->pEvalStack + fms_; \
+	if (fls_ != 0) { SmallZero(fnew_->pParamsLocals + fpsz_, fls_); } \
+	pCurEvalStack -= fpsz_; \
+	SmallCopy(fnew_->pParamsLocals, pCurEvalStack, fpsz_); \
+	fnew_->finalizerThis = NULL; fnew_->nativeEntry = 0; fnew_->pCaller = pCurrentMethodState; \
+	fnew_->pMetaData = fm_->pMetaData; fnew_->pMethod = fm_; fnew_->pJIT = fj_; fnew_->ipOffset = 0; fnew_->stackOfs = 0; \
+	fnew_->isInternalNewObjCall = 0; fnew_->pNextDelegate = NULL; fnew_->pDelegateParams = NULL; \
+	CHANGE_METHOD_STATE(fnew_); \
+} while (0)
+
+JIT_CALL_PTR_start: // Note that JIT_CALL_PTR cannot be virtual
+JIT_CALL_O_start:
+	OPCODE_USE(JIT_CALL_O);
+	{
+		tMD_MethodDef *pFastMethod = (tMD_MethodDef*)GET_OP();
+		if (pFastMethod->isFilled && pFastMethod->pJITted != NULL) {
+			FAST_CALL(pFastMethod);
+			GO_NEXT_CHECK();
+		}
+		pCurOp--;                       // not the usual case: the general code reads the operand itself
+	}
+	op = JIT_CALL_O;
+	goto allCallStart;
+JIT_CALLVIRT_O_start:
+	OPCODE_USE(JIT_CALLVIRT_O);
+	{
+		tMD_MethodDef *pFastMethod = (tMD_MethodDef*)GET_OP();
+		HEAP_PTR pFastThis = *(HEAP_PTR*)(pCurEvalStack - pFastMethod->parameterStackSize);
+		if (pFastThis != NULL) {
+			if (METHOD_ISVIRTUAL(pFastMethod)) {
+				pFastMethod = Heap_GetType(pFastThis)->pVTable[pFastMethod->vTableOfs];
+			}
+			if (pFastMethod->isFilled && pFastMethod->pJITted != NULL) {
+				FAST_CALL(pFastMethod);
+				GO_NEXT_CHECK();
+			}
+		}
+		pCurOp--;                       // a null `this`, or a method not ready: the general code does it (and throws)
+	}
+	op = JIT_CALLVIRT_O;
+	goto allCallStart;
+#else
 JIT_CALL_PTR_start: // Note that JIT_CALL_PTR cannot be virtual
 	op = JIT_CALL_PTR;
 	goto allCallStart;
@@ -1561,9 +1699,46 @@ JIT_CALLVIRT_O_start:
 JIT_CALL_O_start:
 	op = JIT_CALL_O;
 	goto allCallStart;
+#endif
+#if FAST_CALL_PATH
+JIT_CALL_INTERFACE_start:
+	OPCODE_USE(JIT_CALL_INTERFACE);
+	{
+		tMD_MethodDef *pFastMethod = (tMD_MethodDef*)GET_OP();
+		HEAP_PTR pFastThis = *(HEAP_PTR*)(pCurEvalStack - pFastMethod->parameterStackSize);
+		tMD_TypeDef *pFastType, *pFastInterface;
+		tMD_MethodDef *pFastTarget = NULL;
+		I32 fi;
+		if (pFastThis == NULL) {
+			// (the general code below did not check this, and crashed)
+			THROW(types[TYPE_SYSTEM_NULLREFERENCEEXCEPTION]);
+		}
+		pFastType = Heap_GetType(pFastThis);
+		pFastInterface = pFastMethod->pParentType;
+		// searched backwards, as below: if an interface is implemented more than once in the type hierarchy, the most recent one is used
+		for (fi = (I32)pFastType->numInterfaces - 1; fi >= 0; fi--) {
+			if (pFastType->pInterfaceMaps[fi].pInterface == pFastInterface) {
+				if (pFastType->pInterfaceMaps[fi].pVTableLookup != NULL) {
+					pFastTarget = pFastType->pVTable[pFastType->pInterfaceMaps[fi].pVTableLookup[pFastMethod->vTableOfs]];
+				} else {
+					pFastTarget = pFastType->pInterfaceMaps[fi].ppMethodVLookup[pFastMethod->vTableOfs];
+				}
+				break;
+			}
+		}
+		if (pFastTarget != NULL && pFastTarget->isFilled && pFastTarget->pJITted != NULL) {
+			FAST_CALL(pFastTarget);
+			GO_NEXT_CHECK();
+		}
+		pCurOp--;                       // not found, or not ready: the general code does it
+	}
+	op = JIT_CALL_INTERFACE;
+	goto allCallStart;
+#else
 JIT_CALL_INTERFACE_start:
 	op = JIT_CALL_INTERFACE;
 	goto allCallStart;
+#endif
 JIT_CALLI_start:
 	op = JIT_CALLI;
 allCallStart:
@@ -1820,7 +1995,6 @@ JIT_BGE_I64I64_end:
 	GO_NEXT_CHECK();
 
 JIT_BGE_F32F32_start:
-JIT_BGE_UN_F32F32_start:
 	OPCODE_USE(JIT_BGE_F32F32);
 	{
 		float v1, v2;
@@ -1832,11 +2006,24 @@ JIT_BGE_UN_F32F32_start:
 		}
 	}
 JIT_BGE_F32F32_end:
+	GO_NEXT_CHECK();
+
+// the unordered form branches when either operand is NaN too (it used to be this handler, so NaN compared "true")
+JIT_BGE_UN_F32F32_start:
+	OPCODE_USE(JIT_BGE_UN_F32F32);
+	{
+		float v1, v2;
+		U32 ofs;
+		POP_F32_F32(v1, v2);
+		ofs = GET_OP();
+		if (!(v1 < v2)) {
+			pCurOp = pOps + ofs;
+		}
+	}
 JIT_BGE_UN_F32F32_end:
 	GO_NEXT_CHECK();
 
 JIT_BGE_F64F64_start:
-JIT_BGE_UN_F64F64_start:
 	OPCODE_USE(JIT_BGE_F64F64);
 	{
 		double v1, v2;
@@ -1848,6 +2035,20 @@ JIT_BGE_UN_F64F64_start:
 		}
 	}
 JIT_BGE_F64F64_end:
+	GO_NEXT_CHECK();
+
+// the unordered form branches when either operand is NaN too (it used to be this handler, so NaN compared "true")
+JIT_BGE_UN_F64F64_start:
+	OPCODE_USE(JIT_BGE_UN_F64F64);
+	{
+		double v1, v2;
+		U32 ofs;
+		POP_F64_F64(v1, v2);
+		ofs = GET_OP();
+		if (!(v1 < v2)) {
+			pCurOp = pOps + ofs;
+		}
+	}
 JIT_BGE_UN_F64F64_end:
 	GO_NEXT_CHECK();
 
@@ -1880,7 +2081,6 @@ JIT_BGT_I64I64_end:
 	GO_NEXT_CHECK();
 
 JIT_BGT_F32F32_start:
-JIT_BGT_UN_F32F32_start:
 	OPCODE_USE(JIT_BGT_F32F32);
 	{
 		float v1, v2;
@@ -1892,11 +2092,24 @@ JIT_BGT_UN_F32F32_start:
 		}
 	}
 JIT_BGT_F32F32_end:
+	GO_NEXT_CHECK();
+
+// the unordered form branches when either operand is NaN too (it used to be this handler, so NaN compared "true")
+JIT_BGT_UN_F32F32_start:
+	OPCODE_USE(JIT_BGT_UN_F32F32);
+	{
+		float v1, v2;
+		U32 ofs;
+		POP_F32_F32(v1, v2);
+		ofs = GET_OP();
+		if (!(v1 <= v2)) {
+			pCurOp = pOps + ofs;
+		}
+	}
 JIT_BGT_UN_F32F32_end:
 	GO_NEXT_CHECK();
 
 JIT_BGT_F64F64_start:
-JIT_BGT_UN_F64F64_start:
 	OPCODE_USE(JIT_BGT_F64F64);
 	{
 		double v1, v2;
@@ -1908,6 +2121,20 @@ JIT_BGT_UN_F64F64_start:
 		}
 	}
 JIT_BGT_F64F64_end:
+	GO_NEXT_CHECK();
+
+// the unordered form branches when either operand is NaN too (it used to be this handler, so NaN compared "true")
+JIT_BGT_UN_F64F64_start:
+	OPCODE_USE(JIT_BGT_UN_F64F64);
+	{
+		double v1, v2;
+		U32 ofs;
+		POP_F64_F64(v1, v2);
+		ofs = GET_OP();
+		if (!(v1 <= v2)) {
+			pCurOp = pOps + ofs;
+		}
+	}
 JIT_BGT_UN_F64F64_end:
 	GO_NEXT_CHECK();
 
@@ -1940,7 +2167,6 @@ JIT_BLE_I64I64_end:
 	GO_NEXT_CHECK();
 
 JIT_BLE_F32F32_start:
-JIT_BLE_UN_F32F32_start:
 	OPCODE_USE(JIT_BLE_F32F32);
 	{
 		float v1, v2;
@@ -1952,11 +2178,24 @@ JIT_BLE_UN_F32F32_start:
 		}
 	}
 JIT_BLE_F32F32_end:
+	GO_NEXT_CHECK();
+
+// the unordered form branches when either operand is NaN too (it used to be this handler, so NaN compared "true")
+JIT_BLE_UN_F32F32_start:
+	OPCODE_USE(JIT_BLE_UN_F32F32);
+	{
+		float v1, v2;
+		U32 ofs;
+		POP_F32_F32(v1, v2);
+		ofs = GET_OP();
+		if (!(v1 > v2)) {
+			pCurOp = pOps + ofs;
+		}
+	}
 JIT_BLE_UN_F32F32_end:
 	GO_NEXT_CHECK();
 
 JIT_BLE_F64F64_start:
-JIT_BLE_UN_F64F64_start:
 	OPCODE_USE(JIT_BLE_F64F64);
 	{
 		double v1, v2;
@@ -1968,6 +2207,20 @@ JIT_BLE_UN_F64F64_start:
 		}
 	}
 JIT_BLE_F64F64_end:
+	GO_NEXT_CHECK();
+
+// the unordered form branches when either operand is NaN too (it used to be this handler, so NaN compared "true")
+JIT_BLE_UN_F64F64_start:
+	OPCODE_USE(JIT_BLE_UN_F64F64);
+	{
+		double v1, v2;
+		U32 ofs;
+		POP_F64_F64(v1, v2);
+		ofs = GET_OP();
+		if (!(v1 > v2)) {
+			pCurOp = pOps + ofs;
+		}
+	}
 JIT_BLE_UN_F64F64_end:
 	GO_NEXT_CHECK();
 
@@ -2000,7 +2253,6 @@ JIT_BLT_I64I64_end:
 	GO_NEXT_CHECK();
 
 JIT_BLT_F32F32_start:
-JIT_BLT_UN_F32F32_start:
 	OPCODE_USE(JIT_BLT_F32F32);
 	{
 		float v1, v2;
@@ -2012,11 +2264,24 @@ JIT_BLT_UN_F32F32_start:
 		}
 	}
 JIT_BLT_F32F32_end:
+	GO_NEXT_CHECK();
+
+// the unordered form branches when either operand is NaN too (it used to be this handler, so NaN compared "true")
+JIT_BLT_UN_F32F32_start:
+	OPCODE_USE(JIT_BLT_UN_F32F32);
+	{
+		float v1, v2;
+		U32 ofs;
+		POP_F32_F32(v1, v2);
+		ofs = GET_OP();
+		if (!(v1 >= v2)) {
+			pCurOp = pOps + ofs;
+		}
+	}
 JIT_BLT_UN_F32F32_end:
 	GO_NEXT_CHECK();
 
 JIT_BLT_F64F64_start:
-JIT_BLT_UN_F64F64_start:
 	OPCODE_USE(JIT_BLT_F64F64);
 	{
 		double v1, v2;
@@ -2028,6 +2293,20 @@ JIT_BLT_UN_F64F64_start:
 		}
 	}
 JIT_BLT_F64F64_end:
+	GO_NEXT_CHECK();
+
+// the unordered form branches when either operand is NaN too (it used to be this handler, so NaN compared "true")
+JIT_BLT_UN_F64F64_start:
+	OPCODE_USE(JIT_BLT_UN_F64F64);
+	{
+		double v1, v2;
+		U32 ofs;
+		POP_F64_F64(v1, v2);
+		ofs = GET_OP();
+		if (!(v1 >= v2)) {
+			pCurOp = pOps + ofs;
+		}
+	}
 JIT_BLT_UN_F64F64_end:
 	GO_NEXT_CHECK();
 
@@ -3278,6 +3557,30 @@ JIT_LOAD_STRING_start:
 JIT_LOAD_STRING_end:
 	GO_NEXT();
 
+JIT_FFI_CALL_start:
+	OPCODE_USE(JIT_FFI_CALL);
+	{
+		// The arguments are on the evaluation stack in the order of the call; the wrapper reads them there, calls the C function and writes
+		// the result where the first argument was. No frame, no copy, no marshalling.
+		const tFFIEntry *pFfi = (const tFFIEntry*)GET_OP();
+		pFfi->wrapper(pCurEvalStack - pFfi->argBytes);
+		pCurEvalStack = pCurEvalStack - pFfi->argBytes + pFfi->retBytes;
+	}
+JIT_FFI_CALL_end:
+	GO_NEXT();
+
+JIT_LOAD_STRING_MD_start:
+	OPCODE_USE(JIT_LOAD_STRING_MD);
+	{
+		// ldstr from a method that was inlined into another: the token belongs to the metadata of the method it came from, not the one running
+		tMetaData *pStringMetaData = (tMetaData*)GET_OP();
+		U32 value = GET_OP();
+		PTR heapPtr = SystemString_FromUserStrings(pStringMetaData, value);
+		PUSH_O(heapPtr);
+	}
+JIT_LOAD_STRING_MD_end:
+	GO_NEXT();
+
 JIT_NEWOBJECT_start:
 	OPCODE_USE(JIT_NEWOBJECT);
 	{
@@ -3364,12 +3667,34 @@ jitCastClass:
 			goto JIT_IS_INSTANCE_end;
 		}
 		pTestType = Heap_GetType(heapPtr);
+		if (pTestType == pToType) {
+			// exactly that type: nothing to work out
+			PUSH_O(heapPtr);
+			goto JIT_IS_INSTANCE_end;
+		}
+		if (TYPE_ISINTERFACE(pToType)) {
+			// an interface that the object's type lists itself (the usual case) is found without the general walk
+			U32 ii;
+			for (ii = 0; ii < pTestType->numInterfaces; ii++) {
+				if (pTestType->pInterfaceMaps[ii].pInterface == pToType) {
+					PUSH_O(heapPtr);
+					goto JIT_IS_INSTANCE_end;
+				}
+			}
+		}
 		if (TYPE_ISARRAY(pTestType) && TYPE_ISARRAY(pToType)) {
 			// Arrays are handled specially - check if the element type is compatible
-			if (Type_IsAssignableFrom(pToType->pArrayElementType, pTestType->pArrayElementType)) {
+			tMD_TypeDef *pToElem = pToType->pArrayElementType, *pTestElem = pTestType->pArrayElementType;
+			MetaData_Fill_TypeDef(pTestElem, NULL, NULL);
+			// array covariance is for reference element types only: an int[] is not an object[] (it used to be one)
+			if (pToElem == pTestElem || (!pTestElem->isValueType && Type_IsAssignableFrom(pToElem, pTestElem))) {
 				PUSH_O(heapPtr);
 				goto JIT_IS_INSTANCE_end;
 			}
+		} else if (TYPE_ISARRAY(pTestType) && pToType == types[TYPE_SYSTEM_ARRAY_NO_TYPE]) {
+			// every array is a System.Array (it was not recognised as one)
+			PUSH_O(heapPtr);
+			goto JIT_IS_INSTANCE_end;
 		} else {
 			if (Type_IsAssignableFrom(pToType, pTestType) ||
 				(pToType->pGenericDefinition == types[TYPE_SYSTEM_NULLABLE] &&
@@ -3410,6 +3735,7 @@ JIT_LOAD_VECTOR_LEN_start: // Load the length of a vector array
 	OPCODE_USE(JIT_LOAD_VECTOR_LEN);
 	{
 		PTR heapPtr = POP_O();
+		if (heapPtr == NULL) { THROW_NULLREF(); }
 		U32 value = SystemArray_GetLength(heapPtr);
 		PUSH_U32(value);
 	}
@@ -3421,6 +3747,7 @@ JIT_LOAD_ELEMENT_I8_start:
 	{
 		U32 value, idx = POP_U32(); // Array index
 		HEAP_PTR heapPtr = POP_O();
+		CHECK_ARRAY(heapPtr, idx);
 		SystemArray_LoadElement(heapPtr, idx, (PTR)&value);
 		PUSH_U32((I8)value);
 	}
@@ -3432,6 +3759,7 @@ JIT_LOAD_ELEMENT_U8_start:
 	{
 		U32 value, idx = POP_U32(); // Array index
 		HEAP_PTR heapPtr = POP_O();
+		CHECK_ARRAY(heapPtr, idx);
 		SystemArray_LoadElement(heapPtr, idx, (PTR)&value);
 		PUSH_U32((U8)value);
 	}
@@ -3443,6 +3771,7 @@ JIT_LOAD_ELEMENT_I16_start:
 	{
 		U32 value, idx = POP_U32(); // Array index
 		HEAP_PTR heapPtr = POP_O();
+		CHECK_ARRAY(heapPtr, idx);
 		SystemArray_LoadElement(heapPtr, idx, (PTR)&value);
 		PUSH_U32((I16)value);
 	}
@@ -3454,6 +3783,7 @@ JIT_LOAD_ELEMENT_U16_start:
 	{
 		U32 value, idx = POP_U32(); // Array index
 		HEAP_PTR heapPtr = POP_O();
+		CHECK_ARRAY(heapPtr, idx);
 		SystemArray_LoadElement(heapPtr, idx, (PTR)&value);
 		PUSH_U32((U16)value);
 	}
@@ -3467,6 +3797,7 @@ JIT_LOAD_ELEMENT_R32_start:
 	{
 		U32 value, idx = POP_U32(); // Array index
 		HEAP_PTR heapPtr = POP_O();
+		CHECK_ARRAY(heapPtr, idx);
 		SystemArray_LoadElement(heapPtr, idx, (PTR)&value);
 		PUSH_U32(value);
 	}
@@ -3481,6 +3812,7 @@ JIT_LOAD_ELEMENT_R64_start:
 	{
 		U32 idx = POP_U32(); // array index
 		HEAP_PTR heapPtr = POP_O();
+		CHECK_ARRAY(heapPtr, idx);
 		U64 value;
 		SystemArray_LoadElement(heapPtr, idx, (PTR)&value);
 		PUSH_U64(value);
@@ -3494,6 +3826,7 @@ JIT_LOAD_ELEMENT_start:
 	{
 		U32 idx = POP_U32(); // Array index
 		HEAP_PTR heapPtr = POP_O(); // array object
+		CHECK_ARRAY(heapPtr, idx);
 		U32 size = GET_OP(); // size of type on stack
 		*(U32*)pCurEvalStack = 0; // This is required to zero out the stack for types that are stored in <4 bytes in arrays
 		SystemArray_LoadElement(heapPtr, idx, pCurEvalStack);
@@ -3507,6 +3840,7 @@ JIT_LOAD_ELEMENT_ADDR_start:
 	{
 		U32 idx = POP_U32(); // Array index
 		PTR heapPtr = POP_O();
+		CHECK_ARRAY(heapPtr, idx);
 		PTR pMem = SystemArray_LoadElementAddress(heapPtr, idx);
 		PUSH_PTR(pMem);
 	}
@@ -3519,7 +3853,8 @@ JIT_LOAD_ELEMENT_PTR_start:
 		PTR value;
 		U32 idx = POP_U32(); // Array index
 		HEAP_PTR heapPtr = POP_O();
-		SystemArray_LoadElement(heapPtr, idx, (PTR)&value);
+		CHECK_ARRAY(heapPtr, idx);
+		value = ((PTR*)((tSystemArray*)heapPtr)->elements)[idx];      // (the elements are pointer-sized: no need for the general load)
 		PUSH_PTR(value);
 	}
 JIT_LOAD_ELEMENT_PTR_end:
@@ -3531,6 +3866,7 @@ JIT_STORE_ELEMENT_PTR_start:
 		PTR value = POP_PTR(); // Value
 		U32 idx = POP_U32(); // Array index
 		PTR heapPtr = POP_O();
+		CHECK_ARRAY(heapPtr, idx);
 		SystemArray_StoreElement(heapPtr, idx, (PTR)&value);
 	}
 JIT_STORE_ELEMENT_PTR_end:
@@ -3542,6 +3878,7 @@ JIT_STORE_ELEMENT_32_start:
 		U32 value = POP_U32(); // Value
 		U32 idx = POP_U32(); // Array index
 		PTR heapPtr = POP_O();
+		CHECK_ARRAY(heapPtr, idx);
 		SystemArray_StoreElement(heapPtr, idx, (PTR)&value);
 	}
 JIT_STORE_ELEMENT_32_end:
@@ -3553,6 +3890,7 @@ JIT_STORE_ELEMENT_64_start:
 		U64 value = POP_U64(); // Value
 		U32 idx = POP_U32(); // Array index
 		PTR heapPtr = POP_O();
+		CHECK_ARRAY(heapPtr, idx);
 		SystemArray_StoreElement(heapPtr, idx, (PTR)&value);
 	}
 JIT_STORE_ELEMENT_64_end:
@@ -3568,6 +3906,7 @@ JIT_STORE_ELEMENT_start:
 		pMem = pCurEvalStack;
 		idx = POP_U32(); // Array index
 		heapPtr = POP_O(); // Array on heap
+		CHECK_ARRAY(heapPtr, idx);
 		SystemArray_StoreElement(heapPtr, idx, pMem);
 	}
 JIT_STORE_ELEMENT_end:
@@ -3799,6 +4138,9 @@ JIT_LOADSTATICFIELD_CHECKTYPEINIT_VALUETYPE_start:
 	op = JIT_LOADSTATICFIELD_CHECKTYPEINIT_VALUETYPE;
 	goto loadStaticFieldStart;
 JIT_LOADSTATICFIELD_CHECKTYPEINIT_F64_start:
+JIT_LOADSTATICFIELD_CHECKTYPEINIT_INT64_start:
+	// (INT64 had no handler at all, so reading a static long crashed the JIT: "Opcode not available".
+	// It is the same 8-byte copy as a double.)
 	op = JIT_LOADSTATICFIELD_CHECKTYPEINIT_F64;
 	goto loadStaticFieldStart;
 JIT_LOADSTATICFIELD_CHECKTYPEINIT_O_start:
@@ -3863,6 +4205,7 @@ JIT_LOADSTATICFIELD_CHECKTYPEINIT_VALUETYPE_end:
 JIT_LOADSTATICFIELD_CHECKTYPEINIT_INT32_end:
 JIT_LOADSTATICFIELD_CHECKTYPEINIT_F32_end:
 JIT_LOADSTATICFIELD_CHECKTYPEINIT_F64_end:
+JIT_LOADSTATICFIELD_CHECKTYPEINIT_INT64_end:
 JIT_LOADSTATICFIELD_CHECKTYPEINIT_O_end:
 JIT_LOADSTATICFIELD_CHECKTYPEINIT_INTNATIVE_end:
 JIT_LOADSTATICFIELD_CHECKTYPEINIT_PTR_end:
@@ -3890,6 +4233,8 @@ JIT_INIT_OBJECT_end:
 	GO_NEXT();
 
 JIT_BOX_INTNATIVE_start:
+JIT_BOX_PTR_start:      // an IntPtr read from a field has this stack type; boxing it is the same pointer-sized copy (it had no handler, so
+                        // anything that boxed one, such as Delegate.Equals, failed to compile: "Opcode not available")
 	OPCODE_USE(JIT_BOX_INTNATIVE);
 	{
 		tMD_TypeDef *pTypeDef = (tMD_TypeDef*)GET_OP();
@@ -3898,6 +4243,7 @@ JIT_BOX_INTNATIVE_start:
 		PUSH_O(heapPtr);
 	}
 JIT_BOX_INTNATIVE_end:
+JIT_BOX_PTR_end:
 	GO_NEXT();
 
 JIT_BOX_INT32_start:
@@ -4260,6 +4606,169 @@ throwTyped:
 	heapPtr = Heap_AllocType(throwEx);
 	goto throwHeapPtr;
 
+// The fused instructions (generated by tools/gen_fused_ops.py)
+#define FUSED_HANDLERS
+#include "JIT_Fused.gen.h"
+#undef FUSED_HANDLERS
+
+// stelem.i1, .i2, .i4/.r4: store the low 8, 16 or all 32 bits of the value
+JIT_STORE_ELEMENT_I1_start:
+	OPCODE_USE(JIT_STORE_ELEMENT_I1);
+	{
+		U32 value = POP_U32(); // Value
+		U32 idx = POP_U32(); // Array index
+		PTR heapPtr = POP_O();
+		CHECK_ARRAY(heapPtr, idx);
+		((U8*)((tSystemArray*)heapPtr)->elements)[idx] = (U8)value;
+	}
+JIT_STORE_ELEMENT_I1_end:
+	GO_NEXT();
+
+JIT_STORE_ELEMENT_I2_start:
+	OPCODE_USE(JIT_STORE_ELEMENT_I2);
+	{
+		U32 value = POP_U32(); // Value
+		U32 idx = POP_U32(); // Array index
+		PTR heapPtr = POP_O();
+		CHECK_ARRAY(heapPtr, idx);
+		((U16*)((tSystemArray*)heapPtr)->elements)[idx] = (U16)value;
+	}
+JIT_STORE_ELEMENT_I2_end:
+	GO_NEXT();
+
+JIT_STORE_ELEMENT_I4_start:
+	OPCODE_USE(JIT_STORE_ELEMENT_I4);
+	{
+		U32 value = POP_U32(); // Value
+		U32 idx = POP_U32(); // Array index
+		PTR heapPtr = POP_O();
+		CHECK_ARRAY(heapPtr, idx);
+		((U32*)((tSystemArray*)heapPtr)->elements)[idx] = value;
+	}
+JIT_STORE_ELEMENT_I4_end:
+	GO_NEXT();
+
+// ldelem.u1 of a byte element, and of a bool element (which takes 4 bytes in an array)
+JIT_LOAD_ELEMENT_U8_1_start:
+	OPCODE_USE(JIT_LOAD_ELEMENT_U8_1);
+	{
+		U32 idx = POP_U32(); // Array index
+		PTR heapPtr = POP_O();
+		CHECK_ARRAY(heapPtr, idx);
+		PUSH_U32(((U8*)((tSystemArray*)heapPtr)->elements)[idx]);
+	}
+JIT_LOAD_ELEMENT_U8_1_end:
+	GO_NEXT();
+
+JIT_LOAD_ELEMENT_U8_4_start:
+	OPCODE_USE(JIT_LOAD_ELEMENT_U8_4);
+	{
+		U32 idx = POP_U32(); // Array index
+		PTR heapPtr = POP_O();
+		CHECK_ARRAY(heapPtr, idx);
+		PUSH_U32((U8)((U32*)((tSystemArray*)heapPtr)->elements)[idx]);
+	}
+JIT_LOAD_ELEMENT_U8_4_end:
+	GO_NEXT();
+
+// ldelema: the address of an element, whose size the instruction carries
+JIT_LOAD_ELEMENT_ADDR_N_start:
+	OPCODE_USE(JIT_LOAD_ELEMENT_ADDR_N);
+	{
+		U32 size = GET_OP();
+		U32 idx = POP_U32(); // Array index
+		PTR heapPtr = POP_O();
+		CHECK_ARRAY(heapPtr, idx);
+		PUSH_PTR(((tSystemArray*)heapPtr)->elements + (size_t)idx * size);
+	}
+JIT_LOAD_ELEMENT_ADDR_N_end:
+	GO_NEXT();
+
+JIT_NATIVE_BLOCK_start:
+	OPCODE_USE(JIT_NATIVE_BLOCK);
+	{
+#if NATIVE_BLOCKS
+		void *code = (void*)GET_OP();
+		U32 numExits = (U32)GET_OP();
+		tOpWord *exitTargets = pCurOp;               // the CIL-offset operands of the exits follow
+		PTR blockSp = pCurEvalStack;
+		U32 status = NativeBlock_RunStraight(code, pParamsLocals, &blockSp);
+		pCurEvalStack = blockSp;
+		pCurOp += numExits;
+		if (status != NB_DONE) {
+			if (status == NB_NULLREF) {
+				THROW_NULLREF();
+			}
+			if (status == NB_INDEXRANGE) {
+				THROW(types[TYPE_SYSTEM_INDEXOUTOFRANGEEXCEPTION]);
+			}
+			// an exit: carry on at its target
+			pCurOp = pOps + exitTargets[status - NB_EXIT];
+			GO_NEXT_CHECK();
+		}
+#else
+		Crash("a native block was run on a target without native blocks");
+#endif
+	}
+JIT_NATIVE_BLOCK_end:
+	GO_NEXT();
+
+JIT_NATIVE_LOOP_start:
+	OPCODE_USE(JIT_NATIVE_LOOP);
+	{
+#if NATIVE_BLOCKS
+		tOpWord *blockOp = pCurOp - 1;               // this instruction, for running it again
+		void *code = (void*)GET_OP();
+		U32 numExits = (U32)GET_OP();
+		tOpWord *exitTargets = pCurOp;               // the CIL-offset operands of the exits follow
+		PTR blockSp = pCurEvalStack;
+		// The thread's time slice counts branches. Native loops count their backward branches against what is left of it,
+		// and when it runs out the block hands control back so that other threads get their turn.
+		U32 budget = numInst;
+		U32 entry = pCurrentMethodState->nativeEntry;      // 0, unless this block gave up the processor in a loop
+		U32 status;
+		pCurrentMethodState->nativeEntry = 0;
+		status = NativeBlock_Run(code, pParamsLocals, &blockSp, &budget, entry);
+		pCurEvalStack = blockSp;
+		pCurOp += numExits;
+		if (status == NB_DONE) {
+			numInst = budget > 0 ? budget : 1;
+		} else if (status == NB_NULLREF) {
+			THROW_NULLREF();
+		} else if (status == NB_INDEXRANGE) {
+			THROW(types[TYPE_SYSTEM_INDEXOUTOFRANGEEXCEPTION]);
+		} else if (status >= NB_RESTART && status < NB_EXIT) {
+			// the loop's back-edge was about to be taken: run this block again, from where that edge goes, after the yield
+			pCurrentMethodState->nativeEntry = status - NB_RESTART;
+			pCurOp = blockOp;
+			numInst = 1;
+			GO_NEXT_CHECK();
+		} else {
+			// an exit: carry on at its target
+			pCurOp = pOps + exitTargets[status - NB_EXIT];
+			numInst = budget > 1 ? budget : 2;
+			GO_NEXT_CHECK();
+		}
+#else
+		Crash("a native block was run on a target without native blocks");
+#endif
+	}
+JIT_NATIVE_LOOP_end:
+	GO_NEXT();
+
+
+JIT_NATIVE_RESUME_start:
+	OPCODE_USE(JIT_NATIVE_RESUME);
+	{
+		// The end of an island. A native block gave the interpreter one instruction to run (a call, a throw, ...) and it has run it: go on in
+		// the block, at the entry that follows that instruction. The block instruction does the rest (the loop form: it takes the entry).
+		U32 resumeBlockOfs = (U32)GET_OP();
+		U32 resumeEntry = (U32)GET_OP();
+		pCurrentMethodState->nativeEntry = resumeEntry;
+		pCurOp = pOps + resumeBlockOfs;
+	}
+JIT_NATIVE_RESUME_end:
+	GO_NEXT();
 JIT_ENDFILTER_start:
 	OPCODE_USE(JIT_ENDFILTER);
 	{
@@ -4300,26 +4809,22 @@ JIT_ENDFILTER_end:
 JIT_LEAVE_start:
 	OPCODE_USE(JIT_LEAVE);
 	{
-		U32 i;
+		U32 src, next;
 		tExceptionHeader *pFinally;
 
-		// Find any finally exception clauses
-		pFinally = NULL;
-		for (i=0; i<pJIT->numExceptionHandlers; i++) {
-			if (pJIT->pExceptionHeaders[i].flags == COR_ILEXCEPTION_CLAUSE_FINALLY &&
-				pCurrentMethodState->ipOffset - 1 >= pJIT->pExceptionHeaders[i].tryStart &&
-				pCurrentMethodState->ipOffset - 1 < pJIT->pExceptionHeaders[i].tryEnd) {
-				// Found the correct finally clause to jump to
-				pFinally = &pJIT->pExceptionHeaders[i];
-				break;
-			}
-		}
+		// Which finally clauses cover this leave depends on where we are NOW. ipOffset is only saved at calls,
+		// so without this it was stale: a try body that contained no call never ran its finally block.
+		pCurrentMethodState->ipOffset = (U32)(pCurOp - pOps);
+		src = pCurrentMethodState->ipOffset - 1;
 		POP_ALL();
 		ofs = GET_OP();
+		pFinally = FindLeaveFinally(pJIT, 0, src, ofs, &next);
 		if (pFinally != NULL) {
-			// Jump to 'finally' section
+			// Jump to 'finally' section; END_FINALLY carries on to the next one, or to the target
 			pCurOp = pOps + pFinally->handlerStart;
 			pCurrentMethodState->pOpEndFinally = pOps + ofs;
+			pCurrentMethodState->leaveSrc = src;
+			pCurrentMethodState->leaveNext = next;
 		} else {
 			// just branch
 			pCurOp = pOps + ofs;
@@ -4334,11 +4839,19 @@ JIT_END_FINALLY_start:
 		// unwinding stack, so jump back to unwind code
 		goto finallyUnwindStack;
 	} else {
-		// Just empty the evaluation stack and continue on to the next opcode
-		// (finally blocks are always after catch blocks, so execution can just continue)
+		// Empty the evaluation stack. If the leave exits more try blocks with finally clauses, run the next one;
+		// otherwise jump to the instruction the leave named.
+		U32 next;
+		tExceptionHeader *pNext;
 		POP_ALL();
-		// And jump to the correct instruction, as specified in the leave instruction
-		pCurOp = pCurrentMethodState->pOpEndFinally;
+		pNext = FindLeaveFinally(pJIT, pCurrentMethodState->leaveNext, pCurrentMethodState->leaveSrc,
+			(U32)(pCurrentMethodState->pOpEndFinally - pOps), &next);
+		if (pNext != NULL) {
+			pCurrentMethodState->leaveNext = next;
+			pCurOp = pOps + pNext->handlerStart;
+		} else {
+			pCurOp = pCurrentMethodState->pOpEndFinally;
+		}
 	}
 JIT_END_FINALLY_end:
 	GO_NEXT_CHECK();

@@ -43,6 +43,7 @@
 #include "System.IO.FileInternal.h"
 #include "System.Char.h"
 #include "System.Diagnostics.Debugger.h"
+#include "System.Diagnostics.Stopwatch.h"
 #include "System.Net.Sockets.Socket.h"
 #include "System.Net.Dns.h"
 #include "System.DateTime.h"
@@ -212,6 +213,7 @@ static tInternalCall internalCalls[] = {
 	{"System.Runtime.CompilerServices", "RuntimeHelpers", "InitializeArray", System_Runtime_CompilerServices_InitializeArray, TYPE_SYSTEM_VOID, 2, {TYPE_SYSTEM_ARRAY_NO_TYPE, TYPE_SYSTEM_RUNTIMEFIELDHANDLE}},
 
 	{"System.Diagnostics", "Debugger", "Break", System_Diagnostics_Debugger_Break, TYPE_SYSTEM_VOID, 0},
+	{"System.Diagnostics", "Stopwatch", "GetTimestamp", System_Diagnostics_Stopwatch_GetTimestamp, TYPE_SYSTEM_INT64, 0},
 
 	{"System.Net", "Dns", "Internal_GetHostEnt", System_Net_Dns_Internal_GetHostEnt, TYPE_SYSTEM_ARRAY_INT32, 2, {TYPE_SYSTEM_STRING, TYPE_SYSTEM_INTPTR}},
 

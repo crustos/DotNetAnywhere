@@ -435,6 +435,7 @@ static tTypeInit typeInit[] = {
 	{mscorlib, SystemReflection, "InternalCustomAttributeInfo", EVALSTACK_VALUETYPE, sizeof(tInternalCustomAttributeInfo), sizeof(tInternalCustomAttributeInfo), sizeof(tInternalCustomAttributeInfo) },
 	{mscorlib, System, "DivideByZeroException", EVALSTACK_O, 0, 0, 0},
 	{mscorlib, System, "TypedReference", EVALSTACK_VALUETYPE, 0, 0, 0},
+	{mscorlib, System, "IndexOutOfRangeException", EVALSTACK_O, 0, 0, 0},
 };
 
 int CorLibDone = 0;

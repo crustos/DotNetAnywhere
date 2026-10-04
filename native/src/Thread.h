@@ -140,6 +140,7 @@ extern int alwaysBreak;
 U32 Internal_Debugger_Resume_Check(PTR pThis_, PTR pParams, PTR pReturnValue, tAsyncCall *pAsync);
 tThread* Thread();
 void Thread_SetEntryPoint(tThread *pThis, tMetaData *pMetaData, IDX_TABLE entryPointToken, PTR params, U32 paramBytes);
+extern int Thread_HostSchedules;
 I32 Thread_Execute();
 tThread* Thread_GetCurrent();
 void* Thread_StackAlloc(tThread *pThread, U32 size);

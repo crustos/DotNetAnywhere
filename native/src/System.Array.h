@@ -24,6 +24,16 @@
 #include "MetaData.h"
 #include "Types.h"
 
+// The object that is an array: its length, then its elements, one after the other. (The native blocks rely on exactly this
+// layout: NativeBlocks.c asserts it.)
+typedef struct tSystemArray_ tSystemArray;
+struct tSystemArray_ {
+	// How many elements in array
+	U32 length;
+	// The elements
+	U8 elements[0];
+};
+
 tAsyncCall* System_Array_Internal_GetValue(PTR pThis_, PTR pParams, PTR pReturnValue);
 tAsyncCall* System_Array_Internal_SetValue(PTR pThis_, PTR pParams, PTR pReturnValue);
 tAsyncCall* System_Array_Clear(PTR pThis_, PTR pParams, PTR pReturnValue);

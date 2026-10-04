@@ -114,6 +114,7 @@ extern tMD_TypeDef **types;
 #define TYPE_SYSTEM_REFLECTION_INTERNALCUSTOMATTRIBUTEINFO 53
 #define TYPE_SYSTEM_DIVIDEBYZEROEXCEPTION 54
 #define TYPE_SYSTEM_TYPEDREFERENCE 55
+#define TYPE_SYSTEM_INDEXOUTOFRANGEEXCEPTION 56
 
 //U32 Type_IsMethod(tMD_MethodDef *pMethod, STRING name, tMD_TypeDef *pReturnType, U32 numParams, ...);
 U32 Type_IsMethod(tMD_MethodDef *pMethod, STRING name, tMD_TypeDef *pReturnType, U32 numParams, U8 *pParamTypeIndexs);

@@ -29,6 +29,7 @@ int JSInterop_CallDotNet(char* assemblyName, char* namespace, char* className, c
 			
 			// We found the method - now call it
 			Thread_SetEntryPoint(pThread, pAssemblyMetadata, pMethodDef->tableIndex, (PTR)&arg, sizeof(void*));
+			Thread_HostSchedules = 1;      // the JavaScript host reschedules when every thread is sleeping
 			int result = Thread_Execute();
 
 			Heap_MakeDeletable(arg);

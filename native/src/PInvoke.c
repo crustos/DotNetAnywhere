@@ -22,6 +22,7 @@
 #include "Sys.h"
 
 #include "PInvoke.h"
+#include "FFI.h"
 #include "MetaData.h"
 #include "MetaDataTables.h"
 #include "JIT.h"
@@ -177,6 +178,17 @@ U32 PInvoke_Call(tJITCallPInvoke *pCall, PTR pParams, PTR pReturnValue, tThread 
 	U64 u64Ret;
 	float fRet;
 	double dRet;
+
+	if (pCall->ffi != NULL) {
+		// a function named in the FFI manifest: the parameters lie in the frame in the order the wrapper reads them, and the result goes
+		// where the first one was and then to the evaluation stack
+		const tFFIEntry *pFfi = pCall->ffi;
+		pFfi->wrapper(pParams);
+		if (pFfi->retBytes != 0) {
+			memmove(pReturnValue, pParams, pFfi->retBytes);
+		}
+		return pFfi->retBytes;
+	}
 
 	// [Steve edit] Before we issue the call into JS code, we need to set the calling .NET thread's state
 	// to 'suspended' so that, if the JS code makes other calls into .NET, the DNA runtime doesn't try to

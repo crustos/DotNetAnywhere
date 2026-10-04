@@ -498,4 +498,29 @@
 // endfilter: ends the code of an exception filter, with the verdict (nonzero = handle it) on the stack.
 #define JIT_ENDFILTER                                    0x175
 
+// Fused instructions (an instruction that stands for a short run of others): generated, see tools/gen_fused_ops.py
+#include "JIT_FusedOps.gen.h"
+
+// A run of simple instructions compiled to native code (see NativeBlocks.h). Operand: the address of the code.
+#define JIT_NATIVE_BLOCK                                 0x1c0
+// The same for a block that contains a loop: it also takes part in the thread's time slice (see NativeBlocks.h)
+#define JIT_NATIVE_LOOP                                  0x1c1
+#define JIT_FFI_CALL                                     0x1ca   // a call to a C function named in the FFI manifest: [the tFFIEntry]
+#define JIT_LOAD_STRING_MD                               0x1c9   // ldstr with the metadata to look the string up in (an island inlined from another method)
+#define JIT_NATIVE_RESUME                                0x1c8   // the end of an island: go on in the native block that gave an instruction to the interpreter
+
+// stelem.i1 / .i2 / .i4 (and .r4) used to be one instruction, JIT_STORE_ELEMENT_32, that found the element size at run time.
+// They are separate instructions now (the same behaviour), so that the native blocks, which recognise an instruction by its
+// handler, can tell them apart; and ldelema carries the element size from its type token, so a block can compute the address.
+#define JIT_STORE_ELEMENT_I1                             0x1c2
+#define JIT_STORE_ELEMENT_I2                             0x1c3
+#define JIT_STORE_ELEMENT_I4                             0x1c4
+#define JIT_LOAD_ELEMENT_ADDR_N                          0x1c5   // operand: the element size in bytes
+// ldelem.u1 and stelem.i1 are used on byte[] and sbyte[] (1-byte elements) and on bool[] (4-byte elements in this runtime), so the
+// opcode does not say which stride is right. The JIT decides from the array's type when it knows it:
+//   JIT_LOAD_ELEMENT_U8_1: a 1-byte element    JIT_LOAD_ELEMENT_U8_4: the low byte of a 4-byte element
+// (when it does not know, the old JIT_LOAD_ELEMENT_U8 / JIT_STORE_ELEMENT_32 look at the array at run time).
+#define JIT_LOAD_ELEMENT_U8_1                            0x1c6
+#define JIT_LOAD_ELEMENT_U8_4                            0x1c7
+
 #endif

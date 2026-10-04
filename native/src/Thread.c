@@ -128,6 +128,11 @@ static void Thread_Delete(tThread *pThis) {
 	Heap_MakeDeletable((HEAP_PTR)pThis);
 }
 
+// Does whoever called Thread_Execute reschedule it when every thread is sleeping or blocked? A JavaScript host does (it must
+// not block the browser's thread, so it wants Thread_Execute to return the time to sleep). For the native program nobody
+// does, and Thread_Execute used to return then, which ended the program: even Thread.Sleep in the main thread did that.
+int Thread_HostSchedules = 0;
+
 I32 Thread_Execute() {
 	tThread *pThread, *pPrevThread;
 	U32 status;
@@ -276,8 +281,12 @@ I32 Thread_Execute() {
 				//printf("All blocked; sleep(%d)\n", minSleepTime);
                 // Execution needs to unwind if everything is blocked in javascript or it will
                 // hang the browser's main thread, we need to schedule a call back into this method at a later time
-                return minSleepTime;
-				// SleepMS(minSleepTime);
+				if (Thread_HostSchedules || minSleepTime == 0xffffffff) {
+					return minSleepTime;
+				}
+				// the native program: sleep until the first thread is due, then carry on looking
+				SleepMS(minSleepTime);
+				minSleepTime = 0xffffffff;
 			}
 		}
 	}
