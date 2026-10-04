@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Build DotNetAnywhere. This is the only build script: gcc for a native runtime, emcc for WebAssembly.
+"""Build DotNetAnywhere. This is the only build script.
 
 Usage:
     python build.py                 # the native runtime build/dna, and build/corlib.dll if mcs is installed
     python build.py --m32           # 32-bit runtime -> build/dna32 (needs gcc-multilib)
-    python build.py --wasm          # WebAssembly: build/dna.js and build/dna.wasm (needs Emscripten's emcc)
     python build.py --debug         # -O0 -g
     python build.py --clean         # remove build/ and the generated header
     python build.py --cc clang      # use another C compiler
@@ -15,8 +14,9 @@ Usage:
 
 `make` is a one-line wrapper around `python3 build.py`.
 
-native/src/MetaDataLayout.gen.h is generated, not committed: this script runs tools/gen_metadata_layout.py to
-create it when it is missing or older than what it is generated from.
+native/src/MetaDataLayout.gen.h, JIT_FusedOps.gen.h and JIT_Fused.gen.h are generated, not committed: this script runs
+tools/gen_metadata_layout.py and tools/gen_fused_ops.py to create them when they are missing or older than what they
+are generated from.
 
 Objects are cached in build/obj and rebuilt only when the source or any
 header is newer than the object.
@@ -40,7 +40,7 @@ OBJ = os.path.join(BUILD, "obj")
 GEN = os.path.join(BUILD, "gen")
 
 def sources():
-    # NativeHost.c stubs out what js-interop.js provides under Emscripten, so the --wasm build leaves it out
+    # NativeHost.c stubs the JavaScript bridge (js-interop.js) for native builds
     return sorted(f for f in os.listdir(SRC) if f.endswith(".c"))
 
 
@@ -116,20 +116,33 @@ def build_corlib():
 
 LAYOUT_GEN = os.path.join(SRC, "MetaDataLayout.gen.h")
 LAYOUT_TOOL = os.path.join(ROOT, "tools", "gen_metadata_layout.py")
+FUSED_TOOL = os.path.join(ROOT, "tools", "gen_fused_ops.py")
+FUSED_GEN = [os.path.join(SRC, "JIT_FusedOps.gen.h"), os.path.join(SRC, "JIT_Fused.gen.h")]
+STENCIL_TOOL = os.path.join(ROOT, "tools", "gen_stencils.py")
+STENCIL_GEN = [os.path.join(SRC, "Stencils.gen.h")]
+
+# Source files that are generated, not committed: (the script, what it writes, other files it reads)
+GENERATED = [
+    (LAYOUT_TOOL, [LAYOUT_GEN], [os.path.join(SRC, n) for n in ("MetaDataTables.h", "Types.h", "Compat.h")]),
+    (FUSED_TOOL, FUSED_GEN, []),
+    (STENCIL_TOOL, STENCIL_GEN, [os.path.join(ROOT, "native", "stencils", "stencils.c")]),
+]
 
 
-def ensure_layout_header():
-    """Generate native/src/MetaDataLayout.gen.h if it is missing or older than what it is generated from."""
-    inputs = [LAYOUT_TOOL] + [os.path.join(SRC, n) for n in ("MetaDataTables.h", "Types.h", "Compat.h")]
-    newest = max(os.path.getmtime(i) for i in inputs if os.path.exists(i))
-    if os.path.exists(LAYOUT_GEN) and os.path.getmtime(LAYOUT_GEN) >= newest:
-        return 0
-    r = subprocess.run([sys.executable, LAYOUT_TOOL], capture_output=True, text=True)
-    if r.returncode != 0:
-        print("error: could not generate native/src/MetaDataLayout.gen.h\n" + (r.stderr or r.stdout), file=sys.stderr)
-        return 1
-    if "wrote" in r.stdout:
-        print("  generated", os.path.relpath(LAYOUT_GEN, ROOT))
+def ensure_generated():
+    """Run each generator whose output is missing or older than the generator and the files it reads."""
+    for tool, outputs, reads in GENERATED:
+        inputs = [tool] + reads
+        newest = max(os.path.getmtime(i) for i in inputs if os.path.exists(i))
+        if all(os.path.exists(o) and os.path.getmtime(o) >= newest for o in outputs):
+            continue
+        r = subprocess.run([sys.executable, tool], capture_output=True, text=True)
+        if r.returncode != 0:
+            print("error: %s failed\n%s" % (os.path.relpath(tool, ROOT), r.stderr or r.stdout), file=sys.stderr)
+            return 1
+        if "wrote" in r.stdout:
+            for o in outputs:
+                print("  generated", os.path.relpath(o, ROOT))
     return 0
 
 
@@ -155,46 +168,6 @@ def lower_all(crust_dir):
     return gen, 0
 
 
-def build_wasm(gen_units, verbose):
-    """WebAssembly with Emscripten: build/dna.js and build/dna.wasm. (This replaced native/build.sh and build.cmd.)"""
-    emcc = os.environ.get("EMCC") or shutil.which("emcc")
-    if not emcc:
-        print("error: emcc not found. Install Emscripten (https://emscripten.org), or set EMCC to its path.",
-              file=sys.stderr)
-        return 1
-    srcs = [os.path.join(SRC, n) for n in sources() if n != "NativeHost.c"] + gen_units
-    exports = ["_main", "_JSInterop_CallDotNet", "_Debugger_Continue", "_Debugger_SetBreakPoint",
-               "_Debugger_Step", "_Debugger_Reset", "_Debugger_Clear_BreakPoints"]
-    cmd = [emcc] + srcs + ["-I", SRC, "-Wno-pointer-sign", "-Oz"]
-    for setting in (
-            "NO_EXIT_RUNTIME=1",
-            "RESERVED_FUNCTION_POINTERS=20",
-            "ASSERTIONS=1",
-            "EXPORTED_FUNCTIONS=" + repr(exports),
-            "EXTRA_EXPORTED_RUNTIME_METHODS=['ccall']",
-            "DEFAULT_LIBRARY_FUNCS_TO_INCLUDE=['$Browser']",
-            "MODULARIZE=1",
-            "EXPORT_NAME='DotNetAnywhere'",
-            "FORCE_FILESYSTEM=1"):
-        cmd += ["-s", setting]
-    cmd += ["--js-library", os.path.join(ROOT, "native", "js-interop.js"),
-            "-o", os.path.join(BUILD, "dna.js")]
-    if verbose:
-        print(" ".join(cmd))
-    print(f"compiling {len(srcs)} file(s) with emcc...")
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        print("EMCC FAILED")
-        print(r.stderr[-3000:])
-        return 1
-    if r.stderr.strip() and verbose:
-        print(r.stderr)
-    for f in ("dna.js", "dna.wasm"):
-        if os.path.exists(os.path.join(BUILD, f)):
-            print("built", os.path.join("build", f))
-    return 0
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -208,8 +181,6 @@ def main():
                     help="compile corlib/*.cs to build/corlib.dll with mcs (the default if mcs is installed; "
                          "this makes a missing mcs an error)")
     ap.add_argument("--no-corlib", action="store_true", help="do not build build/corlib.dll")
-    ap.add_argument("--wasm", action="store_true",
-                    help="build for WebAssembly with Emscripten (emcc): build/dna.js and build/dna.wasm")
     ap.add_argument("--lower-only", action="store_true",
                     help="only lower native/src/cpp/*.cpp to build/gen/*.c, then stop")
     ap.add_argument("--verbose", "-v", action="store_true")
@@ -220,20 +191,16 @@ def main():
 
     if args.clean:
         shutil.rmtree(BUILD, ignore_errors=True)
-        if os.path.exists(LAYOUT_GEN):
-            os.remove(LAYOUT_GEN)       # generated; the next build makes it again
+        for _, outputs, _ in GENERATED:
+            for o in outputs:
+                if os.path.exists(o):
+                    os.remove(o)        # generated; the next build makes them again
         print("cleaned", BUILD)
         return 0
 
-    rc = ensure_layout_header()
+    rc = ensure_generated()
     if rc:
         return rc
-
-    if args.wasm:
-        os.makedirs(BUILD, exist_ok=True)
-        os.makedirs(GEN, exist_ok=True)
-        gen_units, rc = lower_all(args.crust)
-        return rc or build_wasm(gen_units, args.verbose)
 
     if not shutil.which(args.cc):
         print(f"error: compiler '{args.cc}' not found", file=sys.stderr)

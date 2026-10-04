@@ -58,7 +58,7 @@ mcs -nostdlib -r:build/corlib.dll prog.cs      # corlib.dll must sit beside prog
 
 | | 32-bit | 64-bit |
 |---|---|---|
-| `tests/run_tests.py` | 38 of 38 | 38 of 38 |
+| `tests/run_tests.py` | 51 of 51 | 51 of 51 |
 | Crust survey (`crust_conformance.py`) | 55 of 55 | 55 of 55 |
 | `Math`/`MathF` against .NET 8 (`MathBits`) | 41 of 56 | 56 of 56 |
 
@@ -82,20 +82,18 @@ DNA deliberately differs from the reference runtimes, and the known gaps.
 
 | | |
 |---|---|
-| `build.py` | the one build script: gcc (cached, parallel, lowers the Crust module first, generates the layout header) or `--wasm` for emcc; `--m32`, `--debug`, `--clean` |
-| `Makefile` | `make` calls `python3 build.py`; `ARGS="..."` passes options, and `wasm`, `test`, `clean` forward too |
+| `build.py` | the one build script: gcc, cached and parallel, lowers the Crust module first and generates the layout, fused-instruction and stencil headers; `--m32`, `--debug`, `--clean` |
+| `Makefile` | `make` calls `python3 build.py`; `ARGS="..."` passes options, and `test` and `clean` forward too |
 | `tools/gen_metadata_layout.py` | generates `native/src/MetaDataLayout.gen.h`, how each metadata table row maps onto its C struct, for any word size |
+| `tools/gen_fused_ops.py` | generates the fused instructions (one instruction for a run such as `ldloc; ldloc; add`): opcode numbers, interpreter handlers, and what the JIT matches |
+| `tools/gen_stencils.py` | turns `native/stencils/stencils.c` into machine-code templates with holes, for the native blocks (x86-64 Linux; needs gcc and objdump) |
+| `tools/benchmark_mono.py` | 22 small C# benchmarks, DNA against Mono, with a table and a matplotlib chart (`--help`) |
 | `tools/check_internalcall_params.py` | checks every native method's argument reads against its registered signature, for 32- and 64-bit pointers (`--fix` rewrites them) |
 | `tests/gen_*.py` | generate the large test programs |
 
-## Build for WebAssembly
+## WebAssembly
 
-You need the Emscripten SDK (1.38.6 or above) with `emcc` on the PATH (or set `EMCC`):
-
-```
-python3 build.py --wasm      # or: make wasm
-```
-
-Two files are generated in the `build` folder:
-- `dna.wasm`
-- `dna.js`
+Paused. The Emscripten build (`native/build.sh`, `build.cmd`, CMake, and for a while `build.py --wasm`) has been
+removed. The plan is to target WebAssembly directly with `clang --target=wasm32`, and later to adapt the JIT to emit
+wasm on the fly. The 32-bit build (`--m32`) is the closest thing to a wasm32 target until then; nothing here has been
+built or run as WebAssembly with this fork's changes.

@@ -17,7 +17,6 @@ build. The reference run in `MathBits` also uses a .NET SDK if one is installed.
     make ARGS="--m32"                     # build/dna32 (32-bit)
     make test                             # the whole suite (--32 / --64 pick the binary; default build/dna)
     python3 tests/crust_conformance.py    # Crust's own C# programs, DNA vs Mono (same flags)
-    python3 build.py --wasm               # WebAssembly: build/dna.js, build/dna.wasm (needs emcc)
 
 `native/src/MetaDataLayout.gen.h` is generated, not committed: `build.py` runs `tools/gen_metadata_layout.py` when it
 is missing or older than the files it is generated from, and `--clean` removes it. The generator works out the
@@ -30,11 +29,9 @@ with `corlib.dll` beside the exe. `--debug` gives `-O0 -g`.
 Both word sizes pass the same suite, and the tests do not depend on the pointer size: they compare with Mono (or
 .NET), not with stored output. Tested on Linux x86-64 with gcc only.
 
-**WebAssembly.** `build.py --wasm` carries over the flags of the old `native/build.sh` (all sources except
-`NativeHost.c`, plus the lowered Crust module). It is only partly verified: every source compiles under Emscripten
-3.1.6, which is the only version that was available, but that packaging links no `main` even for a four-line
-program, so the link and the resulting `dna.js`/`dna.wasm` have never been run. `EXTRA_EXPORTED_RUNTIME_METHODS` is
-deprecated in newer Emscripten (it warns) and the flags otherwise date from 1.38.
+**WebAssembly is paused.** The Emscripten build is gone (`build.py --wasm` existed briefly and was removed too). The
+intended route is `clang --target=wasm32`, and later a JIT that emits wasm. `js-interop.js` and the JSInterop /
+Debugger entry points are left in the tree for that, but nothing builds or tests them now.
 
 ## What was added
 
@@ -73,6 +70,23 @@ Each has a regression test, and expectations were checked against Mono.
   wrong for null; `FullName` printed `.Name` for the global namespace.
 * An uninitialised variable in `JIT.c` (a `goto` past its initialiser) made `Dictionary` crash
   depending on stack contents; the type table truncated sizes above 255 bytes.
+* `leave` chose the `finally` to run from an instruction position that is only saved at calls, so a `try` body with no call
+  never ran its `finally`; and it ran only the innermost `finally`, so `return`/`break` out of nested `try/finally` blocks
+  skipped the outer ones.
+* A `catch` handler compiled before its exception type had been used had the exception reference left on the evaluation
+  stack (its `pop` was sized from a type not yet filled in), which overflowed onto the method's parameters.
+* Reading a `static long` field crashed the JIT ("Opcode not available"): the opcode had no handler.
+* `stobj` popped the destination address as 4 bytes, so storing a struct into an array element corrupted the stack on a
+  64-bit target.
+* `Dictionary`: `Count` was one too low after the first resize, and growing it was quadratic (two `List`s per slot, and a
+  collection every 200 KB of allocation whatever the heap size); both fixed, the class rewritten.
+* Array access was not checked at all: reading or writing past the end of an array touched whatever memory was there, and a null
+  array crashed the process. `ldelem.*`, `stelem.*`, `ldelema` and `ldlen` now throw `IndexOutOfRangeException` and
+  `NullReferenceException`.
+* Every ordered float or double comparison with a NaN operand came out true: `bge.un`, `bgt.un`, `ble.un` and `blt.un` (what C#
+  compiles `if (a < b) body` to) shared the ordered handlers, so `if (NaN < 1f)` ran its body.
+* `Thread.Sleep` in the main thread ended the program (rc = the sleep time): the scheduler returned when every thread was
+  sleeping, which only a JavaScript host wants.
 
 ## Tests
 
@@ -80,7 +94,7 @@ Each has a regression test, and expectations were checked against Mono.
 timeout, `DNA_TEST_TIMEOUT`, so a hang fails its own check):
 
 * the heap-tree differential test (original C vs the lowered C++, under ASan/UBSan);
-* that the generated `MetaDataLayout.gen.h` is current, and that every native method reads its arguments at their
+* that the generated `MetaDataLayout.gen.h`, `JIT_Fused*.gen.h` and `Stencils.gen.h` are current, and that every native method reads its arguments at their
   real offsets for both pointer sizes (`tools/gen_metadata_layout.py --check`, `tools/check_internalcall_params.py`);
 * a compile-time guard for the `JIT.c` uninitialised-variable bug;
 * `tests/dotnet/*.cs`: C# programs, each compared with Mono (exit code, or whole output line for line);
@@ -98,6 +112,84 @@ are deliberately not compared.
 Mono and on DNA, and requires the same exit code (or the same unhandled exception type). Programs
 Crust itself refuses (passed to its `assert_refuses`) are excluded. Currently 55 of 55 usable programs agree, on both the 32-bit and the 64-bit build.
 
+## Performance
+
+DNA is an interpreter, and `tools/benchmark_mono.py` measures it against Mono's JIT on small programs (the same C# for both,
+each timing its own work, with a checksum so that a wrong answer shows). Steady-state code is slower, by 6 to 74 times, and
+start-up, cold code, exceptions, string building and `Array.Copy` are faster. What has been done about the first, each step
+measured on its own and each switchable so that a suspected miscompile can be bisected:
+
+* **The call path** (`MethodState_Direct`): one allocation for a frame, and inline copies for the few words of arguments,
+  locals and return values. `recursion` and `alloc` are about 10% faster. There is no single hot spot left in it: the frame
+  has too many fields to set up for much more.
+* **Garbage collection scheduling** (`Heap.c`): a growing heap was collected every 200 KB however big it was, which is quadratic;
+  the ceiling is now 64 MB (`-DMAX_HEAP_EXCESS`). Growing a 60,000-entry `Dictionary` went from 13 s to under a second, and
+  `Dictionary` itself was rewritten as `buckets[]` + `entries[]`.
+* **Fused instructions** (`tools/gen_fused_ops.py`, `FuseOps` in `JIT.c`): a run such as `ldloc a; ldloc b; add` becomes one
+  instruction reading both locals, likewise local-op-constant, `i += k`, and compare-and-branch. It is never done across a
+  branch target, a try block boundary or a debugger sequence point. `int_loop` 1.55x, `recursion`/`virtual_calls` 16-19%.
+  `DNA_NO_FUSION=1` turns it (and native blocks) off.
+* **Native blocks** (`native/stencils/stencils.c`, `tools/gen_stencils.py`, `NativeBlocks.c`): copy-and-patch compilation, as in
+  CPython's JIT. Each stencil is a tiny C function that does what one interpreter instruction does to the memory evaluation
+  stack, compiled by gcc; the generator reads the object file, checks that it is straight-line code whose only relocations are
+  holes, and writes the bytes and the holes into `Stencils.gen.h`. When the JIT finds a region made only of instructions that
+  have stencils, it copies them into executable memory, patches the holes (a local's offset, a constant, a field offset, a
+  branch target) and the region becomes one instruction. The stencils cover loads and stores of 4- and 8-byte locals,
+  constants, `float32` and 32-bit integer arithmetic, `int`/`float` conversions, `ldloca`/`ldfld`/`stfld` on 4-byte fields
+  (structs in locals, `ref` arguments, objects), `dup`, and `br`/`brtrue`/`brfalse`, the six integer compare-and-branches and
+  the ten `float32` ones (with NaN handled as the interpreter does), so straight-line vector code, loops and conditionals are
+  covered, as long as they contain nothing else.
+  * Same semantics as the interpreter: the evaluation stack is still in memory, so the collector, exceptions and everything
+    else see what they always did. A null reference in a field access makes the block return a status, and the interpreter
+    throws `NullReferenceException` at that instruction, with the earlier effects done and the later ones not.
+  * A block is entered only at its start (and, after giving up the processor, at the target of one of its backward
+    branches); it is left through its exits, each of which continues at the target in the interpreter. A loop counts its
+    backward branches against what is left of the thread's time slice (`numInst`, in `r14`), and when that runs out the
+    block returns, the interpreter yields to another thread, and the block is entered again where the loop's back-edge goes.
+    That entry is kept in the frame (`MethodState.nativeEntry`), because other threads run the same code.
+  * x86-64 Linux only (the stencils use `r12`/`r13`/`r14`, and the blocks are in `mmap`ed executable memory, never freed);
+    it is switched off elsewhere, if gcc or objdump is missing, and with `DNA_NO_STENCILS=1`. `DNA_BLOCK_MIN` (the shortest
+    straight run that becomes a block, default 8), `DNA_NO_BLOCK_BRANCHES=1` (blocks without loops and conditionals),
+    `DNA_STENCIL_STATS=1` (what was compiled) and `DNA_FUSION_DEBUG=1` (how each instruction was classified) are for finding
+    out what it is doing; `DNA_OPCODE_TOP=n` lists more of a diagnostic build's opcode table.
+
+Measured on one machine, best of 3 (`python3 tools/benchmark_mono.py`; Mono 6.8, DNA 64-bit release):
+
+| | Mono ms | DNA ms | |
+|---|---|---|---|
+| `string_concat` | 70.8 | 7.9 | 8.97x faster |
+| `exceptions` | 8.9 | 1.1 | 7.84x faster |
+| `cold_methods` | 6.3 | 1.2 | 5.36x faster |
+| `startup` | 8.9 | 3.0 | 2.97x faster |
+| `array_copy` | 8.3 | 8.2 | about the same |
+| `vec_inline` | 3.8 | 5.8 | 1.52x slower |
+| `math_calls` | 15.2 | 23.6 | 1.55x slower |
+| `vec_bounce` | 1.0 | 3.2 | 3.35x slower |
+| `vec_struct` | 0.8 | 4.8 | 6.03x slower |
+| `double_loop` | 3.3 | 20.5 | 6.3x slower |
+| `recursion` | 0.4 | 3.9 | 8.95x slower |
+| `vec_calls` | 1.1 | 11.6 | 10.3x slower |
+| `list_int` | 3.5 | 46.3 | 13.4x slower |
+| `struct_math` | 6.3 | 84.6 | 13.4x slower |
+| `sieve` | 4.7 | 63.1 | 13.5x slower |
+| `boxing` | 3.5 | 52.2 | 14.8x slower |
+| `alloc` | 4.0 | 68.4 | 17.1x slower |
+| `int_loop` | 2.3 | 40.0 | 17.4x slower |
+| `vec_class` | 0.5 | 9.6 | 18.5x slower |
+| `virtual_calls` | 2.6 | 57.1 | 21.8x slower |
+| `delegates` | 3.6 | 94.4 | 25.9x slower |
+| `dictionary` | 3.0 | 245 | 82.5x slower |
+
+What that shows, and what it does not: the native blocks bring float32 code that stays in locals and fields within 1.5 to 6 times
+of Mono's JIT (`vec_inline`, `vec_bounce`, `vec_struct`), where the plain interpreter is 15 to 20 times behind; anything that calls, allocates,
+uses `long`/`double`/conversions, arrays, or virtual dispatch is still interpreted and still 10 to 70 times behind, and the
+calls dominate the particle benchmark. Inside a block the cost is about two cycles a stencil, because the evaluation stack
+is still in memory; keeping stack values in registers (a virtual stack, three-address stencils) is the next step for that, and
+stencils for `ldelem`/`stelem` (with the same exit-on-failure as the null check), and `long` and `double` arithmetic are what
+would make more code eligible. Arrays need one more thing first: every `stelem.i1`/`.i2`/`.i4`/`.r4` is the same instruction,
+whose element size is only known at run time, and stencils are recognised by the address of the instruction's handler, so the
+JIT would have to emit distinct instructions for them. None of this has been tried on any other operating system or CPU.
+
 ## Where DNA deliberately differs
 
 * `Marshal.SizeOf` accepts only unmanaged types (primitives, enums, structs of those) and refuses the
@@ -114,7 +206,7 @@ Crust itself refuses (passed to its `assert_refuses`) are excluded. Currently 55
 ## 64-bit port (done for Linux x86-64)
 
 DNA assumed 32-bit pointers in many independent places, so the port was staged, each stage gated by the whole
-suite. A single source builds as 32-bit (including wasm32) and 64-bit; on a 32-bit target every change below
+suite. A single source builds as 32-bit and 64-bit (wasm32 has not been tried); on a 32-bit target every change below
 reduces to what it was before (for the layout changes, generated or compile-time checks pin that).
 
 1. **Metadata loader.** Table rows were arrays of fixed 4-byte cells padded to the 32-bit struct size, with
@@ -156,7 +248,7 @@ Results: `tests/run_tests.py` passes 38/38 on both `build/dna32` and `build/dna`
 library differ, because a 32-bit process calls the i386 `libm` (see "Where DNA deliberately differs").
 
 Not done: x86-only P/Invoke has not been exercised on 64-bit (Prowl and the tests use internal calls); other
-operating systems and architectures are untested; the WebAssembly build has never been linked or run (see above).
+operating systems and architectures are untested; WebAssembly is paused (see above).
 
 ## Known gaps
 
