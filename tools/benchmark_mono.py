@@ -22,6 +22,7 @@ also compiles the programs, in parallel; they are cached by source hash after th
 Needs: mono and mcs, a built runtime and corlib (`make`), and matplotlib for the chart (the table prints without it).
 """
 import argparse
+import glob
 import concurrent.futures as cf
 import datetime
 import hashlib
@@ -46,6 +47,7 @@ using System;
 using System.Diagnostics;
 using System.Collections.Generic;
 using System.Text;
+using System.Runtime.InteropServices;
 
 public class Program {
 /*BODY*/
@@ -436,6 +438,45 @@ def cold_source():
 
 
 # name, one line on what it measures, C# body, warm up first?, measured from outside (process start-up)?
+# [DllImport] of a C function: on DNA the runtime built with tests/ffi/mylib.json (build.py --ffi), on Mono the same C as libmylib.so
+FFI_ADD = """
+    [DllImport("mylib")] static extern int add_numbers(int a, int b);
+    const int N = 2000000;
+    static long Run(int n) { long s = 0; for (int i = 0; i < n; i++) { s += add_numbers(i, 3); } return s; }
+"""
+FFI_SUM6 = """
+    [DllImport("mylib")] static extern int sum6(int a, int b, int c, int d, int e, int f);
+    const int N = 2000000;
+    static long Run(int n) { long s = 0; for (int i = 0; i < n; i++) { s += sum6(i, 1, 2, 3, 4, i & 7); } return s; }
+"""
+FFI_MIXED = """
+    [DllImport("mylib")] static extern double mixed(int a, double b, long c, float d, int e);
+    const int N = 2000000;
+    static long Run(int n) { double s = 0; for (int i = 0; i < n; i++) { s += mixed(i, 0.5, 7L, 0.25f, 3); } return (long)s; }
+"""
+
+FFI_BUF = """
+    [DllImport("mylib")] static extern int sum_buf(int[] p, int n);
+    const int N = 500000;
+    static int[] arr = new int[16];
+    static long Run(int n) { for (int i = 0; i < 16; i++) arr[i] = i * 3 + 1; long s = 0; for (int i = 0; i < n; i++) s += sum_buf(arr, 16); return s; }
+"""
+FFI_REF = """
+    [DllImport("mylib")] static extern void swap_ref(ref int a, ref int b);
+    const int N = 500000;
+    static long Run(int n) { int a = 1, b = 2; long s = 0; for (int i = 0; i < n; i++) { swap_ref(ref a, ref b); s += a; } return s; }
+"""
+FFI_STR = """
+    [DllImport("mylib")] static extern int str_len(string s);
+    const int N = 500000;
+    static long Run(int n) { string t = "hello world"; long s = 0; for (int i = 0; i < n; i++) s += str_len(t); return s; }
+"""
+FFI_ECHO = """
+    [DllImport("mylib")] static extern string echo_upper(string s);
+    const int N = 200000;
+    static long Run(int n) { string t = "hello"; long s = 0; for (int i = 0; i < n; i++) s += echo_upper(t).Length; return s; }
+"""
+
 BENCHMARKS = [
     ("startup",       "process start: a program that returns 0 (whole run, from outside)", STARTUP, False, True),
     ("vec_inline",    "float32 physics step inline: long runs of float arithmetic on locals", VEC_INLINE, True, False),
@@ -461,6 +502,13 @@ BENCHMARKS = [
     ("sieve",         "sieve of Eratosthenes over 1M bools (array access)",                 SIEVE, True, False),
     ("double_loop",   "800k iterations of double arithmetic",                               DOUBLE_LOOP, True, False),
     ("int_loop",      "2M iterations of integer arithmetic",                                INT_LOOP, True, False),
+    ("ffi_add",       "[DllImport] add_numbers(int, int), 2M calls (needs build.py --ffi)",         FFI_ADD, True, False),
+    ("ffi_sum6",      "[DllImport] six integer arguments, 2M calls",                              FFI_SUM6, True, False),
+    ("ffi_mixed",     "[DllImport] int, double, long, float, int arguments, double result, 2M calls", FFI_MIXED, True, False),
+    ("ffi_buf",       "[DllImport] an int[] argument (a pointer to its elements), 500k calls",    FFI_BUF, True, False),
+    ("ffi_ref",       "[DllImport] two ref arguments, 500k calls",                                FFI_REF, True, False),
+    ("ffi_str",       "[DllImport] a string argument (a temporary UTF-8 copy), 500k calls",       FFI_STR, True, False),
+    ("ffi_echo",      "[DllImport] a string in and a string out, 200k calls",                     FFI_ECHO, True, False),
 ]
 
 
@@ -476,6 +524,33 @@ def program(name, body, warm):
 
 def sh(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def net8_tools():
+    """(dotnet, csc.dll, reference assemblies dir, runtime version) for the .NET SDK, or None"""
+    dotnet = shutil.which("dotnet")
+    csc = (glob.glob("/usr/lib/dotnet/sdk/*/Roslyn/bincore/csc.dll") or glob.glob("/usr/share/dotnet/sdk/*/Roslyn/bincore/csc.dll") or [None])[0]
+    refs = (glob.glob("/usr/lib/dotnet/packs/Microsoft.NETCore.App.Ref/*/ref/net*") or glob.glob("/usr/share/dotnet/packs/Microsoft.NETCore.App.Ref/*/ref/net*") or [None])[0]
+    rts = sorted(glob.glob("/usr/lib/dotnet/shared/Microsoft.NETCore.App/*") + glob.glob("/usr/share/dotnet/shared/Microsoft.NETCore.App/*"))
+    if not (dotnet and csc and refs and rts):
+        return None
+    return dotnet, csc, refs, os.path.basename(rts[-1])
+
+
+def compile_net8(name, source):
+    """Compile `source` with Roslyn for .NET 8. Returns ([command to run it], error or None)."""
+    dotnet, csc, refs, version = net8_tools()
+    d = os.path.join(WORK, "net8")
+    os.makedirs(d, exist_ok=True)
+    cs, dll, cfg = (os.path.join(d, name + ext) for ext in (".cs", ".dll", ".runtimeconfig.json"))
+    open(cs, "w").write(source)
+    cmd = [dotnet, csc, "-noconfig", "-nologo", "-unsafe", "-optimize+", "-nullable:disable", "-nowarn:0219,0414", "-target:exe", "-out:" + dll, cs]
+    cmd += ["-r:" + f for f in glob.glob(os.path.join(refs, "*.dll"))]
+    r = sh(cmd)
+    if r.returncode or not os.path.exists(dll):
+        return None, ((r.stdout + r.stderr).strip().splitlines() or ["compile failed"])[0][:160]
+    open(cfg, "w").write('{"runtimeOptions":{"tfm":"net8.0","framework":{"name":"Microsoft.NETCore.App","version":"%s"}}}' % version)
+    return [dotnet, "exec", "--runtimeconfig", cfg, dll], None
 
 
 def compile_one(kind, name, source, dna_corlib):
@@ -501,11 +576,11 @@ def compile_one(kind, name, source, dna_corlib):
     return exe, None
 
 
-def run_once(cmd, cwd, timeout):
+def run_once(cmd, cwd, timeout, env=None):
     """Run a command: (wall seconds, {'SUM': .., 'US': ..}, error or None)"""
     t0 = time.perf_counter()
     try:
-        r = sh(cmd, cwd=cwd, timeout=timeout)
+        r = sh(cmd, cwd=cwd, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         return None, {}, "timed out after %ds" % timeout
     wall = time.perf_counter() - t0
@@ -520,13 +595,15 @@ def run_once(cmd, cwd, timeout):
     return wall, out, None
 
 
-def measure(runtime, exe, external, repeat, timeout):
+def measure(runtime, exe, external, repeat, timeout, ffi=False):
     """Best of `repeat` runs. Returns {'us': best microseconds, 'sum': checksum} or {'error': ..}"""
-    cwd = os.path.dirname(exe)
-    cmd = {"dna": [DNA_BIN, exe], "mono": ["mono", exe], "mono-interp": ["mono", "--interpreter", exe]}[runtime]
+    cwd = os.path.dirname(exe if isinstance(exe, str) else exe[-1])
+    cmd = {"dna": [FFI_BIN if ffi else DNA_BIN, exe], "mono": ["mono", exe], "mono-interp": ["mono", "--interpreter", exe],
+           "net8": exe}[runtime]
+    env = dict(os.environ, LD_LIBRARY_PATH=FFI_LIBDIR) if ffi and runtime != "dna" else None      # (where Mono finds libmylib.so)
     best, checksum = None, None
     for _ in range(repeat * (3 if external else 1)):
-        wall, out, err = run_once(cmd, cwd, timeout)
+        wall, out, err = run_once(cmd, cwd, timeout, env)
         if err:
             return {"error": err}
         us = wall * 1e6 if external else float(out.get("US", "nan"))
@@ -546,18 +623,20 @@ def verdict(ratio):
     return "about the same"
 
 
-def print_table(rows, with_interp):
+def print_table(rows, with_interp, with_net8=False):
     print()
-    print("  %-14s %10s %s%10s %11s   %s" % ("benchmark", "Mono ms", "%14s " % "Mono-interp ms" if with_interp else "",
-                                           "DNA ms", "DNA/Mono", "verdict"))
+    print("  %-14s %10s %s%s%10s %11s   %s" % ("benchmark", "Mono ms", "%14s " % "Mono-interp ms" if with_interp else "",
+                                           "%10s " % ".NET 8 ms" if with_net8 else "", "DNA ms", "DNA/Mono", "verdict"))
     for r in rows:
         if "error" in r:
             print("  %-14s  %s" % (r["name"], r["error"]))
             continue
         extra = ("%14s " % ("%.2f" % (r["mono_interp_us"] / 1000) if r.get("mono_interp_us") else "-")) if with_interp else ""
         note = "" if r.get("same", True) else "   !! checksums differ (Mono %s, DNA %s)" % (r["mono_sum"], r["dna_sum"])
-        print("  %-14s %10.2f %s%10.2f %10.3gx   %s%s" % (r["name"], r["mono_us"] / 1000, extra, r["dna_us"] / 1000,
-                                                          r["ratio"], verdict(r["ratio"]), note))
+        n8 = ("%10s " % ("%.2f" % (r["net8_us"] / 1000) if r.get("net8_us") else "-")) if with_net8 else ""
+        n8note = ("   (%.3gx .NET 8)" % (r["dna_us"] / r["net8_us"])) if with_net8 and r.get("net8_us") else ""
+        print("  %-14s %10.2f %s%s%10.2f %10.3gx   %s%s%s" % (r["name"], r["mono_us"] / 1000, extra, n8, r["dna_us"] / 1000,
+                                                          r["ratio"], verdict(r["ratio"]), n8note, note))
 
 
 def plot(rows, meta, out_png, show, with_interp):
@@ -625,6 +704,7 @@ def main():
     ap.add_argument("--only", help="comma-separated benchmark names")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--mono-interp", action="store_true", help="also run Mono's interpreter (mono --interpreter)")
+    ap.add_argument("--net8", action="store_true", help="also run .NET 8 (compiled with Roslyn; needs the .NET SDK): a stricter baseline than Mono")
     ap.add_argument("--timeout", type=int, default=60, help="seconds allowed per run (default 60)")
     ap.add_argument("--out", default=os.path.join(BUILD, "benchmark_mono.png"), help="chart file")
     ap.add_argument("--json", help="also write the results here")
@@ -640,7 +720,7 @@ def main():
 
     if args.plot_only:
         saved = json.load(open(args.plot_only))
-        print_table(saved["rows"], saved["meta"].get("mono_interp", False))
+        print_table(saved["rows"], saved["meta"].get("mono_interp", False), any(r.get("net8_us") for r in saved["rows"]))
         plot(saved["rows"], saved["meta"], args.out, args.show, saved["meta"].get("mono_interp", False))
         return 0
 
@@ -659,6 +739,18 @@ def main():
     if not chosen:
         print("error: no such benchmark; --list shows them", file=sys.stderr)
         return 1
+
+    if any(b[0].startswith("ffi_") for b in chosen):
+        if not build_ffi():
+            return 1
+
+    net8_cmds = {}
+    if args.net8:
+        if net8_tools() is None:
+            print("error: --net8 needs the .NET SDK (dotnet, Roslyn, the reference assemblies)", file=sys.stderr)
+            return 1
+        for name, what, body, warm, external in chosen:
+            net8_cmds[name] = compile_net8(name, program(name, body, warm))
 
     # compile everything for both runtimes, in parallel
     os.makedirs(WORK, exist_ok=True)
@@ -686,23 +778,31 @@ def main():
             row["error"] = "does not compile for %s: %s" % ("Mono" if merr else "DNA", merr or derr)
             rows.append(row)
             continue
-        m = measure("mono", mexe, external, args.repeat, args.timeout)
-        d = measure("dna", dexe, external, args.repeat, args.timeout)
+        isffi = name.startswith("ffi_")
+        m = measure("mono", mexe, external, args.repeat, args.timeout, isffi)
+        d = measure("dna", dexe, external, args.repeat, args.timeout, isffi)
         if "error" in m or "error" in d:
             row["error"] = "failed: Mono %s; DNA %s" % (m.get("error", "ok"), d.get("error", "ok"))
             rows.append(row)
             continue
         row.update(mono_us=m["us"], dna_us=d["us"], mono_sum=m["sum"], dna_sum=d["sum"],
                    same=(m["sum"] == d["sum"]), ratio=d["us"] / m["us"])
+        if args.net8:
+            ncmd, nerr = net8_cmds[name]
+            if nerr:
+                row["net8_us"] = None
+            else:
+                n8 = measure("net8", ncmd, external, args.repeat, args.timeout, isffi)
+                row["net8_us"] = n8.get("us")
         if args.mono_interp:
-            mi = measure("mono-interp", mexe, external, args.repeat, args.timeout)
+            mi = measure("mono-interp", mexe, external, args.repeat, args.timeout, isffi)
             row["mono_interp_us"] = mi.get("us")
         rows.append(row)
         sys.stdout.write(".")
         sys.stdout.flush()
     print(" ran in %.1fs" % (time.time() - t0))
 
-    print_table(rows, args.mono_interp)
+    print_table(rows, args.mono_interp, args.net8)
     meta = {"dna": os.path.relpath(DNA_BIN, ROOT) if DNA_BIN.startswith(ROOT) else DNA_BIN, "repeat": args.repeat,
             "mono": mono_ver, "mono_interp": args.mono_interp, "date": datetime.date.today().isoformat()}
     if args.json:
@@ -716,6 +816,26 @@ def main():
 
 
 DNA_BIN = None
+FFI_BIN = None          # the runtime built with tests/ffi/mylib.json, for the ffi_* benchmarks
+FFI_LIBDIR = None       # where libmylib.so is, for Mono
+
+
+def build_ffi():
+    """Build what the ffi_* benchmarks need: the runtime with the manifest (build/dna_ffi) and the C library for Mono."""
+    global FFI_BIN, FFI_LIBDIR
+    manifest = os.path.join(ROOT, "tests", "ffi", "mylib.json")
+    r = sh([sys.executable, os.path.join(ROOT, "build.py"), "--ffi", manifest, "--no-corlib"])
+    FFI_BIN = os.path.join(BUILD, "dna_ffi")
+    if r.returncode or not os.path.exists(FFI_BIN):
+        print("error: the runtime with the FFI manifest did not build:\n" + (r.stdout + r.stderr)[-500:], file=sys.stderr)
+        return False
+    FFI_LIBDIR = os.path.join(BUILD, "ffi")
+    os.makedirs(FFI_LIBDIR, exist_ok=True)
+    r = sh(["gcc", "-shared", "-fPIC", "-O2", "-o", os.path.join(FFI_LIBDIR, "libmylib.so"), os.path.join(ROOT, "tests", "ffi", "mylib.c")])
+    if r.returncode:
+        print("error: libmylib.so did not build:\n" + r.stderr[-500:], file=sys.stderr)
+        return False
+    return True
 
 if __name__ == "__main__":
     sys.exit(main())

@@ -14,6 +14,9 @@ The checks (a stencil that breaks one is rejected, because it could not be copie
 
     python3 tools/gen_stencils.py            # (re)write native/src/Stencils.gen.h
     python3 tools/gen_stencils.py --check    # fail if it is out of date
+    python3 tools/gen_stencils.py --extra-c F.c --extra-names a,b --out H.h
+                                             # also compile F.c (st_a, st_b ...) and write H.h instead: what build.py --ffi does (the
+                                             # generated ffi_* stencils call a C function, so they may contain one indirect call)
 
 On a host that is not x86-64 Linux (or without gcc) the header says STENCILS_AVAILABLE 0 and the interpreter does not
 use native blocks. Setting DNA_NO_STENCILS=1 at run time turns them off too.
@@ -40,7 +43,8 @@ NAMES = ["ldl", "stl", "ldc", "fadd", "fsub", "fmul", "fdiv", "fneg", "lda", "ld
          "ldc8lo", "ldc8hi", "ladd", "lsub", "lmul", "land", "lor", "lxor", "lshl", "lshr", "lshrun", "lneg",
          "dadd", "dsub", "dmul", "ddiv", "dneg", "cvtil", "cvtul", "cvtli", "cvtid", "cvtdi", "cvtfd", "cvtdf",
          "lbeq", "lbge", "lbgt", "lble", "lblt", "lbne",
-         "jdeq", "jdne", "jdlt", "jdle", "jdgt", "jdge", "jdlt_un", "jdle_un", "jdgt_un", "jdge_un"]
+         "jdeq", "jdne", "jdlt", "jdle", "jdgt", "jdge", "jdlt_un", "jdle_un", "jdgt_un", "jdge_un",
+         "zero4", "zero8", "chkthis", "ldfld8", "stfld8", "ldflda", "cvtld", "cvtlf", "cvtdl", "cvtfl", "jt8", "jf8"]
 GCC_FLAGS = ["-O2", "-fno-pic", "-fno-pie", "-mcmodel=small", "-ffixed-r12", "-ffixed-r13",
              "-fno-asynchronous-unwind-tables", "-fno-unwind-tables", "-fcf-protection=none",
              "-fno-stack-protector", "-ffp-contract=off", "-fno-ident"]
@@ -103,15 +107,16 @@ def parse_elf(path):
                 m = re.fullmatch(r"HOLE(\d)", target)
                 is_abs = typ in (R_X86_64_32, R_X86_64_32S)
                 is_rel = typ in (R_X86_64_PC32, R_X86_64_PLT32)
-                if not m or not (is_abs or (is_rel and target in ("HOLE1", "HOLE2"))):
+                if not m or not (is_abs or (is_rel and target in ("HOLE1", "HOLE2", "HOLE5"))):
                     sys.exit("stencil %s has a relocation (type %d against %s) that cannot be copied: only absolute "
-                             "32-bit references to HOLEn, and PC-relative branches to HOLE1 or HOLE2, are allowed" % (name, typ, target))
+                             "32-bit references to HOLEn, and PC-relative branches to HOLE1 or HOLE2 (or a read of the constant pool, HOLE5), are allowed" % (name, typ, target))
                 holes.append((r_off - value, int(m.group(1)), add, 1 if is_rel else 0))
         out[name] = (code, sorted(holes))
     return out
 
 
 def check_straight_line(obj, names, branch_relocs):
+    # (a stencil called ffi_* calls a C function: through a register, once)
     """objdump the object: the only control transfer in each function is its final ret"""
     asm = subprocess.run(["objdump", "-d", "--no-show-raw-insn", obj], capture_output=True, text=True).stdout
     current, insns = None, {}
@@ -134,6 +139,8 @@ def check_straight_line(obj, names, branch_relocs):
         body = seq[:seq.index("ret")]
         jumps = 0
         for mnem in body:
+            if mnem == "call" and n.startswith("ffi_") and body.count("call") == 1:
+                continue
             if mnem.startswith("call") or mnem.startswith("ret") or mnem == "loop":
                 sys.exit("stencil st_%s is not straight-line code (it has a %s)" % (n, mnem))
             if mnem.startswith("j"):
@@ -143,7 +150,17 @@ def check_straight_line(obj, names, branch_relocs):
                      "to the block's stub" % (n, jumps, branch_relocs.get(n, 0)))
 
 
-def generate():
+def vstencil_names():
+    """the register stencils (tools/gen_vstencils.py writes their names beside their source, which stencils.c includes)"""
+    path = os.path.join(HERE, "..", "native", "stencils", "vstencils.json")
+    if not os.path.exists(path):
+        sys.exit("native/stencils/vstencils.json is missing: run tools/gen_vstencils.py first")
+    import json
+    return json.load(open(path))
+
+
+def generate(extra_c=None, extra_names=()):
+    names_all = list(NAMES) + vstencil_names() + list(extra_names)
     if platform.machine() not in ("x86_64", "AMD64") or platform.system() != "Linux":
         return unavailable("this host is %s %s; stencils are x86-64 Linux" % (platform.system(), platform.machine()))
     for tool in ("gcc", "objdump"):
@@ -151,48 +168,64 @@ def generate():
             return unavailable("%s was not found (stencils need gcc and objdump from binutils)" % tool)
     with tempfile.TemporaryDirectory() as d:
         obj = os.path.join(d, "stencils.o")
-        r = subprocess.run(["gcc"] + GCC_FLAGS + ["-c", SRC, "-o", obj], capture_output=True, text=True)
+        src = SRC
+        if extra_c:
+            # one translation unit: the stencils, then the generated ones (which use the same register conventions)
+            src = os.path.join(d, "combined.c")
+            open(src, "w").write('#include "%s"\n#include "%s"\n' % (os.path.abspath(SRC), os.path.abspath(extra_c)))
+        r = subprocess.run(["gcc"] + GCC_FLAGS + ["-c", src, "-o", obj], capture_output=True, text=True)
         if r.returncode != 0:
             sys.exit("gcc failed on stencils.c:\n" + r.stderr)
         funcs = parse_elf(obj)
-        branch_relocs = dict((n[3:], sum(1 for h in holes if h[3] == 1)) for n, (code, holes) in funcs.items())
-        check_straight_line(obj, NAMES, branch_relocs)
+        for n in list(funcs):
+            code, holes = funcs[n]
+            if code.endswith(b"\xc3\x0f\x0b"):
+                # gcc puts a ud2 after the asm of a naked function: not part of the stencil (cut here, once, so the length is right everywhere)
+                funcs[n] = (code[:-2], holes)
+        branch_relocs = dict((n[3:], sum(1 for h in holes if h[3] == 1 and h[1] in (1, 2))) for n, (code, holes) in funcs.items())
+        check_straight_line(obj, names_all, branch_relocs)
     o = ["// GENERATED by tools/gen_stencils.py from native/stencils/stencils.c. Do not edit.", "",
          "#define STENCILS_AVAILABLE 1", "",
          "#ifndef STENCIL_IDS_DEFINED", "#define STENCIL_IDS_DEFINED",
-         "enum { " + ", ".join("ST_" + n.upper() for n in NAMES) + ", ST_COUNT };",
+         "enum { " + ", ".join("ST_" + n.upper() for n in names_all) + ", ST_COUNT };",
          "#endif", "",
          "// The code itself is only wanted by NativeBlocks.c, which defines STENCIL_DATA first", "#ifdef STENCIL_DATA", "",
          "typedef struct { unsigned off; unsigned hole; int addend; int rel; } tStencilHole;   // rel: a PC-relative branch",
-         "typedef struct { const unsigned char *code; unsigned len; unsigned numHoles; tStencilHole holes[3]; } tStencil;", ""]
-    for n in NAMES:
+         "typedef struct { const unsigned char *code; unsigned len; unsigned numHoles; tStencilHole holes[6]; } tStencil;", ""]
+    for n in names_all:
         if "st_" + n not in funcs:
             sys.exit("stencils.c has no function st_%s" % n)
         code, holes = funcs["st_" + n]
         if code[-1] != 0xC3:
             sys.exit("st_%s does not end in ret" % n)
         code = code[:-1]
-        if len(holes) > 3:
-            sys.exit("st_%s has more than three holes" % n)
+        if len(holes) > 6:
+            sys.exit("st_%s has more than six holes" % n)
         for off, hole, add, typ in holes:
             if off + 4 > len(code):
                 sys.exit("st_%s: a hole runs into the ret" % n)
         o.append("static const unsigned char stencil_%s[] = { %s };" % (n, ", ".join("0x%02x" % b for b in code) if code else "0"))
     o.append("")
     o.append("static const tStencil stencils[ST_COUNT] = {")
-    for n in NAMES:
+    for n in names_all:
         code, holes = funcs["st_" + n]
         hs = ", ".join("{ %d, %d, %d, %d }" % (off, hole, add, rel) for off, hole, add, rel in holes)
         o.append("\t{ stencil_%s, %d, %d, { %s } }," % (n, len(code) - 1, len(holes), hs))
     o.append("};")
-    o.append("static const char *const stencilNames[ST_COUNT] = { " + ", ".join('"%s"' % n for n in NAMES) + " };")
+    o.append("static const char *const stencilNames[ST_COUNT] = { " + ", ".join('"%s"' % n for n in names_all) + " };")
     o.append("")
     o.append("#endif // STENCIL_DATA")
     return "\n".join(o) + "\n"
 
 
+def arg(flag):
+    return sys.argv[sys.argv.index(flag) + 1] if flag in sys.argv else None
+
+
 if __name__ == "__main__":
-    text = generate()
+    if arg("--out"):
+        OUT = arg("--out")
+    text = generate(arg("--extra-c"), [n for n in (arg("--extra-names") or "").split(",") if n])
     if "--check" in sys.argv:
         if not (os.path.exists(OUT) and open(OUT).read() == text):
             sys.exit("Stencils.gen.h is out of date: run tools/gen_stencils.py")
