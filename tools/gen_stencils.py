@@ -35,12 +35,17 @@ OUT = os.path.join(HERE, "..", "native", "src", "Stencils.gen.h")
 NAMES = ["ldl", "stl", "ldc", "fadd", "fsub", "fmul", "fdiv", "fneg", "lda", "ldp", "stp", "dup4", "dup8", "ldfld4", "stfld4",
          "iadd", "isub", "imul", "iand", "ior", "ixor", "ishl", "ishr", "ishrun",
          "j", "jt", "jf", "jeq", "jge", "jgt", "jle", "jlt", "jne",
-         "jfeq", "jfne", "jflt", "jfle", "jfgt", "jfge", "jflt_un", "jfle_un", "jfgt_un", "jfge_un", "cvtif", "cvtfi"]
+         "jfeq", "jfne", "jflt", "jfle", "jfgt", "jfge", "jflt_un", "jfle_un", "jfgt_un", "jfge_un", "cvtif", "cvtfi",
+         "ldelem4", "ldelemu1", "ldelemb4", "stelem4", "stelem1", "ldelema", "ldlen", "cvtii", "cvtmask",
+         "ldc8lo", "ldc8hi", "ladd", "lsub", "lmul", "land", "lor", "lxor", "lshl", "lshr", "lshrun", "lneg",
+         "dadd", "dsub", "dmul", "ddiv", "dneg", "cvtil", "cvtul", "cvtli", "cvtid", "cvtdi", "cvtfd", "cvtdf",
+         "lbeq", "lbge", "lbgt", "lble", "lblt", "lbne",
+         "jdeq", "jdne", "jdlt", "jdle", "jdgt", "jdge", "jdlt_un", "jdle_un", "jdgt_un", "jdge_un"]
 GCC_FLAGS = ["-O2", "-fno-pic", "-fno-pie", "-mcmodel=small", "-ffixed-r12", "-ffixed-r13",
              "-fno-asynchronous-unwind-tables", "-fno-unwind-tables", "-fcf-protection=none",
              "-fno-stack-protector", "-ffp-contract=off", "-fno-ident"]
 R_X86_64_32, R_X86_64_32S = 10, 11
-R_X86_64_PC32, R_X86_64_PLT32 = 2, 4     # a jump or call target: only HOLE1 may be one
+R_X86_64_PC32, R_X86_64_PLT32 = 2, 4     # a jump or call target: only HOLE1 (the exit) and HOLE2 (index out of range) may be one
 
 
 def unavailable(why):
@@ -98,9 +103,9 @@ def parse_elf(path):
                 m = re.fullmatch(r"HOLE(\d)", target)
                 is_abs = typ in (R_X86_64_32, R_X86_64_32S)
                 is_rel = typ in (R_X86_64_PC32, R_X86_64_PLT32)
-                if not m or not (is_abs or (is_rel and target == "HOLE1")):
+                if not m or not (is_abs or (is_rel and target in ("HOLE1", "HOLE2"))):
                     sys.exit("stencil %s has a relocation (type %d against %s) that cannot be copied: only absolute "
-                             "32-bit references to HOLEn, and PC-relative branches to HOLE1, are allowed" % (name, typ, target))
+                             "32-bit references to HOLEn, and PC-relative branches to HOLE1 or HOLE2, are allowed" % (name, typ, target))
                 holes.append((r_off - value, int(m.group(1)), add, 1 if is_rel else 0))
         out[name] = (code, sorted(holes))
     return out
@@ -159,7 +164,7 @@ def generate():
          "#endif", "",
          "// The code itself is only wanted by NativeBlocks.c, which defines STENCIL_DATA first", "#ifdef STENCIL_DATA", "",
          "typedef struct { unsigned off; unsigned hole; int addend; int rel; } tStencilHole;   // rel: a PC-relative branch",
-         "typedef struct { const unsigned char *code; unsigned len; unsigned numHoles; tStencilHole holes[2]; } tStencil;", ""]
+         "typedef struct { const unsigned char *code; unsigned len; unsigned numHoles; tStencilHole holes[3]; } tStencil;", ""]
     for n in NAMES:
         if "st_" + n not in funcs:
             sys.exit("stencils.c has no function st_%s" % n)
@@ -167,8 +172,8 @@ def generate():
         if code[-1] != 0xC3:
             sys.exit("st_%s does not end in ret" % n)
         code = code[:-1]
-        if len(holes) > 2:
-            sys.exit("st_%s has more than two holes" % n)
+        if len(holes) > 3:
+            sys.exit("st_%s has more than three holes" % n)
         for off, hole, add, typ in holes:
             if off + 4 > len(code):
                 sys.exit("st_%s: a hole runs into the ret" % n)
