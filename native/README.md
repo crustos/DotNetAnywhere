@@ -14,12 +14,11 @@ Likewise, the corlib.csproj project has been extended to support extra APIs.
 HOW TO BUILD
 ============
 
-1. Install the Emscripten SDK. I've verified it works with emscripten-1.37.9.
-   Newer SDKs should also work.
-2. In the command prompt you'll build from, activate that SDK
-   (e.g., in your emscripten SDK directory, run "emsdk activate")
-3. Run build.cmd
+Everything is built by `build.py` at the top of the repository (`make` calls it):
 
-If the build succeeds, it will write updated .js/.wasm files to the Blazor.Host
-directory. You can then rebuild that package and dependent packages (e.g., the sample
-application).
+    python3 build.py              # the native runtime, build/dna, and build/corlib.dll
+    python3 build.py --m32        # 32-bit native runtime, build/dna32
+
+It needs gcc and a checkout of Crust (see ../README.md). The Emscripten build is gone (see "WebAssembly" in
+../README.md); js-interop.js and the JSInterop/Debugger entry points are still here for a future wasm target, but
+nothing builds or tests them now.
