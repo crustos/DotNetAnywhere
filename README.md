@@ -58,7 +58,7 @@ mcs -nostdlib -r:build/corlib.dll prog.cs      # corlib.dll must sit beside prog
 
 | | 32-bit | 64-bit |
 |---|---|---|
-| `tests/run_tests.py` | 51 of 51 | 51 of 51 |
+| `tests/run_tests.py` | 54 of 54 | 55 of 55 |
 | Crust survey (`crust_conformance.py`) | 55 of 55 | 55 of 55 |
 | `Math`/`MathF` against .NET 8 (`MathBits`) | 41 of 56 | 56 of 56 |
 
@@ -87,7 +87,7 @@ DNA deliberately differs from the reference runtimes, and the known gaps.
 | `tools/gen_metadata_layout.py` | generates `native/src/MetaDataLayout.gen.h`, how each metadata table row maps onto its C struct, for any word size |
 | `tools/gen_fused_ops.py` | generates the fused instructions (one instruction for a run such as `ldloc; ldloc; add`): opcode numbers, interpreter handlers, and what the JIT matches |
 | `tools/gen_stencils.py` | turns `native/stencils/stencils.c` into machine-code templates with holes, for the native blocks (x86-64 Linux; needs gcc and objdump) |
-| `tools/benchmark_mono.py` | 22 small C# benchmarks, DNA against Mono, with a table and a matplotlib chart (`--help`) |
+| `tools/benchmark_mono.py` | 24 small C# benchmarks, DNA against Mono, with a table and a matplotlib chart (`--help`) |
 | `tools/check_internalcall_params.py` | checks every native method's argument reads against its registered signature, for 32- and 64-bit pointers (`--fix` rewrites them) |
 | `tests/gen_*.py` | generate the large test programs |
 

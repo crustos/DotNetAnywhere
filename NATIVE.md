@@ -135,9 +135,11 @@ measured on its own and each switchable so that a suspected miscompile can be bi
   holes, and writes the bytes and the holes into `Stencils.gen.h`. When the JIT finds a region made only of instructions that
   have stencils, it copies them into executable memory, patches the holes (a local's offset, a constant, a field offset, a
   branch target) and the region becomes one instruction. The stencils cover loads and stores of 4- and 8-byte locals,
-  constants, `float32` and 32-bit integer arithmetic, `int`/`float` conversions, `ldloca`/`ldfld`/`stfld` on 4-byte fields
+  constants (a 64-bit one is two stencils), `float32`, `double`, 32-bit and 64-bit integer arithmetic, `int`/`float` conversions and the narrowing `conv.i1`..`conv.u4`, array access
+  (`ldelem`/`stelem` of 4-byte elements and of bytes, `ldelema`, `ldlen`, with null and bounds checks that exit to the
+  interpreter), `ldloca`/`ldfld`/`stfld` on 4-byte fields
   (structs in locals, `ref` arguments, objects), `dup`, and `br`/`brtrue`/`brfalse`, the six integer compare-and-branches and
-  the ten `float32` ones (with NaN handled as the interpreter does), so straight-line vector code, loops and conditionals are
+  the ten `float32` and ten `double` ones (with NaN handled as the interpreter does) and the six `long` ones, so straight-line vector code, loops and conditionals are
   covered, as long as they contain nothing else.
   * Same semantics as the interpreter: the evaluation stack is still in memory, so the collector, exceptions and everything
     else see what they always did. A null reference in a field access makes the block return a status, and the interpreter
@@ -157,38 +159,49 @@ Measured on one machine, best of 3 (`python3 tools/benchmark_mono.py`; Mono 6.8,
 
 | | Mono ms | DNA ms | |
 |---|---|---|---|
-| `string_concat` | 70.8 | 7.9 | 8.97x faster |
-| `exceptions` | 8.9 | 1.1 | 7.84x faster |
-| `cold_methods` | 6.3 | 1.2 | 5.36x faster |
-| `startup` | 8.9 | 3.0 | 2.97x faster |
-| `array_copy` | 8.3 | 8.2 | about the same |
-| `vec_inline` | 3.8 | 5.8 | 1.52x slower |
-| `math_calls` | 15.2 | 23.6 | 1.55x slower |
-| `vec_bounce` | 1.0 | 3.2 | 3.35x slower |
-| `vec_struct` | 0.8 | 4.8 | 6.03x slower |
-| `double_loop` | 3.3 | 20.5 | 6.3x slower |
-| `recursion` | 0.4 | 3.9 | 8.95x slower |
-| `vec_calls` | 1.1 | 11.6 | 10.3x slower |
-| `list_int` | 3.5 | 46.3 | 13.4x slower |
-| `struct_math` | 6.3 | 84.6 | 13.4x slower |
-| `sieve` | 4.7 | 63.1 | 13.5x slower |
-| `boxing` | 3.5 | 52.2 | 14.8x slower |
-| `alloc` | 4.0 | 68.4 | 17.1x slower |
-| `int_loop` | 2.3 | 40.0 | 17.4x slower |
-| `vec_class` | 0.5 | 9.6 | 18.5x slower |
-| `virtual_calls` | 2.6 | 57.1 | 21.8x slower |
-| `delegates` | 3.6 | 94.4 | 25.9x slower |
-| `dictionary` | 3.0 | 245 | 82.5x slower |
+| `exceptions` | 10.8 | 1.4 | 7.64x faster |
+| `string_concat` | 56.0 | 7.6 | 7.35x faster |
+| `cold_methods` | 7.4 | 1.7 | 4.24x faster |
+| `startup` | 8.0 | 2.4 | 3.34x faster |
+| `array_copy` | 6.5 | 4.9 | 1.31x faster |
+| `vec_inline` | 3.5 | 4.1 | 1.16x slower |
+| `math_calls` | 14.8 | 22.3 | 1.51x slower |
+| `double_loop` | 2.9 | 5.5 | 1.9x slower |
+| `vec_array` | 0.13 | 0.42 | 3.14x slower |
+| `vec_aos` | 0.17 | 0.59 | 3.39x slower |
+| `vec_bounce` | 0.89 | 3.3 | 3.65x slower |
+| `sieve` | 4.1 | 16.3 | 3.95x slower |
+| `vec_struct` | 0.61 | 2.4 | 3.96x slower |
+| `int_loop` | 1.9 | 11.1 | 5.9x slower |
+| `recursion` | 0.38 | 3.4 | 8.95x slower |
+| `vec_calls` | 0.85 | 9.2 | 10.8x slower |
+| `list_int` | 3.6 | 41.7 | 11.6x slower |
+| `vec_class` | 0.40 | 5.2 | 12.9x slower |
+| `struct_math` | 4.8 | 71.3 | 14.9x slower |
+| `boxing` | 3.0 | 47.2 | 15.7x slower |
+| `virtual_calls` | 2.5 | 43.0 | 17x slower |
+| `delegates` | 3.8 | 75.8 | 19.7x slower |
+| `alloc` | 3.1 | 60.5 | 19.8x slower |
+| `dictionary` | 2.7 | 226 | 84.5x slower |
 
-What that shows, and what it does not: the native blocks bring float32 code that stays in locals and fields within 1.5 to 6 times
-of Mono's JIT (`vec_inline`, `vec_bounce`, `vec_struct`), where the plain interpreter is 15 to 20 times behind; anything that calls, allocates,
-uses `long`/`double`/conversions, arrays, or virtual dispatch is still interpreted and still 10 to 70 times behind, and the
-calls dominate the particle benchmark. Inside a block the cost is about two cycles a stencil, because the evaluation stack
-is still in memory; keeping stack values in registers (a virtual stack, three-address stencils) is the next step for that, and
-stencils for `ldelem`/`stelem` (with the same exit-on-failure as the null check), and `long` and `double` arithmetic are what
-would make more code eligible. Arrays need one more thing first: every `stelem.i1`/`.i2`/`.i4`/`.r4` is the same instruction,
-whose element size is only known at run time, and stencils are recognised by the address of the instruction's handler, so the
-JIT would have to emit distinct instructions for them. None of this has been tried on any other operating system or CPU.
+What that shows, and what it does not: the native blocks bring code that stays in locals, fields and arrays (`float32`, `int`, `long`,
+`double`) within 1.2 to 7 times of Mono's JIT (`vec_inline`, `vec_bounce`, `vec_array`, `vec_aos`, `vec_struct`, `double_loop`, `int_loop`),
+where the plain interpreter is 15 to 25 times behind; anything that calls, allocates, boxes or does virtual dispatch is still interpreted
+and still 10 to 80 times behind, and the calls dominate the particle benchmark (`vec_class`). Inside a block the cost is about two cycles a
+stencil, because the evaluation stack is still in memory; keeping stack values in registers (a virtual stack, three-address stencils) is the
+next step for that, and 2- and 8-byte array elements, `ldelem.ref`, value-producing comparisons (`clt`, `ceq`) and calls are what would
+make more code eligible. None of this has been tried on any other operating system or CPU.
+
+How a stencil is matched, and what that costs when it goes wrong. An instruction is recognised by the address of its handler, so
+a stencil is only used for instructions the JIT emits as a distinct handler: `stelem.i1`/`.i2`/`.i4` are separate instructions
+for that reason, and `ldelema` carries its element size. `ldelem.u1` and `stelem.i1` are used on `byte[]` (1-byte elements) and
+on `bool[]` (4 bytes here), so the JIT picks the stride from the array's static type and falls back to the run-time
+instruction when it does not know it. A match that is missed produces the right answer, only slower (`ldelem.r4` was missed for a
+while, because its handler's address was not the one compared), so output comparisons cannot see it: look at what still runs
+interpreted with a diagnostic build (`-DDIAG_OPCODE_USE`, `DNA_OPCODE_TOP=n`) or `DNA_FUSION_DEBUG=1`. The test suite checks that
+every stencil is exercised by some stencil test, which catches a stencil nobody uses but not a missed source instruction, and a second
+check fails if the classification compares some of the instructions that share a handler body but not all of them. Those do not share an
+address: `JIT_LOAD_I64` and `JIT_LOAD_F64` are adjacent labels with different values (which is why `ldc.r8` was missed).
 
 ## Where DNA deliberately differs
 
