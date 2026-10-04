@@ -8,7 +8,8 @@
 //    through into the next one;
 //  * the only relocations are against HOLE0 / HOLE1: absolute 32-bit ones (a displacement or an immediate) against
 //    either, and PC-relative branches against HOLE1, which is where a stencil that can fail jumps to (the block's exit
-//    stub; see NativeBlocks.c). Such a stencil is written in assembly so that the jump is exactly where it is meant to
+//    stub; see NativeBlocks.c) and, for array access, against HOLE2, the exit for an index out of range. Such a stencil is
+//    written in assembly so that the jump is exactly where it is meant to
 //    be: compiled from C, gcc moves the failure path after the `ret`, which is dropped;
 //  * the evaluation stack pointer lives in r12 and the frame (the parameters and locals) in r13, in every stencil
 //    (the file is compiled with -ffixed-r12 -ffixed-r13), so they can follow each other without a call convention.
@@ -24,6 +25,7 @@ register unsigned char *FP asm("r13");     // the frame: parameters, then locals
 
 extern char HOLE0[];
 extern char HOLE1[];
+extern char HOLE2[];
 #define H0 ((long)HOLE0)
 
 // ldloc / ldarg of a 4-byte value (an int or a float: just 4 bytes)      H0 = byte offset in the frame
@@ -132,3 +134,107 @@ void st_jfne(void) { __asm__ volatile("sub $8, %%r12\n\tmovss (%%r12), %%xmm0\n\
 void st_cvtif(void) { *(float*)(SP - 4) = (float)*(int*)(SP - 4); }                        // conv.r4 of an int
 // conv.i4 (and, with a shift, conv.i1 / conv.i2) of a float: the interpreter's expression       H0 = the shift
 void st_cvtfi(void) { int r = (int)*(float*)(SP - 4); r = (r << H0) >> H0; *(int*)(SP - 4) = r; }
+
+// ---- arrays. An array object is its length (a 32-bit integer at offset 0), then its elements from offset 4
+// (NativeBlocks.c asserts that this is the layout). A null array jumps to HOLE1 (NullReferenceException), an index that is
+// not below the length, as an unsigned number so that a negative one is too, to HOLE2 (IndexOutOfRangeException).
+// The stack is [array (8 bytes)] [index (4)] and, for a store, [value (4)] above that.
+#define ARRAY_PROLOGUE(pop) \
+	"sub $" #pop ", %%r12\n\t" \
+	"mov (%%r12), %%rax\n\t" \
+	"test %%rax, %%rax\n\t" \
+	"jz HOLE1\n\t" \
+	"mov 8(%%r12), %%edx\n\t" \
+	"cmp (%%rax), %%edx\n\t" \
+	"jae HOLE2\n\t"
+// ldelem.i4 / .u4 / .r4: push the 4-byte element
+void st_ldelem4(void)  { __asm__ volatile(ARRAY_PROLOGUE(12) "mov 4(%%rax,%%rdx,4), %%eax\n\tmov %%eax, (%%r12)\n\tadd $4, %%r12" ::: "rax", "rdx", "memory", "cc"); }
+// ldelem.u1 of a byte[] element: push the byte, zero-extended
+void st_ldelemu1(void) { __asm__ volatile(ARRAY_PROLOGUE(12) "movzbl 4(%%rax,%%rdx,1), %%eax\n\tmov %%eax, (%%r12)\n\tadd $4, %%r12" ::: "rax", "rdx", "memory", "cc"); }
+// ldelem.u1 of a bool[] element: the low byte of its 4-byte element, zero-extended
+void st_ldelemb4(void) { __asm__ volatile(ARRAY_PROLOGUE(12) "movzbl 4(%%rax,%%rdx,4), %%eax\n\tmov %%eax, (%%r12)\n\tadd $4, %%r12" ::: "rax", "rdx", "memory", "cc"); }
+// stelem.i4 / .r4 and stelem.i1: store the value (all 32 bits, or the low 8)
+void st_stelem4(void)  { __asm__ volatile(ARRAY_PROLOGUE(16) "mov 12(%%r12), %%ecx\n\tmov %%ecx, 4(%%rax,%%rdx,4)" ::: "rax", "rcx", "rdx", "memory", "cc"); }
+void st_stelem1(void)  { __asm__ volatile(ARRAY_PROLOGUE(16) "mov 12(%%r12), %%ecx\n\tmov %%cl, 4(%%rax,%%rdx,1)" ::: "rax", "rcx", "rdx", "memory", "cc"); }
+// ldelema: push the address of the element                                  H0 = the element size
+void st_ldelema(void)  { __asm__ volatile(ARRAY_PROLOGUE(12) "imul $HOLE0, %%rdx, %%rdx\n\tlea 4(%%rax,%%rdx), %%rax\n\tmov %%rax, (%%r12)\n\tadd $8, %%r12" ::: "rax", "rdx", "memory", "cc"); }
+// ldlen: push the length (a null array jumps to HOLE1)
+void st_ldlen(void) {
+	__asm__ volatile("sub $8, %%r12\n\tmov (%%r12), %%rax\n\ttest %%rax, %%rax\n\tjz HOLE1\n\tmov (%%rax), %%eax\n\tmov %%eax, (%%r12)\n\tadd $4, %%r12"
+		::: "rax", "memory", "cc");
+}
+
+// ---- narrowing conversions of an int32, in place, the interpreter's expressions.
+// conv.i4 / conv.i1 / conv.i2 of an int:  (v << shift) >> shift     H0 = the shift (0 for conv.i4: C# puts one after every .Length)
+void st_cvtii(void)   { int r = *(int*)(SP - 4); *(int*)(SP - 4) = (r << H0) >> H0; }
+// conv.u1 / conv.u2 / conv.u4 of an int:  v & mask                    H0 = the mask
+void st_cvtmask(void) { *(U32*)(SP - 4) &= (U32)H0; }
+
+// =====================================================================================================================
+// 64-bit integers and doubles. A long or a double takes 8 bytes of evaluation stack, little-endian, like everything else here.
+// =====================================================================================================================
+typedef unsigned long long U64;
+typedef long long I64;
+
+// ldc.i8 / ldc.r8: the 64 bits are two 32-bit holes, so it is two stencils, always emitted together: the first puts the low half
+// in eax, the second builds the whole value and stores it with ONE 8-byte store. (Two 4-byte stores, as this was first written,
+// are slow: the next stencil reads the value with an 8-byte load, which cannot be forwarded from two stores, and stalls.)
+void st_ldc8lo(void) { __asm__ volatile("mov $HOLE0, %%eax" ::: "rax"); }
+void st_ldc8hi(void) { __asm__ volatile("mov $HOLE0, %%edx\n\tshl $32, %%rdx\n\tor %%rdx, %%rax\n\tmov %%rax, (%%r12)\n\tadd $8, %%r12" ::: "rax", "rdx", "memory", "cc"); }
+
+// ---- long arithmetic on the two longs on top of the stack
+#define LONG_OP(name, op) void st_##name(void) { SP -= 8; *(U64*)(SP - 8) = *(U64*)(SP - 8) op *(U64*)SP; }
+LONG_OP(ladd, +)
+LONG_OP(lsub, -)
+LONG_OP(lmul, *)
+LONG_OP(land, &)
+LONG_OP(lor, |)
+LONG_OP(lxor, ^)
+// shifts: the count is an int on top of a long (the interpreter's BINARY_OP(U64, U64, U32, <<))
+void st_lshl(void)   { SP -= 4; *(U64*)(SP - 8) = *(U64*)(SP - 8) << *(U32*)SP; }
+void st_lshr(void)   { SP -= 4; *(I64*)(SP - 8) = *(I64*)(SP - 8) >> *(U32*)SP; }
+void st_lshrun(void) { SP -= 4; *(U64*)(SP - 8) = *(U64*)(SP - 8) >> *(U32*)SP; }
+void st_lneg(void)   { *(I64*)(SP - 8) = -*(I64*)(SP - 8); }
+
+// ---- double arithmetic
+#define DOUBLE_OP(name, op) void st_##name(void) { SP -= 8; *(double*)(SP - 8) = *(double*)(SP - 8) op *(double*)SP; }
+DOUBLE_OP(dadd, +)
+DOUBLE_OP(dsub, -)
+DOUBLE_OP(dmul, *)
+DOUBLE_OP(ddiv, /)
+void st_dneg(void) { *(U64*)(SP - 8) ^= 0x8000000000000000ull; }     // flip the sign bit
+
+// ---- conversions that change the size of what is on the stack
+void st_cvtil(void) { *(I64*)(SP - 4) = (I64)*(int*)(SP - 4); SP += 4; }               // conv.i8 of an int: sign-extend
+void st_cvtul(void) { *(U64*)(SP - 4) = (U64)*(U32*)(SP - 4); SP += 4; }               // conv.u8 / of a uint: zero-extend
+void st_cvtli(void) { int v = (int)*(U64*)(SP - 8); SP -= 4; *(int*)(SP - 4) = (v << H0) >> H0; }   // conv.i4 etc. of a long   H0 = shift
+void st_cvtid(void) { *(double*)(SP - 4) = (double)*(int*)(SP - 4); SP += 4; }         // conv.r8 of an int
+void st_cvtdi(void) { int r = (int)*(double*)(SP - 8); SP -= 4; *(int*)(SP - 4) = (r << H0) >> H0; } // conv.i4 etc. of a double   H0 = shift
+void st_cvtfd(void) { *(double*)(SP - 4) = (double)*(float*)(SP - 4); SP += 4; }       // float to double
+void st_cvtdf(void) { float f = (float)*(double*)(SP - 8); SP -= 4; *(float*)(SP - 4) = f; }   // double to float
+
+// ---- long compare-and-branch: the two longs on top of the stack, the deeper one (a) first; signed, as the interpreter does
+#define LONG_BRANCH(name, jcc) \
+	void st_##name(void) { __asm__ volatile("sub $16, %%r12\n\tmov (%%r12), %%rax\n\tcmp 8(%%r12), %%rax\n\t" jcc " HOLE1" ::: "rax", "memory", "cc"); }
+LONG_BRANCH(lbeq, "je")
+LONG_BRANCH(lbge, "jge")
+LONG_BRANCH(lbgt, "jg")
+LONG_BRANCH(lble, "jle")
+LONG_BRANCH(lblt, "jl")
+LONG_BRANCH(lbne, "jne")
+
+// ---- double compare-and-branch: as the float32 ones, with ucomisd (see there for the reasoning about NaN)
+#define DOUBLE_BRANCH_BA(name, jcc) \
+	void st_##name(void) { __asm__ volatile("sub $16, %%r12\n\tmovsd 8(%%r12), %%xmm1\n\tucomisd (%%r12), %%xmm1\n\t" jcc " HOLE1" ::: "xmm1", "memory", "cc"); }
+#define DOUBLE_BRANCH_AB(name, jcc) \
+	void st_##name(void) { __asm__ volatile("sub $16, %%r12\n\tmovsd (%%r12), %%xmm0\n\tucomisd 8(%%r12), %%xmm0\n\t" jcc " HOLE1" ::: "xmm0", "memory", "cc"); }
+DOUBLE_BRANCH_BA(jdlt, "ja")
+DOUBLE_BRANCH_BA(jdle, "jae")
+DOUBLE_BRANCH_AB(jdgt, "ja")
+DOUBLE_BRANCH_AB(jdge, "jae")
+DOUBLE_BRANCH_AB(jdlt_un, "jb")
+DOUBLE_BRANCH_BA(jdge_un, "jbe")
+DOUBLE_BRANCH_AB(jdle_un, "jbe")
+DOUBLE_BRANCH_BA(jdgt_un, "jb")
+void st_jdeq(void) { __asm__ volatile("sub $16, %%r12\n\tmovsd (%%r12), %%xmm0\n\tucomisd 8(%%r12), %%xmm0\n\tsete %%al\n\tsetnp %%cl\n\ttest %%cl, %%al\n\tjnz HOLE1" ::: "xmm0", "rax", "rcx", "memory", "cc"); }
+void st_jdne(void) { __asm__ volatile("sub $16, %%r12\n\tmovsd (%%r12), %%xmm0\n\tucomisd 8(%%r12), %%xmm0\n\tjne HOLE1\n\tjp HOLE1" ::: "xmm0", "memory", "cc"); }
