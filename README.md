@@ -24,22 +24,21 @@ scripting layer inside a native program. Compared with the version it started fr
 * **More of the language and library.** Exception filters (`catch ... when`) and `fault` blocks, `Marshal` /
   `MemoryMarshal` / `Span<T>` / `[StructLayout]`, `MathF` and the rest of `Math`, `Math.Clamp`, `calli`, `jmp`,
   `cpblk`/`initblk`, `__makeref`, and the opcodes that were missing.
-* **Part of the runtime is written in the Crust C++ subset** (the heap-tracking tree) and lowered to C by Crust's
-  `cpprust` during the build.
+* **The runtime is plain C.** (The heap-tracking tree was for a while a C++ module in the Crust subset, lowered to C during
+  the build; it is C again, `native/src/HeapTree.c`, so the build needs nothing but `gcc` and `python3`.)
 
 ### Build and test
 
-Everything is built by `build.py`; `make` just calls it. You need `gcc`, `python3`, a
-[Crust](https://github.com/brentharts/crust) checkout next to this one, and `mono-mcs`, `mono-runtime` and
-`mono-devel` for the corlib and the tests (`gcc-multilib` only for the 32-bit build).
+Everything is built by `build.py`; `make` just calls it. You need `gcc` and `python3`, and `mono-mcs`, `mono-runtime` and
+`mono-devel` for the corlib and the tests (`gcc-multilib` only for the 32-bit build). A
+[Crust](https://github.com/brentharts/crust) checkout next to this one is needed only for the conformance test.
 
 ```
-git clone https://github.com/brentharts/crust.git ../crust
-
 make                                  # python3 build.py: build/dna (native, 64-bit on x86-64) and build/corlib.dll
 make ARGS="--m32"                     # python3 build.py --m32: build/dna32 (32-bit)
 make test                             # build, then the whole suite     (python3 tests/run_tests.py)
 python3 build.py --ffi M.json            # the runtime with the C functions of a manifest built in (build/dna_ffi): [DllImport] of them is a direct call; see NATIVE.md
+git clone https://github.com/brentharts/crust.git ../crust     # only for the next line
 python3 tests/crust_conformance.py    # Crust's C# programs, DNA against Mono   (--32 / --64 choose the binary)
 make clean
 ```
@@ -83,7 +82,7 @@ DNA deliberately differs from the reference runtimes, and the known gaps.
 
 | | |
 |---|---|
-| `build.py` | the one build script: gcc, cached and parallel, lowers the Crust module first and generates the layout, fused-instruction and stencil headers; `--m32`, `--debug`, `--clean` |
+| `build.py` | the one build script: gcc, cached and parallel, and generates the layout, fused-instruction and stencil headers; `--m32`, `--debug`, `--clean` |
 | `Makefile` | `make` calls `python3 build.py`; `ARGS="..."` passes options, and `test` and `clean` forward too |
 | `tools/gen_metadata_layout.py` | generates `native/src/MetaDataLayout.gen.h`, how each metadata table row maps onto its C struct, for any word size |
 | `tools/gen_fused_ops.py` | generates the fused instructions (one instruction for a run such as `ldloc; ldloc; add`): opcode numbers, interpreter handlers, and what the JIT matches |

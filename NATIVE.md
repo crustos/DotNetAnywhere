@@ -1,18 +1,17 @@
 # Native build, Crust integration and test suite
 
-This fork builds DotNetAnywhere natively with gcc (the original build is Emscripten-only), moves part
-of the runtime into the [Crust](https://github.com/brentharts/crust) C++ subset, extends corlib with
+This fork builds DotNetAnywhere natively with gcc (the original build is Emscripten-only), extends corlib with
 what Crust's C# subset needs (`Marshal`, `MemoryMarshal`, `Span<T>`, `[StructLayout]`), and fixes a
 large number of runtime bugs found by comparing DNA against Mono.
 
 ## Building and testing
 
 `build.py` is the only build script (the old CMake file, `build.sh` and `build.cmd` are gone), and `make` just calls
-it. Needs: `gcc`, `python3`, a Crust checkout at `../crust` (or `--crust DIR` / `$CRUST_ROOT`), and, for corlib and
+it. Needs: `gcc`, `python3`, and, for corlib and
 the tests, `mono-mcs`, `mono-runtime` and `mono-devel` (for `ilasm`). `gcc-multilib` is needed only for the 32-bit
-build. The reference run in `MathBits` also uses a .NET SDK if one is installed.
+build. The reference run in `MathBits` also uses a .NET SDK if one is installed. The build needs no Crust; only
+`tests/crust_conformance.py` does (a [Crust](https://github.com/brentharts/crust) checkout at `../crust`, or `--crust DIR`).
 
-    git clone https://github.com/brentharts/crust.git ../crust
     make                                  # python3 build.py: build/dna (native, 64-bit on x86-64) + build/corlib.dll
     make ARGS="--m32"                     # build/dna32 (32-bit)
     make test                             # the whole suite (--32 / --64 pick the binary; default build/dna)
@@ -35,10 +34,11 @@ Debugger entry points are left in the tree for that, but nothing builds or tests
 
 ## What was added
 
-* **`build.py`**: gcc build with parallel, cached compilation; lowers `native/src/cpp/*.cpp` with
-  Crust's `cpprust` first. `NativeHost.c` stubs the JS bridge for native builds.
-* **A runtime module in the Crust C++ subset**: the heap-tracking tree (`native/src/cpp/HeapTree.cpp`,
-  class `AATree`) replaces the C code in `Heap.c`; a differential test pins it to the original.
+* **`build.py`**: gcc build with parallel, cached compilation. `NativeHost.c` stubs the JS bridge for native builds.
+* **The heap-tracking tree** (`native/src/HeapTree.c`, with the API in `HeapTree.h`): the Andersson tree that was in `Heap.c`, in a file of
+  its own, with the root as a plain global (`HeapTree_RootNode`) that the collector reads without a call; a differential test pins it to the
+  original. (For a while it was a C++ class in the Crust subset, lowered to C during the build; it is plain C again, so that the core of the
+  runtime, the JIT included, needs no toolchain but gcc and python.)
 * **corlib**: `Marshal`, `MemoryMarshal`, `Span<T>`/`ReadOnlySpan<T>`, `StructLayoutAttribute`,
   `LayoutKind`, `Unsafe.SizeOf`, `TypedReference`, `IsVolatile`, `DivideByZeroException`.
   Marshalling serialises unmanaged structs field by field in the reference runtime's Sequential
@@ -104,7 +104,7 @@ Each has a regression test, and expectations were checked against Mono.
 `tests/run_tests.py` runs, and requires `mcs`, `mono`, `ilasm` for the programs (every external run has a 60 s
 timeout, `DNA_TEST_TIMEOUT`, so a hang fails its own check):
 
-* the heap-tree differential test (original C vs the lowered C++, under ASan/UBSan);
+* the heap-tree differential test (the original C vs `native/src/HeapTree.c`, under ASan/UBSan);
 * that the generated `MetaDataLayout.gen.h`, `JIT_Fused*.gen.h` and `Stencils.gen.h` are current, and that every native method reads its arguments at their
   real offsets for both pointer sizes (`tools/gen_metadata_layout.py --check`, `tools/check_internalcall_params.py`);
 * a compile-time guard for the `JIT.c` uninitialised-variable bug;

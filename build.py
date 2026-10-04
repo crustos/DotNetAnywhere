@@ -9,7 +9,6 @@ Usage:
     python build.py --cc clang      # use another C compiler
     python build.py -j 8            # parallel jobs
     python build.py --no-corlib     # skip build/corlib.dll
-    python build.py --lower-only    # only run cpprust on native/src/cpp/*.cpp
     python build.py --run X.exe     # build, then run: build/dna X.exe
     python build.py --ffi M.json    # the runtime with the C functions of a manifest built in -> build/dna_ffi (see tools/gen_ffi.py)
 
@@ -21,10 +20,6 @@ are generated from.
 
 Objects are cached in build/obj and rebuilt only when the source or any
 header is newer than the object.
-
-Crust C++ subset modules (native/src/cpp/*.cpp) are first lowered to C with
-Crust's tools/cpprust.py into build/gen/, then compiled like any other C file.
-Crust is located with --crust DIR, $CRUST_ROOT, or a sibling ../crust checkout.
 """
 import argparse
 import json
@@ -36,10 +31,9 @@ import sys
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(ROOT, "native", "src")
-CPP_SRC = os.path.join(SRC, "cpp")
 BUILD = os.path.join(ROOT, "build")
 OBJ = os.path.join(BUILD, "obj")
-GEN = os.path.join(BUILD, "gen")
+GEN = os.path.join(BUILD, "gen")      # (only a --ffi build has generated C of its own: build/gen_ffi)
 
 FFI_INPUTS = []      # the manifest and C files of a --ffi build (what FFI.gen.c depends on)
 
@@ -49,42 +43,9 @@ def sources():
     return sorted(f for f in os.listdir(SRC) if f.endswith(".c"))
 
 
-def cpp_sources():
-    if not os.path.isdir(CPP_SRC):
-        return []
-    return sorted(f for f in os.listdir(CPP_SRC) if f.endswith(".cpp"))
-
-
 def newest_header():
     return max((os.path.getmtime(os.path.join(SRC, f))
                 for f in os.listdir(SRC) if f.endswith(".h")), default=0)
-
-
-def find_crust(explicit):
-    for cand in (explicit, os.environ.get("CRUST_ROOT"),
-                 os.path.join(ROOT, "..", "crust")):
-        if cand and os.path.isfile(os.path.join(cand, "tools", "cpprust.py")):
-            return os.path.abspath(cand)
-    return None
-
-
-def lower_cpp(crust, name, force):
-    """cpprust: native/src/cpp/X.cpp -> build/gen/X.c. Returns (path, error)."""
-    src = os.path.join(CPP_SRC, name)
-    out = os.path.join(GEN, name[:-4] + ".c")
-    deps = [src] + [os.path.join(SRC, f) for f in os.listdir(SRC) if f.endswith(".h")]
-    if (not force and os.path.exists(out)
-            and os.path.getmtime(out) >= max(os.path.getmtime(d) for d in deps)):
-        return out, None
-    cmd = [sys.executable, os.path.join(crust, "tools", "cpprust.py"), src,
-           "-o", out, "--incdir", SRC, "--incdir", CPP_SRC]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        # cpprust writes its diagnostic to the output path on failure
-        diag = open(out).read() if os.path.exists(out) else ""
-        os.remove(out) if os.path.exists(out) else None
-        return None, (diag or r.stderr or r.stdout).strip()
-    return out, None
 
 
 def compile_one(cc, cflags, name):
@@ -155,28 +116,6 @@ def ensure_generated():
     return 0
 
 
-def lower_all(crust_dir):
-    """Lower every native/src/cpp/*.cpp to C. Returns (generated C files, exit code)."""
-    gen = []
-    cpps = cpp_sources()
-    if cpps:
-        crust = find_crust(crust_dir)
-        if not crust:
-            print("error: Crust not found (needed for native/src/cpp/*.cpp).\n"
-                  "  git clone https://github.com/brentharts/crust.git ../crust\n"
-                  "  or pass --crust DIR / set CRUST_ROOT",
-                  file=sys.stderr)
-            return [], 1
-        for name in cpps:
-            out, err = lower_cpp(crust, name, force=False)
-            if err:
-                print(f"cpprust REFUSED  cpp/{name}\n{err}", file=sys.stderr)
-                return [], 1
-            print(f"  cpprust  cpp/{name} -> {os.path.relpath(out, ROOT)}")
-            gen.append(out)
-    return gen, 0
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -185,13 +124,10 @@ def main():
     ap.add_argument("--m32", action="store_true",
                     help="build 32-bit (-m32); needs gcc-multilib. The default is the native word size")
     ap.add_argument("--clean", action="store_true")
-    ap.add_argument("--crust", help="path to a crust checkout (for cpprust.py)")
     ap.add_argument("--corlib", action="store_true",
                     help="compile corlib/*.cs to build/corlib.dll with mcs (the default if mcs is installed; "
                          "this makes a missing mcs an error)")
     ap.add_argument("--no-corlib", action="store_true", help="do not build build/corlib.dll")
-    ap.add_argument("--lower-only", action="store_true",
-                    help="only lower native/src/cpp/*.cpp to build/gen/*.c, then stop")
     ap.add_argument("--ffi", metavar="MANIFEST.json",
                     help="build the C files and functions of this manifest into the runtime, so that [DllImport] of them is a direct "
                          "call (tools/gen_ffi.py says what the manifest holds). Makes build/dna_ffi, with its own objects")
@@ -261,7 +197,6 @@ def main():
         cflags += ["-O2", "-DNDEBUG"]
 
     os.makedirs(OBJ, exist_ok=True)
-    os.makedirs(GEN, exist_ok=True)
     hdr_time = newest_header()
     if args.ffi and os.path.exists(os.path.join(GEN, "Stencils.gen.h")):
         hdr_time = max(hdr_time, os.path.getmtime(os.path.join(GEN, "Stencils.gen.h")))
@@ -276,18 +211,10 @@ def main():
                 os.remove(os.path.join(OBJ, f))
     open(stamp, "w").write(flags_now)
 
-    # Step 1: lower Crust C++ subset modules to C.
     units = [os.path.join(SRC, n) for n in sources()]
-    gen_units, rc = lower_all(args.crust)
-    if rc:
-        return rc
-    units += gen_units
     ffi_extra = ffi_extra if args.ffi else []
     if args.ffi:
         units.append(os.path.join(GEN, "FFI.gen.c"))
-
-    if args.lower_only:
-        return 0
 
     todo = []
     for unit in units:
