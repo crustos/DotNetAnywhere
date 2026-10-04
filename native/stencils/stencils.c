@@ -238,3 +238,57 @@ DOUBLE_BRANCH_AB(jdle_un, "jbe")
 DOUBLE_BRANCH_BA(jdgt_un, "jb")
 void st_jdeq(void) { __asm__ volatile("sub $16, %%r12\n\tmovsd (%%r12), %%xmm0\n\tucomisd 8(%%r12), %%xmm0\n\tsete %%al\n\tsetnp %%cl\n\ttest %%cl, %%al\n\tjnz HOLE1" ::: "xmm0", "rax", "rcx", "memory", "cc"); }
 void st_jdne(void) { __asm__ volatile("sub $16, %%r12\n\tmovsd (%%r12), %%xmm0\n\tucomisd 8(%%r12), %%xmm0\n\tjne HOLE1\n\tjp HOLE1" ::: "xmm0", "memory", "cc"); }
+
+// ---- for inlining a small method into a block (see FuseOps in JIT.c)
+// Clear 4 or 8 bytes of the frame, to give an inlined method's locals the zero a real call would                H0 = offset in the frame
+void st_zero4(void) { *(U32*)(FP + H0) = 0; }
+void st_zero8(void) { *(unsigned long*)(FP + H0) = 0; }
+// callvirt of a method that is not virtual still has to check `this`, which is (the size of the arguments) below the top of the stack:
+// the reference at that depth must not be null (a null one jumps to HOLE1, the NullReferenceException exit)      H0 = minus that depth
+void st_chkthis(void) { __asm__ volatile("mov HOLE0(%%r12), %%rax\n\ttest %%rax, %%rax\n\tjz HOLE1" ::: "rax", "cc"); }
+
+// ---- 8-byte fields (long, double, references), and the address of a field
+// ldfld of an 8-byte field: the object (or address) is replaced by the field's value.   H0 = the field's offset;  null: HOLE1
+void st_ldfld8(void) {
+	__asm__ volatile(
+		"mov -8(%%r12), %%rax\n\t"
+		"test %%rax, %%rax\n\t"
+		"jz HOLE1\n\t"
+		"mov HOLE0(%%rax), %%rax\n\t"
+		"mov %%rax, -8(%%r12)"
+		::: "rax", "memory", "cc");
+}
+// stfld of an 8-byte value: pop the value and then the object.                          H0 = the field's offset;  null: HOLE1
+void st_stfld8(void) {
+	__asm__ volatile(
+		"sub $16, %%r12\n\t"
+		"mov (%%r12), %%rax\n\t"
+		"test %%rax, %%rax\n\t"
+		"jz HOLE1\n\t"
+		"mov 8(%%r12), %%rdx\n\t"
+		"mov %%rdx, HOLE0(%%rax)"
+		::: "rax", "rdx", "memory", "cc");
+}
+// ldflda: the object becomes the address of the field                                   H0 = the field's offset;  null: HOLE1
+void st_ldflda(void) {
+	__asm__ volatile(
+		"mov -8(%%r12), %%rax\n\t"
+		"test %%rax, %%rax\n\t"
+		"jz HOLE1\n\t"
+		"lea HOLE0(%%rax), %%rax\n\t"
+		"mov %%rax, -8(%%r12)"
+		::: "rax", "memory", "cc");
+}
+
+// ---- long <-> float and double (the conversions are the C ones, as the interpreter's handlers are)
+void st_cvtld(void) { *(double*)(SP - 8) = (double)*(I64*)(SP - 8); }                 // conv.r8 of a long
+void st_cvtlf(void) { *(float*)(SP - 8) = (float)*(I64*)(SP - 8); SP -= 4; }          // conv.r4 of a long
+void st_cvtdl(void) { *(I64*)(SP - 8) = (I64)*(double*)(SP - 8); }                    // conv.i8 of a double
+void st_cvtfl(void) { *(I64*)(SP - 4) = (I64)*(float*)(SP - 4); SP += 4; }            // conv.i8 of a float
+
+// ---- brtrue / brfalse on a reference or pointer (8 bytes)
+void st_jt8(void) { __asm__ volatile("sub $8, %%r12\n\tcmpq $0, (%%r12)\n\tjne HOLE1" ::: "memory", "cc"); }
+void st_jf8(void) { __asm__ volatile("sub $8, %%r12\n\tcmpq $0, (%%r12)\n\tje HOLE1" ::: "memory", "cc"); }
+
+// ---- the register stencils (three-address, with a virtual evaluation stack: see tools/gen_vstencils.py and the register pass in JIT.c)
+#include "vstencils.gen.c"
