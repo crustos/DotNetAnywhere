@@ -73,6 +73,11 @@ struct tJITted_ {
 	tExceptionHeader *pExceptionHeaders;
 	// If we have debug metadata for this method, points to it
 	tDebugMetaDataEntry *pDebugMetadataEntry;
+	// If the whole body of this method became one native block with no loop and no exit but its return (see JIT.c, FuseOps),
+	// how to make that block again, so that a caller's block can contain it instead of calling it. NULL otherwise.
+	void *pRecipe;
+	// Evaluation stack that this method's own block needs for the methods it has inlined: added to maxStack
+	U32 inlineExtraStack;
 #ifdef GEN_COMBINED_OPCODES
 	// The number of bytes used by this JITted method - to include ALL bytes:
 	// The size of the opcodes, plus the size of the combined opcodes.
@@ -128,6 +133,8 @@ struct tJITCallPInvoke_ {
 	tMD_MethodDef *pMethod;
 	// The ImplMap of the function that's being called
 	tMD_ImplMap *pImplMap;
+	// If the function is in the FFI manifest, its entry (this method is then run by calling the entry's wrapper)
+	const struct tFFIEntry_ *ffi;
 };
 
 typedef struct tJITCodeInfo_ {
