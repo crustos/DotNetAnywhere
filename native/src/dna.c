@@ -192,7 +192,7 @@ doneArgs:;
 #endif
 #ifdef DIAG_OPCODE_USE
 	{
-		I32 howMany = 25;
+		I32 howMany = getenv("DNA_OPCODE_TOP") != NULL ? atoi(getenv("DNA_OPCODE_TOP")) : 25;   // how many opcodes to list
 		U32 i, j;
 		printf("\nOpcode use:\n");
 		for (j=1; howMany>0; howMany--, j++) {
