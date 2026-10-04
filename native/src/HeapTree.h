@@ -1,6 +1,4 @@
-// C API for the heap-tracking tree. Implemented in cpp/HeapTree.cpp, which is
-// written in the Crust C++ subset and lowered to C by tools/cpprust.py
-// (see build.py).
+// The heap-tracking tree (HeapTree.c): an AA tree of the heap entries, ordered by address.
 
 #if !defined(__HEAPTREE_H)
 #define __HEAPTREE_H
@@ -9,12 +7,12 @@
 
 // Create the empty tree and its nil sentinel.
 void HeapTree_Init(void);
-// The sentinel that terminates every leaf. A plain global (set by
-// HeapTree_Init) because the GC compares against it in its inner loops.
+// The sentinel that terminates every leaf. A plain global (set by HeapTree_Init) because the GC
+// compares against it in its inner loops.
 extern tHeapEntry *HeapTree_NilNode;
-// Root of the tree.
-tHeapEntry* HeapTree_Root(void);
-// Add / remove a node (ordered by address).
+// The root of the tree (HeapTree_NilNode if it is empty). Read it, do not set it: Insert and Remove do.
+extern tHeapEntry *HeapTree_RootNode;
+// Add / remove a node (ordered by address). An entry is initialised (level, links, mark) as it is added.
 void HeapTree_Insert(tHeapEntry *pEntry);
 void HeapTree_Remove(tHeapEntry *pEntry);
 

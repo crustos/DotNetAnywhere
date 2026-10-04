@@ -1,5 +1,4 @@
-// Heap entry header, shared by Heap.c (C) and cpp/HeapTree.cpp (Crust C++ subset).
-// Keep this file in the intersection of C99 and the cpprust subset.
+// Heap entry header, shared by Heap.c and HeapTree.c.
 
 #if !defined(__HEAPENTRY_H)
 #define __HEAPENTRY_H

@@ -53,7 +53,7 @@ struct tSync_ {
 };
 
 // tHeapEntry (the per-allocation header) lives in HeapEntry.h; the address-ordered
-// tree that tracks them is the C++ class in cpp/HeapTree.cpp (see HeapTree.h).
+// tree that tracks them is in HeapTree.c (see HeapTree.h).
 
 // Get the tHeapEntry pointer when given a HEAP_PTR object
 #define GET_HEAPENTRY(heapObj) ((tHeapEntry*)(heapObj - sizeof(tHeapEntry)))
@@ -61,7 +61,7 @@ struct tSync_ {
 // Forward ref
 static void RemoveWeakRefTarget(tHeapEntry *pHeapEntry, U32 removeLongRefs);
 
-#define pHeapTreeRoot (HeapTree_Root())
+#define pHeapTreeRoot HeapTree_RootNode
 #define nil HeapTree_NilNode
 #define MAX_TREE_DEPTH 40
 
