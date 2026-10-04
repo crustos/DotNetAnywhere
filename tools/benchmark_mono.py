@@ -169,6 +169,51 @@ VEC_BOUNCE = """
     }
 """
 
+# Particles as arrays: structure of arrays (float[] positions and velocities), the layout game code uses for bulk updates, and an
+# array of structs (ldelema + a field), the other common one.
+VEC_ARRAY = """
+    const int N = 2000;
+    static long Run(int n) {
+        int count = 256;
+        float[] px = new float[count], py = new float[count], vx = new float[count], vy = new float[count];
+        for (int i = 0; i < count; i++) { px[i] = i * 0.5f; py[i] = 100f - i; vx[i] = 1f + i * 0.01f; vy[i] = -0.5f; }
+        float dt = 0.01f;
+        for (int step = 0; step < n / 16; step++) {
+            for (int i = 0; i < px.Length; i++) {
+                px[i] = px[i] + vx[i] * dt;
+                py[i] = py[i] + vy[i] * dt;
+                vy[i] = vy[i] - 9.8f * dt;
+                if (py[i] < 0f) { py[i] = 0f; vy[i] = -vy[i] * 0.9f; }
+            }
+        }
+        float sum = 0f;
+        for (int i = 0; i < px.Length; i++) sum = sum + px[i] + py[i];
+        return (long)(sum * 100f);
+    }
+"""
+
+VEC_AOS = """
+    const int N = 2000;
+    struct P { public float X, Y, VX, VY; }
+    static long Run(int n) {
+        int count = 256;
+        P[] ps = new P[count];
+        for (int i = 0; i < count; i++) { ps[i].X = i * 0.5f; ps[i].Y = 100f - i; ps[i].VX = 1f + i * 0.01f; ps[i].VY = -0.5f; }
+        float dt = 0.01f;
+        for (int step = 0; step < n / 16; step++) {
+            for (int i = 0; i < ps.Length; i++) {
+                ps[i].X = ps[i].X + ps[i].VX * dt;
+                ps[i].Y = ps[i].Y + ps[i].VY * dt;
+                ps[i].VY = ps[i].VY - 9.8f * dt;
+                if (ps[i].Y < 0f) { ps[i].Y = 0f; ps[i].VY = -ps[i].VY * 0.9f; }
+            }
+        }
+        float sum = 0f;
+        for (int i = 0; i < ps.Length; i++) sum = sum + ps[i].X + ps[i].Y;
+        return (long)(sum * 100f);
+    }
+"""
+
 INT_LOOP = """
     const int N = 2000000;
     static long Run(int n) {
@@ -397,6 +442,8 @@ BENCHMARKS = [
     ("vec_calls",     "float32 dot / lerp / quaternion-rotate called as small methods",       VEC_CALLS, True, False),
     ("vec_struct",    "Vector3 as a struct in locals: ldloca + ldfld/stfld on every access",   VEC_STRUCT, True, False),
     ("vec_class",     "particles as objects: Step() updates float fields through this",        VEC_CLASS, True, False),
+    ("vec_array",     "particles in float[] arrays (structure of arrays): integrate and bounce",   VEC_ARRAY, True, False),
+    ("vec_aos",       "particles as an array of structs (ldelema + a field): integrate and bounce", VEC_AOS, True, False),
     ("vec_bounce",    "a bouncing particle: float compares that clamp and reverse, int to float", VEC_BOUNCE, True, False),
     ("cold_methods",  "300 methods each run once: compile cost, no warm-up",               None,    False, False),
     ("exceptions",    "throw / catch / finally through 5 frames",                           EXCEPTIONS, True, False),
