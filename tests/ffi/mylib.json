@@ -1,0 +1,32 @@
+{
+  "c_files": ["mylib.c"],
+  "cflags": ["-O2"],
+  "functions": [
+    {"library": "mylib", "entry": "add_numbers",  "ret": "int",    "args": ["int", "int"]},
+    {"library": "mylib", "entry": "sum6",         "ret": "int",    "args": ["int", "int", "int", "int", "int", "int"]},
+    {"library": "mylib", "entry": "mix64",        "ret": "long",   "args": ["long", "int"]},
+    {"library": "mylib", "entry": "uclamp",       "ret": "uint",   "args": ["uint", "uint", "uint"]},
+    {"library": "mylib", "entry": "hyp2",         "ret": "double", "args": ["double", "double"]},
+    {"library": "mylib", "entry": "scalef",       "ret": "float",  "args": ["float", "float"]},
+    {"library": "mylib", "entry": "mixed",        "ret": "double", "args": ["int", "double", "long", "float", "int"]},
+    {"library": "mylib", "entry": "narrow16",     "ret": "short",  "args": ["int"]},
+    {"library": "mylib", "entry": "low8",         "ret": "byte",   "args": ["int"]},
+    {"library": "mylib", "entry": "ptr_bump",     "ret": "intptr", "args": ["intptr", "int"]},
+    {"library": "mylib", "entry": "bump_counter", "ret": "void",   "args": ["int"]},
+    {"library": "mylib", "entry": "get_counter",  "ret": "int",    "args": []},
+    {"library": "mylib", "entry": "bump_get",     "ret": "int",    "args": ["int"]},
+    {"library": "mylib", "entry": "aligned_sum",  "ret": "double", "args": ["double", "double"]},
+    {"library": "mylib", "entry": "sum_buf",      "ret": "int",    "args": ["buf:const int32_t*", "int"]},
+    {"library": "mylib", "entry": "sum_i64",      "ret": "long",   "args": ["buf:const int64_t*", "int"]},
+    {"library": "mylib", "entry": "fill_buf",     "ret": "void",   "args": ["buf:int32_t*", "int", "int"]},
+    {"library": "mylib", "entry": "dot",          "ret": "double", "args": ["buf:const double*", "buf:const double*", "int"]},
+    {"library": "mylib", "entry": "upcase",       "ret": "void",   "args": ["buf:unsigned char*", "int"]},
+    {"library": "mylib", "entry": "is_null",      "ret": "int",    "args": ["buf:const void*"]},
+    {"library": "mylib", "entry": "swap_ref",     "ret": "void",   "args": ["ref:int32_t*", "ref:int32_t*"]},
+    {"library": "mylib", "entry": "divmod",       "ret": "void",   "args": ["int", "int", "ref:int32_t*", "ref:int32_t*"]},
+    {"library": "mylib", "entry": "str_len",      "ret": "int",    "args": ["cstr"]},
+    {"library": "mylib", "entry": "str_sum",      "ret": "int",    "args": ["cstr"]},
+    {"library": "mylib", "entry": "greeting",     "ret": "cstr",   "args": ["int"]},
+    {"library": "mylib", "entry": "echo_upper",   "ret": "cstr",   "args": ["cstr"]}
+  ]
+}
