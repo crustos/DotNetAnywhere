@@ -31,10 +31,10 @@ SRC = os.path.join(ROOT, "native", "src")
 
 def heaptree_difftest():
     exe = os.path.join(BUILD, "heaptree_difftest")
-    lowered = os.path.join(BUILD, "gen", "HeapTree.c")
+    os.makedirs(BUILD, exist_ok=True)
     cmd = ["gcc", "-std=gnu99", "-O1", "-g", "-fsanitize=address,undefined",
            "-I", SRC, os.path.join(ROOT, "tests", "heaptree_difftest.c"),
-           lowered, "-o", exe]
+           os.path.join(SRC, "HeapTree.c"), "-o", exe]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode:
         print(r.stderr); return False
@@ -496,7 +496,7 @@ def stencil_alias_groups():
     return True
 
 
-TESTS = [("heaptree_difftest (C reference vs cpprust-lowered C++)", heaptree_difftest),
+TESTS = [("heaptree_difftest (the original C vs native/src/HeapTree.c)", heaptree_difftest),
          ("metadata layout (generated) is current", metadata_layout_current),
          ("native parameter reads match their signatures", internalcall_params_ok),
          ("JIT.c: no conditionally-initialised locals", jit_uninitialised_locals),

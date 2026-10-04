@@ -1,6 +1,6 @@
 // Differential test: original C Andersson tree (verbatim from the pre-port
-// Heap.c) vs. the cpprust-lowered C++ HeapTree. Same random operations on two
-// parallel node arrays; the entire tree shape must match after every step.
+// Heap.c) vs. native/src/HeapTree.c. Same random operations on two parallel
+// node arrays; the entire tree shape must match after every step.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -155,11 +155,11 @@ int main(int argc, char **argv) {
 		// bias: sometimes run a burst in one direction
 		if (step % 5000 < 1000 && live > 0 && rand() % 4) { /* extra churn handled by rand */ }
 		if (step % 7 == 0 || step < 200) {
-			int n = walk(pHeapTreeRoot, HeapTree_Root(), 0);
+			int n = walk(pHeapTreeRoot, HeapTree_RootNode, 0);
 			if (n != live) { printf("FAIL seed=%u step=%d (count %d vs live %d)\n", seed, step, n, live); return 1; }
 		}
 	}
-	int n = walk(pHeapTreeRoot, HeapTree_Root(), 0);
+	int n = walk(pHeapTreeRoot, HeapTree_RootNode, 0);
 	if (n != live) { printf("FAIL final\n"); return 1; }
 	printf("OK seed=%u rounds=%d final_live=%d\n", seed, rounds, live);
 	return 0;
