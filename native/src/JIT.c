@@ -22,6 +22,7 @@
 #include "Sys.h"
 
 #include "JIT.h"
+#include "NativeBlocks.h"
 
 #include "JIT_OpCodes.h"
 #include "System.Runtime.InteropServices.Marshal.h"
@@ -34,6 +35,8 @@
 #include "InternalCall.h"
 #include "Heap.h"
 #include "PInvoke.h"
+#include "FFI.h"
+#include "VStack.h"
 
 #define CorILMethod_TinyFormat 0x02
 #define CorILMethod_MoreSects 0x08
@@ -108,6 +111,15 @@ static tOpWord Translate(U32 op, U32 getDynamic) {
 #define PopStackType() (typeStack.ppTypes[--typeStack.ofs])
 #define PopStackTypeDontCare() typeStack.ofs--
 #define PopStackTypeMulti(number) typeStack.ofs -= number
+
+// The element size of an array whose type is `pType`, as the runtime lays it out, or 0 if pType is not known to be an array
+static U32 KnownArrayElementSize(tMD_TypeDef *pType) {
+	if (pType == NULL || !TYPE_ISARRAY(pType)) {
+		return 0;
+	}
+	MetaData_Fill_TypeDef(pType->pArrayElementType, NULL, NULL);
+	return pType->pArrayElementType->arrayElementSize;
+}
 #define PopStackTypeAll() typeStack.ofs = 0;
 
 #define MayCopyTypeStack() if (u32Value > cilOfs) ppTypeStacks[u32Value] = DeepCopyTypeStack(&typeStack)
@@ -306,6 +318,1120 @@ static int ConvSourceIsUnsigned(U32 op) {
 	return ConvOvfTarget(op, &isUn) >= 0 && isUn;
 }
 
+
+// ---------------------------------------------------------------------------------------------------------------
+// Fusing instructions. JITit has translated the method one CIL instruction at a time; this pass, run before the branch
+// targets are converted from CIL offsets, replaces short runs that have a fused equivalent (see tools/gen_fused_ops.py:
+// `ldloc a; ldloc b; add` becomes one instruction that reads both locals) with that one instruction. A run is never
+// fused across anything that could be jumped to or that marks a region boundary, so no jump can land inside one:
+//  * every branch target (all of them are in `branchOffsets` by now, backward ones too),
+//  * the start and end of every try block, handler and filter,
+//  * an instruction that carries a debugger sequence point.
+// Compacting shifts every op offset after a fusion, so pJITOffsets, the recorded branch-operand positions and the
+// sequence points are all remapped. DNA_NO_FUSION=1 turns the pass off.
+// ---------------------------------------------------------------------------------------------------------------
+#define FUSED_TABLES
+#include "JIT_Fused.gen.h"
+#undef FUSED_TABLES
+
+#define NUM_FUSED_BINS ((U32)(sizeof(fusedBins) / sizeof(fusedBins[0])))
+#define NUM_FUSED_BCCS ((U32)(sizeof(fusedBccs) / sizeof(fusedBccs[0])))
+
+// Instructions that a native block does not compile but gives to the interpreter, which runs the one instruction and hands back (an
+// "island": the block leaves by an exit to a stub [the instruction][JIT_NATIVE_RESUME block entry], and is entered again after it). Any
+// instruction could be, because the evaluation stack is in memory; these are the ones that do not use the frame's own offsets or the
+// op stream's positions (so they can be copied as they are). Every alias of a handler is listed (see stencil_alias_groups).
+#define MAX_ISLAND_OPS 64
+static const U32 islandOps[] = {
+	JIT_CALL_O, JIT_CALL_PTR, JIT_CALLVIRT_O, JIT_CALL_INTERFACE, JIT_THROW, JIT_NEWOBJECT, JIT_NEWOBJECT_VALUETYPE, JIT_FFI_CALL,
+	JIT_CAST_CLASS, JIT_IS_INSTANCE, JIT_UNBOX2OBJECT, JIT_UNBOX2VALUETYPE, JIT_LOAD_STRING,
+	JIT_BOX_INT64, JIT_BOX_INT32, JIT_BOX_INTNATIVE, JIT_BOX_F32, JIT_BOX_PTR, JIT_BOX_O, JIT_BOX_F64, JIT_BOX_VALUETYPE,
+	JIT_LOADSTATICFIELD_CHECKTYPEINIT_INT64, JIT_LOADSTATICFIELD_CHECKTYPEINIT_INT32, JIT_LOADSTATICFIELD_CHECKTYPEINIT_INTNATIVE,
+	JIT_LOADSTATICFIELD_CHECKTYPEINIT_F32, JIT_LOADSTATICFIELD_CHECKTYPEINIT_PTR, JIT_LOADSTATICFIELD_CHECKTYPEINIT_O,
+	JIT_LOADSTATICFIELD_CHECKTYPEINIT_F64, JIT_LOADSTATICFIELD_CHECKTYPEINIT_VALUETYPE,
+	JIT_LOADSTATICFIELD_INT64, JIT_LOADSTATICFIELD_INT32, JIT_LOADSTATICFIELD_INTNATIVE, JIT_LOADSTATICFIELD_F32,
+	JIT_LOADSTATICFIELD_PTR, JIT_LOADSTATICFIELD_O, JIT_LOADSTATICFIELD_F64,
+	JIT_STORESTATICFIELD_INT64, JIT_STORESTATICFIELD_INT32, JIT_STORESTATICFIELD_INTNATIVE, JIT_STORESTATICFIELD_F32,
+	JIT_STORESTATICFIELD_F64, JIT_STORESTATICFIELD_PTR, JIT_STORESTATICFIELD_O, JIT_STORESTATICFIELD_VALUETYPE };
+#define NUM_ISLAND_OPS ((int)(sizeof(islandOps) / sizeof(islandOps[0])))
+
+// Instructions with no operand that are one stencil each (long and double arithmetic, the conversions that change the size),
+// in the order of simpleStencils in StencilIdFor
+#define NUM_SIMPLE_OPS 26
+static const U32 simpleOps[NUM_SIMPLE_OPS] = {
+	JIT_ADD_I64I64, JIT_SUB_I64I64, JIT_MUL_I64I64, JIT_AND_I64I64, JIT_OR_I64I64, JIT_XOR_I64I64, JIT_SHL_I64, JIT_SHR_I64,
+	JIT_SHR_UN_I64, JIT_NEG_I64, JIT_ADD_F64F64, JIT_SUB_F64F64, JIT_MUL_F64F64, JIT_DIV_F64F64, JIT_NEG_F64,
+	JIT_CONV_I32_I64, JIT_CONV_U32_I64, JIT_CONV_I32_R64, JIT_CONV_R32_R64, JIT_CONV_R64_R32,
+	JIT_CONV_I32_U64, JIT_CONV_U32_U64, JIT_CONV_I64_R64, JIT_CONV_I64_R32, JIT_CONV_R64_I64, JIT_CONV_R32_I64 };      // (these two are cvtul as well: one handler body, but not one address)
+// The long and double compare-and-branches, in the order of the stencils that do them
+static const U32 lbccOps[6] = { JIT_BEQ_I64I64, JIT_BGE_I64I64, JIT_BGT_I64I64, JIT_BLE_I64I64, JIT_BLT_I64I64, JIT_BNE_UN_I64I64 };
+static const U32 dbccOps[10] = { JIT_BEQ_F64F64, JIT_BNE_UN_F64F64, JIT_BLT_F64F64, JIT_BLE_F64F64, JIT_BGT_F64F64,
+	JIT_BGE_F64F64, JIT_BLT_UN_F64F64, JIT_BLE_UN_F64F64, JIT_BGT_UN_F64F64, JIT_BGE_UN_F64F64 };
+
+// The float32 compare-and-branch instructions, in the order of the stencils that do them (see StencilIdFor)
+static const U32 fbccOps[10] = { JIT_BEQ_F32F32, JIT_BNE_UN_F32F32, JIT_BLT_F32F32, JIT_BLE_F32F32, JIT_BGT_F32F32,
+	JIT_BGE_F32F32, JIT_BLT_UN_F32F32, JIT_BLE_UN_F32F32, JIT_BGT_UN_F32F32, JIT_BGE_UN_F32F32 };
+
+enum { K_OTHER = 0, K_LOADL, K_CONSTI, K_CONSTF, K_STOREL, K_BIN, K_BCC, K_FNEG,
+	K_LDA, K_LDP, K_STP, K_DUP4, K_DUP8, K_LDFLD4, K_STFLD4, K_BR, K_BRT, K_BRF, K_FBCC, K_CVTIF, K_CVTFI,
+	K_LDELEM4, K_LDELEMU1, K_LDELEMB4, K_STELEM4, K_STELEM1, K_LDELEMA, K_LDLEN, K_CVTII, K_CVTMASK,
+	K_SIMPLE, K_LDC8, K_CVTLI, K_CVTDI, K_LBCC, K_DBCC,
+	K_CALLD, K_CALLVIRTD, K_RET, K_LDFLD8, K_STFLD8, K_LDFLDA, K_ISLAND, K_BRT8, K_BRF8, K_FFI };
+
+static struct {
+	int ready;
+	tOpWord loadSlot[8], storeSlot[8], constI[4];
+	tOpWord load32a, load32b, store32a, store32b, loadI32, loadF32;
+	tOpWord bin[sizeof(fusedBins) / sizeof(fusedBins[0])];
+	tOpWord bcc[sizeof(fusedBccs) / sizeof(fusedBccs[0])];
+	tOpWord inc, load2, negF32;
+	tOpWord lda, ldp[5], stp[5], dup4, dup8, ldfld4, stfld4[2], br, brt, brf, cvtif, cvtfi;
+	tOpWord fbcc[10];
+	tOpWord simple[NUM_SIMPLE_OPS], lbcc[6], dbcc[10], ldc8[2], cvtli[2], cvtdi;
+	tOpWord callO, callPtr, callvirtO, ret, ldfld8, stfld8[5], ldflda, loadString, loadStringMd, brt8, brf8, ffiCall;
+	tOpWord island[MAX_ISLAND_OPS];
+	tOpWord ldelem4[3], ldelemu1, ldelemb4, stelem4, stelem1, ldelema, ldlen, cvtii[2], cvtmask[2];
+	U32 addIdx, subIdx;
+} fc;
+
+static void InitFuseCodes(void) {
+	U32 i;
+	for (i = 0; i < 8; i++) {
+		fc.loadSlot[i] = Translate(JIT_LOADPARAMLOCAL_0 + i, 0);
+		fc.storeSlot[i] = Translate(JIT_STOREPARAMLOCAL_0 + i, 0);
+	}
+	for (i = 0; i < 4; i++) {
+		fc.constI[i] = Translate(JIT_LOAD_I4_M1 + i, 0);
+	}
+	fc.load32a = Translate(JIT_LOADPARAMLOCAL_INT32, 0);   // INT32 and F32 share one handler: both copy 4 bytes
+	fc.load32b = Translate(JIT_LOADPARAMLOCAL_F32, 0);
+	fc.store32a = Translate(JIT_STOREPARAMLOCAL_INT32, 0);
+	fc.store32b = Translate(JIT_STOREPARAMLOCAL_F32, 0);
+	fc.loadI32 = Translate(JIT_LOAD_I32, 0);
+	fc.loadF32 = Translate(JIT_LOAD_F32, 0);
+	fc.addIdx = fc.subIdx = 0xffffffff;
+	for (i = 0; i < NUM_FUSED_BINS; i++) {
+		fc.bin[i] = Translate(fusedBins[i].op, 0);
+		if (fusedBins[i].op == FUSED_ADD_OP) { fc.addIdx = i; }
+		if (fusedBins[i].op == FUSED_SUB_OP) { fc.subIdx = i; }
+	}
+	for (i = 0; i < NUM_FUSED_BCCS; i++) {
+		fc.bcc[i] = Translate(fusedBccs[i].op, 0);
+	}
+	fc.inc = Translate(JIT_FUSED_INC_L, 0);
+	fc.load2 = Translate(JIT_FUSED_LOAD2, 0);
+	fc.negF32 = Translate(JIT_NEG_F32, 0);
+	fc.lda = Translate(JIT_LOAD_PARAMLOCAL_ADDR, 0);
+	fc.ldp[0] = Translate(JIT_LOADPARAMLOCAL_O, 0);          // (these share one handler, but do not rely on it)
+	fc.ldp[1] = Translate(JIT_LOADPARAMLOCAL_PTR, 0);
+	fc.ldp[2] = Translate(JIT_LOADPARAMLOCAL_INTNATIVE, 0);
+	fc.stp[0] = Translate(JIT_STOREPARAMLOCAL_O, 0);
+	fc.stp[1] = Translate(JIT_STOREPARAMLOCAL_PTR, 0);
+	fc.stp[2] = Translate(JIT_STOREPARAMLOCAL_INTNATIVE, 0);
+	fc.dup4 = Translate(JIT_DUP_4, 0);
+	fc.dup8 = Translate(JIT_DUP_8, 0);
+	fc.ldfld4 = Translate(JIT_LOADFIELD_4, 0);
+	fc.br = Translate(JIT_BRANCH, 0);
+	for (i = 0; i < 10; i++) { fc.fbcc[i] = Translate(fbccOps[i], 0); }
+	fc.cvtif = Translate(JIT_CONV_I32_R32, 0);
+	for (i = 0; i < NUM_SIMPLE_OPS; i++) { fc.simple[i] = Translate(simpleOps[i], 0); }
+	for (i = 0; i < 6; i++) { fc.lbcc[i] = Translate(lbccOps[i], 0); }
+	for (i = 0; i < 10; i++) { fc.dbcc[i] = Translate(dbccOps[i], 0); }
+	// Instructions that share a handler body do NOT share an address (the labels are separate), so every one the JIT can emit
+	// for a stencil's meaning is compared, not just one of them
+	fc.ldc8[0] = Translate(JIT_LOAD_I64, 0);
+	fc.ldc8[1] = Translate(JIT_LOAD_F64, 0);
+	fc.cvtli[0] = Translate(JIT_CONV_I64_I32, 0);
+	fc.cvtli[1] = Translate(JIT_CONV_U64_I32, 0);
+	fc.cvtdi = Translate(JIT_CONV_R64_I32, 0);
+	fc.callO = Translate(JIT_CALL_O, 0);
+	fc.callPtr = Translate(JIT_CALL_PTR, 0);
+	fc.callvirtO = Translate(JIT_CALLVIRT_O, 0);
+	fc.ret = Translate(JIT_RETURN, 0);
+	fc.ldfld8 = Translate(JIT_LOADFIELD, 0);                  // the general field load: used here only for 8-byte fields
+	fc.stfld8[0] = Translate(JIT_STOREFIELD_INT64, 0);
+	fc.stfld8[1] = Translate(JIT_STOREFIELD_F64, 0);
+	fc.stfld8[2] = Translate(JIT_STOREFIELD_O, 0);
+	fc.stfld8[3] = Translate(JIT_STOREFIELD_INTNATIVE, 0);
+	fc.stfld8[4] = Translate(JIT_STOREFIELD_PTR, 0);
+	fc.ldflda = Translate(JIT_LOAD_FIELD_ADDR, 0);
+	fc.loadString = Translate(JIT_LOAD_STRING, 0);
+	fc.ffiCall = Translate(JIT_FFI_CALL, 0);
+	fc.brt8 = Translate(JIT_BRANCH_TRUE_PTR, 0);
+	fc.brf8 = Translate(JIT_BRANCH_FALSE_PTR, 0);
+	fc.loadStringMd = Translate(JIT_LOAD_STRING_MD, 0);
+	for (i = 0; i < MAX_ISLAND_OPS; i++) { fc.island[i] = 0; }
+	for (i = 0; i < (U32)NUM_ISLAND_OPS; i++) {
+		// (a handler that does not exist in this build is simply not an island)
+		fc.island[i] = (islandOps[i] < JIT_OPCODE_MAXNUM && jitCodeInfo[islandOps[i]].pEnd != NULL) ? Translate(islandOps[i], 0) : 0;
+	}
+	fc.ldp[3] = Translate(JIT_LOADPARAMLOCAL_INT64, 0);    // a long and a double are 8-byte copies, as a reference is
+	fc.ldp[4] = Translate(JIT_LOADPARAMLOCAL_F64, 0);
+	fc.stp[3] = Translate(JIT_STOREPARAMLOCAL_INT64, 0);
+	fc.stp[4] = Translate(JIT_STOREPARAMLOCAL_F64, 0);
+	fc.ldelem4[0] = Translate(JIT_LOAD_ELEMENT_I32, 0);     // .i4, .u4 and .r4: all load 4 bytes, but they are three instructions
+	fc.ldelem4[1] = Translate(JIT_LOAD_ELEMENT_U32, 0);     // (their handlers are one piece of code, yet ldelem.r4 did not match
+	fc.ldelem4[2] = Translate(JIT_LOAD_ELEMENT_R32, 0);     // the I32 address, so each is compared)
+	fc.ldelemu1 = Translate(JIT_LOAD_ELEMENT_U8_1, 0);        // (not JIT_LOAD_ELEMENT_U8: that one looks at the array at run time)
+	fc.ldelemb4 = Translate(JIT_LOAD_ELEMENT_U8_4, 0);
+	fc.stelem4 = Translate(JIT_STORE_ELEMENT_I4, 0);
+	fc.stelem1 = Translate(JIT_STORE_ELEMENT_I1, 0);
+	fc.ldelema = Translate(JIT_LOAD_ELEMENT_ADDR_N, 0);
+	fc.ldlen = Translate(JIT_LOAD_VECTOR_LEN, 0);
+	fc.cvtii[0] = Translate(JIT_CONV_I32_I32, 0);
+	fc.cvtii[1] = Translate(JIT_CONV_U32_I32, 0);
+	fc.cvtmask[0] = Translate(JIT_CONV_I32_U32, 0);
+	fc.cvtmask[1] = Translate(JIT_CONV_U32_U32, 0);
+	fc.cvtfi = Translate(JIT_CONV_R32_I32, 0);
+	fc.brt = Translate(JIT_BRANCH_TRUE, 0);
+	fc.brf = Translate(JIT_BRANCH_FALSE, 0);
+	fc.stfld4[0] = Translate(JIT_STOREFIELD_INT32, 0);
+	fc.stfld4[1] = Translate(JIT_STOREFIELD_F32, 0);
+	fc.ready = 1;
+}
+
+// What a CIL instruction was translated to, judged by the address of its first op and its length in words
+// The stencils that put the address of a C function in r11 (generated with the FFI stencils: a build with no manifest has none)
+static int ffiStFnLo = -2, ffiStFnHi = -2;
+static int FfiStencilIds(void) {
+	if (ffiStFnLo == -2) {
+		ffiStFnLo = NativeBlock_FindStencil("fnlo");
+		ffiStFnHi = NativeBlock_FindStencil("fnhi");
+	}
+	return ffiStFnLo >= 0 && ffiStFnHi >= 0;
+}
+
+static int ClassifyOps(const tOpWord *p, U32 len, U32 *pVal, U32 *pIdx) {
+	U32 i;
+	if (p[0] == fc.callO || p[0] == fc.callPtr) { return K_CALLD; }       // (the callee is the operand, read where it is used)
+	if (p[0] == fc.callvirtO) { return K_CALLVIRTD; }
+	if (p[0] == fc.ffiCall && len == 2 && FfiStencilIds()) {
+		// a call of a C function from the FFI manifest, if there is a stencil that makes it (else it is an island, below)
+		const tFFIEntry *pFfi = (const tFFIEntry*)p[1];
+		if (pFfi->stencil != NULL && NativeBlock_FindStencil(pFfi->stencil) >= 0) { return K_FFI; }
+	}
+	for (i = 0; i < (U32)NUM_ISLAND_OPS; i++) {
+		if (fc.island[i] != 0 && p[0] == fc.island[i]) { return K_ISLAND; }
+	}
+	if (len == 1) {
+		for (i = 0; i < 8; i++) {
+			if (p[0] == fc.loadSlot[i]) { *pVal = i * 4; return K_LOADL; }
+			if (p[0] == fc.storeSlot[i]) { *pVal = i * 4; return K_STOREL; }
+		}
+		for (i = 0; i < 4; i++) {
+			if (p[0] == fc.constI[i]) { *pVal = (U32)((I32)i - 1); return K_CONSTI; }
+		}
+		for (i = 0; i < NUM_FUSED_BINS; i++) {
+			if (p[0] == fc.bin[i]) { *pIdx = i; return K_BIN; }
+		}
+		if (p[0] == fc.negF32) { return K_FNEG; }
+		if (p[0] == fc.dup4) { return K_DUP4; }
+		if (p[0] == fc.dup8) { return K_DUP8; }
+		if (p[0] == fc.cvtif) { return K_CVTIF; }
+		if (p[0] == fc.ret) { return K_RET; }
+		for (i = 0; i < NUM_SIMPLE_OPS; i++) {
+			if (p[0] == fc.simple[i]) { *pIdx = i; return K_SIMPLE; }
+		}
+		if (p[0] == fc.ldelem4[0] || p[0] == fc.ldelem4[1] || p[0] == fc.ldelem4[2]) { return K_LDELEM4; }
+		if (p[0] == fc.ldelemu1) { return K_LDELEMU1; }
+		if (p[0] == fc.ldelemb4) { return K_LDELEMB4; }
+		if (p[0] == fc.stelem4) { return K_STELEM4; }
+		if (p[0] == fc.stelem1) { return K_STELEM1; }
+		if (p[0] == fc.ldlen) { return K_LDLEN; }
+	} else if (len == 2) {
+		if (p[0] == fc.load32a || p[0] == fc.load32b) { *pVal = (U32)p[1]; return K_LOADL; }
+		if (p[0] == fc.store32a || p[0] == fc.store32b) { *pVal = (U32)p[1]; return K_STOREL; }
+		if (p[0] == fc.loadI32) { *pVal = (U32)p[1]; return K_CONSTI; }
+		if (p[0] == fc.loadF32) { *pVal = (U32)p[1]; return K_CONSTF; }
+		if (p[0] == fc.lda) { *pVal = (U32)p[1]; return K_LDA; }
+		for (i = 0; i < 5; i++) {
+			if (p[0] == fc.ldp[i]) { *pVal = (U32)p[1]; return K_LDP; }
+			if (p[0] == fc.stp[i]) { *pVal = (U32)p[1]; return K_STP; }
+		}
+		if (p[0] == fc.ldc8[0] || p[0] == fc.ldc8[1]) { return K_LDC8; }
+		if (p[0] == fc.callO || p[0] == fc.callPtr) { return K_CALLD; }       // the callee is the operand (read where it is used)
+		if (p[0] == fc.callvirtO) { return K_CALLVIRTD; }                            // the 64 bits are the operand word (read in EmitBlock)
+		if (p[0] == fc.cvtli[0] || p[0] == fc.cvtli[1]) { *pVal = (U32)p[1]; return K_CVTLI; }       // val: the narrowing shift
+		if (p[0] == fc.cvtdi) { *pVal = (U32)p[1]; return K_CVTDI; }
+		for (i = 0; i < 6; i++) {
+			if (p[0] == fc.lbcc[i]) { *pIdx = i; *pVal = (U32)p[1]; return K_LBCC; }
+		}
+		for (i = 0; i < 10; i++) {
+			if (p[0] == fc.dbcc[i]) { *pIdx = i; *pVal = (U32)p[1]; return K_DBCC; }
+		}
+		if (p[0] == fc.ldfld4) { *pVal = (U32)p[1]; return K_LDFLD4; }
+		if (p[0] == fc.ldflda) { *pVal = (U32)p[1]; return K_LDFLDA; }
+		if (p[0] == fc.ldfld8) {
+			// the general load: only an 8-byte field is done here, and its offset is only known once its type has been filled in
+			tMD_FieldDef *pField = (tMD_FieldDef*)p[1];
+			if (pField != NULL && pField->pParentType != NULL && pField->pParentType->isFilled && pField->memSize == 8) {
+				*pVal = pField->memOffset;
+				return K_LDFLD8;
+			}
+			return K_OTHER;
+		}
+		for (i = 0; i < 5; i++) {
+			if (p[0] == fc.stfld8[i]) {
+				tMD_FieldDef *pField = (tMD_FieldDef*)p[1];
+				if (pField != NULL && pField->pParentType != NULL && pField->pParentType->isFilled) {
+					*pVal = pField->memOffset;
+					return K_STFLD8;
+				}
+				return K_OTHER;
+			}
+		}
+		if (p[0] == fc.stfld4[0] || p[0] == fc.stfld4[1]) {
+			// the operand is the field; its offset is only known once its type has been filled in
+			tMD_FieldDef *pField = (tMD_FieldDef*)p[1];
+			if (pField != NULL && pField->pParentType != NULL && pField->pParentType->isFilled) {
+				*pVal = pField->memOffset;
+				return K_STFLD4;
+			}
+			return K_OTHER;
+		}
+		if (p[0] == fc.cvtfi) { *pVal = (U32)p[1]; return K_CVTFI; }       // val: the narrowing shift
+		if (p[0] == fc.ldelema) { *pVal = (U32)p[1]; return K_LDELEMA; }   // val: the element size
+		if (p[0] == fc.cvtii[0] || p[0] == fc.cvtii[1]) { *pVal = (U32)p[1]; return K_CVTII; }       // val: the shift
+		if (p[0] == fc.cvtmask[0] || p[0] == fc.cvtmask[1]) { *pVal = (U32)p[1]; return K_CVTMASK; }   // val: the mask
+		for (i = 0; i < 10; i++) {
+			if (p[0] == fc.fbcc[i]) { *pIdx = i; *pVal = (U32)p[1]; return K_FBCC; }
+		}
+		if (p[0] == fc.br) { *pVal = (U32)p[1]; return K_BR; }
+		if (p[0] == fc.brt) { *pVal = (U32)p[1]; return K_BRT; }
+		if (p[0] == fc.brt8) { *pVal = (U32)p[1]; return K_BRT8; }
+		if (p[0] == fc.brf8) { *pVal = (U32)p[1]; return K_BRF8; }
+		if (p[0] == fc.brf) { *pVal = (U32)p[1]; return K_BRF; }
+		for (i = 0; i < NUM_FUSED_BCCS; i++) {
+			if (p[0] == fc.bcc[i]) { *pIdx = i; *pVal = (U32)p[1]; return K_BCC; }    // val: the target, a CIL offset
+		}
+	}
+	return K_OTHER;
+}
+
+#if NATIVE_BLOCKS
+// Native blocks: which stencil does an instruction have (or -1), and how long a run of them may a block be.
+// A block costs a call out of the interpreter and back, so a short straight run is better left to the interpreter and its
+// fused instructions; but a run that contains a loop pays that once for all its iterations, so it is worth a much shorter one.
+#define BLOCK_MIN_LOOP 6
+#define BLOCK_MAX 2048
+static U32 BlockMinStraight(void) {
+	static int v = -1;
+	if (v < 0) { v = getenv("DNA_BLOCK_MIN") != NULL ? atoi(getenv("DNA_BLOCK_MIN")) : 8; }
+	return (U32)v;
+}
+static int StencilIdFor(int kind, U32 idx) {
+	switch (kind) {
+	case K_LOADL: return ST_LDL;
+	case K_STOREL: return ST_STL;
+	case K_CONSTI:
+	case K_CONSTF: return ST_LDC;
+	case K_FNEG: return ST_FNEG;
+	case K_LDA: return ST_LDA;
+	case K_LDP: return ST_LDP;
+	case K_STP: return ST_STP;
+	case K_DUP4: return ST_DUP4;
+	case K_DUP8: return ST_DUP8;
+	case K_LDFLD4: return ST_LDFLD4;
+	case K_STFLD4: return ST_STFLD4;
+	case K_LDFLD8: return ST_LDFLD8;
+	case K_STFLD8: return ST_STFLD8;
+	case K_LDFLDA: return ST_LDFLDA;
+	case K_FBCC: {
+		static const int fbccStencils[10] = { ST_JFEQ, ST_JFNE, ST_JFLT, ST_JFLE, ST_JFGT, ST_JFGE, ST_JFLT_UN, ST_JFLE_UN, ST_JFGT_UN, ST_JFGE_UN };
+		return fbccStencils[idx];
+	}
+	case K_CVTIF: return ST_CVTIF;
+	case K_SIMPLE: {
+		static const int simpleStencils[NUM_SIMPLE_OPS] = { ST_LADD, ST_LSUB, ST_LMUL, ST_LAND, ST_LOR, ST_LXOR, ST_LSHL, ST_LSHR,
+			ST_LSHRUN, ST_LNEG, ST_DADD, ST_DSUB, ST_DMUL, ST_DDIV, ST_DNEG, ST_CVTIL, ST_CVTUL, ST_CVTID, ST_CVTFD, ST_CVTDF,
+			ST_CVTUL, ST_CVTUL, ST_CVTLD, ST_CVTLF, ST_CVTDL, ST_CVTFL };
+		return simpleStencils[idx];
+	}
+	case K_FFI: return ST_LDL;           // (a placeholder: EmitBlock makes three stencils of it)
+	case K_ISLAND: return ST_J;          // an island leaves the block by an exit: an unconditional jump to it
+	case K_CALLD:
+	case K_CALLVIRTD: return ST_LDL;     // (a placeholder: only calls with a recipe keep this kind; EmitBlock splices the callee in)
+	case K_LDC8: return ST_LDC8LO;       // (EmitBlock makes it a pair: the low half, then the high half)
+	case K_CVTLI: return ST_CVTLI;
+	case K_CVTDI: return ST_CVTDI;
+	case K_LBCC: {
+		static const int lbccStencils[6] = { ST_LBEQ, ST_LBGE, ST_LBGT, ST_LBLE, ST_LBLT, ST_LBNE };
+		return lbccStencils[idx];
+	}
+	case K_DBCC: {
+		static const int dbccStencils[10] = { ST_JDEQ, ST_JDNE, ST_JDLT, ST_JDLE, ST_JDGT, ST_JDGE, ST_JDLT_UN, ST_JDLE_UN, ST_JDGT_UN, ST_JDGE_UN };
+		return dbccStencils[idx];
+	}
+	case K_LDELEM4: return ST_LDELEM4;
+	case K_LDELEMU1: return ST_LDELEMU1;
+	case K_LDELEMB4: return ST_LDELEMB4;
+	case K_STELEM4: return ST_STELEM4;
+	case K_STELEM1: return ST_STELEM1;
+	case K_LDELEMA: return ST_LDELEMA;
+	case K_LDLEN: return ST_LDLEN;
+	case K_CVTII: return ST_CVTII;
+	case K_CVTMASK: return ST_CVTMASK;
+	case K_CVTFI: return ST_CVTFI;
+	case K_BR: return ST_J;
+	case K_BRT8: return ST_JT8;
+	case K_BRF8: return ST_JF8;
+	case K_BRT: return ST_JT;
+	case K_BRF: return ST_JF;
+	case K_BCC:
+		switch (fusedBccs[idx].op) {
+		case JIT_BEQ_I32I32: return ST_JEQ;
+		case JIT_BGE_I32I32: return ST_JGE;
+		case JIT_BGT_I32I32: return ST_JGT;
+		case JIT_BLE_I32I32: return ST_JLE;
+		case JIT_BLT_I32I32: return ST_JLT;
+		case JIT_BNE_UN_I32I32: return ST_JNE;
+		}
+		return -1;
+	case K_BIN:
+		switch (fusedBins[idx].op) {
+		case JIT_ADD_F32F32: return ST_FADD;
+		case JIT_SUB_F32F32: return ST_FSUB;
+		case JIT_MUL_F32F32: return ST_FMUL;
+		case JIT_DIV_F32F32: return ST_FDIV;
+		case JIT_ADD_I32I32: return ST_IADD;
+		case JIT_SUB_I32I32: return ST_ISUB;
+		case JIT_MUL_I32I32: return ST_IMUL;
+		case JIT_AND_I32I32: return ST_IAND;
+		case JIT_OR_I32I32: return ST_IOR;
+		case JIT_XOR_I32I32: return ST_IXOR;
+		case JIT_SHL_I32: return ST_ISHL;
+		case JIT_SHR_I32: return ST_ISHR;
+		case JIT_SHR_UN_I32: return ST_ISHRUN;
+		}
+	}
+	return -1;
+}
+
+// A method whose whole body is one loop-free native block that leaves only by returning can be made into a block again somewhere else:
+// these are its stencils, their holes, and where they branch (to each other: -1 where they do not). A caller's block then contains
+// the callee instead of calling it (see InlineRecipeFor and EmitBlock).
+typedef struct {
+	U32 n; unsigned *ids; U32 *holes; int *tgt;
+	// The islands in it: which stencil is the exit for each, and the words of the instruction the interpreter runs there (an ldstr has been
+	// made one that carries its own metadata). Nothing else leaves a recipe.
+	U32 numIslands; U32 *islandAt; tOpWord **islandWords; U32 *islandLen;
+	// Some stencil branches to the method's own return, which in a recipe is the end of it: tgt is n, and the caller puts a stencil there
+	int hasEnd;
+} tBlockRecipe;
+
+// The stencils whose hole is an offset in the frame: the ones that have to move when the callee's frame becomes part of the caller's
+static int IsFrameStencil(unsigned id) {
+	return id == ST_LDL || id == ST_STL || id == ST_LDP || id == ST_STP || id == ST_LDA || id == ST_ZERO4 || id == ST_ZERO8;
+}
+
+#define METHODIMPL_NOINLINING 0x0008
+#define MAX_INLINE_STENCILS 160
+
+// The recipe for the method `m` that a block may contain in place of a call to it, or NULL. A call is inlinable if its target is known
+// now (a virtual method's is not), the target's whole body is a block with a recipe (so it calls nothing, allocates nothing, has no
+// exception handler), and it is not being compiled at this moment (that is recursion). The callee is compiled now if it has not been yet.
+// DNA_NO_INLINE=1 turns this off.
+static tBlockRecipe* InlineRecipeFor1(tMD_MethodDef *m, int isCallvirt, tMD_MethodDef *caller, int allowIslands, const char **why);
+static tBlockRecipe* InlineRecipeFor(tMD_MethodDef *m, int isCallvirt, tMD_MethodDef *caller, int allowIslands) {
+	const char *why = "inlined";
+	tBlockRecipe *r = InlineRecipeFor1(m, isCallvirt, caller, allowIslands, &why);
+	if (getenv("DNA_FUSION_DEBUG") != NULL && m != NULL) {
+		fprintf(stderr, "  call to %s.%s: %s\n", m->pParentType != NULL ? m->pParentType->name : "?", m->name, r != NULL ? "INLINED" : why);
+	}
+	return r;
+}
+static tBlockRecipe* InlineRecipeFor1(tMD_MethodDef *m, int isCallvirt, tMD_MethodDef *caller, int allowIslands, const char **why) {
+	static int disabled = -1;
+	tJITted *j;
+	if (disabled < 0) { disabled = (getenv("DNA_NO_INLINE") != NULL); }
+	if (disabled || !NativeBlock_Enabled() || m == NULL || m == caller || m->pParentType == NULL || !m->isFilled) {
+		*why = "inlining is off, or the callee is not ready"; return NULL;
+	}
+	// A virtual method has one possible target if nothing can override it: it is final (a method that implements an interface is virtual final),
+	// or its class is sealed.
+	if (isCallvirt && METHOD_ISVIRTUAL(m) && !(m->flags & 0x0020 /* final */) && !(m->pParentType->flags & 0x0100 /* sealed */)) {
+		*why = "virtual: the target depends on the object"; return NULL;
+	}
+	if ((m->implFlags & (METHODIMPLATTRIBUTES_INTERNALCALL | METHODIMPLATTRIBUTES_CODETYPE_MASK | METHODIMPL_NOINLINING)) != 0 ||
+			(m->flags & (0x0400 /* abstract */ | METHODATTRIBUTES_PINVOKEIMPL)) != 0) {
+		*why = "internal call, native, NoInlining, abstract or P/Invoke"; return NULL;
+	}
+	if (m->pJITted == NULL) {
+		JIT_Prepare(m, 0);
+	}
+	j = m->pJITted;
+	if (j == NULL || j->pOps == NULL) {
+		*why = "being compiled (recursion)"; return NULL;
+	}
+	if (j->pRecipe != NULL) {
+		// DNA_INLINE_LIMIT=n: allow only the first n inlines, to find by bisection which one is at fault
+		static int limit = -2, serial = 0;
+		if (limit == -2) { limit = getenv("DNA_INLINE_LIMIT") != NULL ? atoi(getenv("DNA_INLINE_LIMIT")) : -1; }
+		if (limit >= 0 && serial++ >= limit) { *why = "past DNA_INLINE_LIMIT"; return NULL; }
+	}
+	if (j->pRecipe == NULL || ((tBlockRecipe*)j->pRecipe)->n > MAX_INLINE_STENCILS) {
+		*why = j->pRecipe == NULL ? "the body is not one loop-free native block ending in ret" : "too big"; return NULL;
+	}
+	if (((tBlockRecipe*)j->pRecipe)->numIslands > 0 && !allowIslands) {
+		*why = "has islands, and the caller may not (it has exception handlers, or islands are off)"; return NULL;
+	}
+	return (tBlockRecipe*)j->pRecipe;
+}
+
+// The stubs for the islands of a method's blocks: [the instruction's own words][JIT_NATIVE_RESUME][block][entry]. They go after the last op of
+// the method, which is never fallen into, and each exit of a block that is an island is patched to point at its stub.
+typedef struct tIslandStubs_ {
+	U32 n, cap;
+	struct tIslandStub_ { const tOpWord *words; U32 len, exitWord, blockOfs, entry; } *item;
+} tIslandStubs;
+#define MAX_ISLANDS_PER_BLOCK 60
+#define ISLAND_COST 6      // how many stencils of compiled code an island has to be worth (see FindBlockRegion)
+
+typedef struct {
+	U32 numInstr;
+	const U32 *instrList, *start, *end, *val, *idx, *minSrc, *maxSrc;
+	const U8 *kind, *isHard, *isTarget;
+	const I32 *cilToInstr;          // CIL offset -> instruction number (or -1)
+	tOps *pOps;
+	tBlockRecipe * const *recipeOf; // per instruction: the callee to inline there (calls only)
+	U32 inlineBase;                 // where inlined callees' frames go: just after this method's own parameters and locals
+	U32 *pInlineFrame, *pInlineStack;   // the most frame and evaluation stack any inlined callee needs
+	struct tIslandStubs_ *pStubs;       // where the islands' stubs are collected (they are put after the end of the method's ops)
+	tMD_MethodDef *pMethodDef;          // the method these instructions are from
+} tBlockCtx;
+
+static int IsBranchKind(int kind) { return kind == K_BR || kind == K_BRT || kind == K_BRF || kind == K_BRT8 || kind == K_BRF8 || kind == K_BCC || kind == K_FBCC || kind == K_LBCC || kind == K_DBCC; }
+
+// The instructions [k, k+n) that become one native block, or n = 0. The region is the longest run of instructions with
+// stencils (branches included), cut back until it can be entered only at its start and left only through its exits:
+//  * a branch target inside the region must be reached only from inside it (every branch to it is in the region);
+//  * a try/handler/filter boundary, or an instruction with a debugger sequence point, ends it.
+// The targets of backward branches inside it are the places it can be entered again after giving up the processor.
+static U32 lastRegionRaw;        // and before the island rule too: a whole method that is a loop-free block with islands is a recipe whatever they cost
+static U32 lastRegionLength;     // how long the last region was, before the minimum size was applied (a whole method is made a recipe at any length)
+static U32 FindBlockRegion(const tBlockCtx *c, U32 k) {
+	U32 e = k, t, s, hasLoop = 0, weight = 0, islands = 0;
+	int again;
+	static int noBranches = -1;
+	if (noBranches < 0) { noBranches = (getenv("DNA_NO_BLOCK_BRANCHES") != NULL); }     // for comparing: blocks without loops
+	while (e < c->numInstr && e - k < BLOCK_MAX && StencilIdFor(c->kind[e], c->idx[e]) >= 0 &&
+			!(noBranches && IsBranchKind(c->kind[e])) && (e == k || !c->isHard[c->instrList[e]]) &&
+			(c->kind[e] != K_ISLAND || islands < MAX_ISLANDS_PER_BLOCK)) {
+		if (c->kind[e] == K_ISLAND) { islands++; }
+		e++;
+	}
+	do {
+		again = 0;
+		for (t = k + 1; t < e && !again; t++) {
+			if (c->minSrc[t] <= c->maxSrc[t] && (c->minSrc[t] < k || c->maxSrc[t] >= e)) {
+				e = t;      // something outside the region jumps to t: the region ends before it
+				again = 1;
+			}
+		}
+	} while (again);
+	// Islands cost: each one is an exit, a stub, a resume and an entry again, a good deal more than the interpreter calling something directly.
+	// So a region with islands has to have that much more compiled around them; if it does not, it ends at its first island, which makes the
+	// pieces on either side (if they are worth it) blocks of their own, as they were before islands existed.
+	lastRegionRaw = e - k;
+	for (;;) {
+		U32 numIsl = 0;
+		// (nothing outside the region may jump into the middle of it. This is checked again every time the region has been made shorter:
+		// a jump that came from inside it may now come from outside, and would land on the start of the block instead of the target.)
+		do {
+			again = 0;
+			for (t = k + 1; t < e && !again; t++) {
+				if (c->minSrc[t] <= c->maxSrc[t] && (c->minSrc[t] < k || c->maxSrc[t] >= e)) {
+					e = t;
+					again = 1;
+				}
+			}
+		} while (again);
+		hasLoop = 0; weight = 0;
+		// a block does not begin with an island (it would only leave at once) and does not end with one (it would only come back to the end)
+		while (e > k && c->kind[e - 1] == K_ISLAND) { e--; }
+		if (e > k && c->kind[k] == K_ISLAND) { lastRegionLength = 0; return 0; }
+		for (s = k; s < e; s++) {
+			if (IsBranchKind(c->kind[s])) {
+				I32 tt = c->cilToInstr[c->val[s]];
+				if (tt >= (I32)k && (U32)tt < e && (U32)tt <= s) { hasLoop = 1; }
+			}
+			// an inlinable call saves a whole call (a frame and its setup): worth a block by itself
+			weight += (c->kind[s] == K_CALLD || c->kind[s] == K_CALLVIRTD) ? 16 : (c->kind[s] == K_ISLAND ? 0 : 1);
+			if (c->kind[s] == K_ISLAND) { numIsl++; }
+		}
+		if (numIsl == 0 || weight >= (hasLoop ? BLOCK_MIN_LOOP : BlockMinStraight()) + ISLAND_COST * numIsl) { break; }
+		for (s = k; s < e && c->kind[s] != K_ISLAND; s++) { }
+		e = s;
+	}
+	lastRegionLength = e - k;
+	if (getenv("DNA_FUSION_DEBUG") != NULL && e - k >= 4) {
+		fprintf(stderr, "  region at instruction %u: %u instructions, %s, %s, ends before instruction %u (kind %d)\n", k, e - k,
+			hasLoop ? "has a loop" : "straight", (weight >= (hasLoop ? BLOCK_MIN_LOOP : BlockMinStraight())) ? "BLOCK" : "too short",
+			e, e < c->numInstr ? (int)c->kind[e] : -1);
+	}
+	return (weight >= (hasLoop ? BLOCK_MIN_LOOP : BlockMinStraight())) ? e - k : 0;
+}
+
+// Compile the region [k, k+n) and write the block instruction: [JIT_NATIVE_BLOCK][code][numExits][exit target]*
+// The exit targets are CIL offsets until the branch fixup: each is the operand word of the branch it came from, so its
+// new position is recorded in remap (and the operand words of branches that stayed inside are marked as gone).
+// A call with a recipe becomes: (for callvirt, a check of `this`), the arguments popped into the callee's frame, which is in the
+// caller's frame after its own locals, that frame's locals cleared, then the callee's stencils with their frame offsets moved there.
+// If this region is a whole method that qualifies, *ppRecipe is a recipe for it (else NULL).
+static int EmitBlock(const tBlockCtx *c, U32 k, U32 n, tOpWord *newP, U32 *pNewOfs, U32 *remap, tBlockRecipe **ppRecipe, int recipeOnly) {
+	U32 cap = 2 * n + 1, j, i, e, p;
+	unsigned *ids;
+	U32 *holes, *holes1, *holes2, *srcInstr, *stencilOf, *exitSrc, *entries;
+	U64 *pool64 = NULL;               // the 64-bit constants of the register pass
+	U32 numPool = 0;
+	int *tgt;
+	U32 nb = 0, numExits = 0, numEntries = 1, numIslands = 0, *ientry, *ilen, *exitSten, blockOfs = 0, ri;
+	char *endJump;               // per stencil: a branch to the return that follows the region (see the recipe)
+	U32 numEndJumps = 0;
+	const tOpWord **iwords;      // per stencil: if it is an island, the words of the instruction the interpreter is to run there
+	void *code;
+	int ok = 0, anyBackward = 0, entryBad = 0;      // a block with a loop in it needs the time-slice accounting
+
+	*ppRecipe = NULL;
+	for (j = 0; j < n; j++) {
+		if (c->kind[k + j] == K_FFI) { cap += 3; }
+		if (c->kind[k + j] == K_CALLD || c->kind[k + j] == K_CALLVIRTD) {
+			tMD_MethodDef *m = (tMD_MethodDef*)c->pOps->p[c->start[k + j] + 1];
+			cap += 3 + m->parameterStackSize / 4 + m->pJITted->localsStackSize / 4 + 2 + c->recipeOf[k + j]->n;
+		}
+	}
+	ids = (unsigned*)malloc(cap * sizeof(unsigned));
+	holes = (U32*)malloc(cap * sizeof(U32));
+	holes1 = (U32*)calloc(cap, sizeof(U32));        // (the second and third operands of the stencils that have them: see the register pass)
+	holes2 = (U32*)calloc(cap, sizeof(U32));
+	srcInstr = (U32*)malloc(cap * sizeof(U32));
+	stencilOf = (U32*)malloc((n + 1) * sizeof(U32));
+	exitSrc = (U32*)malloc(cap * sizeof(U32));
+	entries = (U32*)malloc((cap + 1) * sizeof(U32));
+	tgt = (int*)malloc(cap * sizeof(int));
+	iwords = (const tOpWord**)calloc(cap, sizeof(*iwords));
+	endJump = (char*)calloc(cap, 1);
+	ilen = (U32*)calloc(cap, sizeof(U32));
+	ientry = (U32*)calloc(cap, sizeof(U32));
+	exitSten = (U32*)malloc(cap * sizeof(U32));
+#define ADD(id, hole, src, target) do { ids[nb] = (unsigned)(id); holes[nb] = (hole); srcInstr[nb] = (src); tgt[nb] = (target); nb++; } while (0)
+
+	for (j = 0; j < n; j++) {
+		stencilOf[j] = nb;
+		if (c->kind[k + j] == K_LDA && j + 1 < n && c->kind[k + j + 1] == K_LDFLD8 && !c->isTarget[c->instrList[k + j + 1]]) {
+			// the same for an 8-byte field: a load of the 8 bytes at L+F
+			ADD(ST_LDP, c->val[k + j] + c->val[k + j + 1], 0xffffffff, -1);
+			stencilOf[++j] = nb - 1;
+			continue;
+		}
+		if (c->kind[k + j] == K_LDA && j + 1 < n && c->kind[k + j + 1] == K_LDFLD4 && !c->isTarget[c->instrList[k + j + 1]]) {
+			// ldloca L; ldfld F: the address is a frame address, never null, so this is a load of the slot L+F
+			ADD(ST_LDL, c->val[k + j] + c->val[k + j + 1], 0xffffffff, -1);
+			stencilOf[++j] = nb - 1;
+			continue;
+		}
+		if (c->kind[k + j] == K_LDC8) {
+			// ldc.i8 / ldc.r8: the operand word holds all 64 bits (this target has 8-byte op words); store them as two halves
+			U64 w = (U64)c->pOps->p[c->start[k + j] + 1];
+			ADD(ST_LDC8LO, (U32)w, 0xffffffff, -1);
+			ADD(ST_LDC8HI, (U32)(w >> 32), 0xffffffff, -1);
+			continue;
+		}
+		if (c->kind[k + j] == K_CALLD || c->kind[k + j] == K_CALLVIRTD) {
+			tMD_MethodDef *m = (tMD_MethodDef*)c->pOps->p[c->start[k + j] + 1];
+			tBlockRecipe *r = c->recipeOf[k + j];
+			tJITted *cj = m->pJITted;
+			U32 base = c->inlineBase, zo, ze, baseIdx, frame = m->parameterStackSize + cj->localsStackSize;
+			if (c->kind[k + j] == K_CALLVIRTD) {
+				ADD(ST_CHKTHIS, (U32)(0 - m->parameterStackSize), 0xffffffff, -1);       // callvirt checks `this`
+			}
+			// the arguments are on the stack in order, so the last is on top: pop them into the callee's parameters, last first
+			for (p = m->numberOfParameters; p-- > 0; ) {
+				U32 size = m->pParams[p].size, off = base + m->pParams[p].offset, u;
+				if (size == 8) {
+					ADD(ST_STP, off, 0xffffffff, -1);
+				} else if (size == 4) {
+					ADD(ST_STL, off, 0xffffffff, -1);
+				} else {
+					for (u = size / 4; u-- > 0; ) { ADD(ST_STL, off + 4 * u, 0xffffffff, -1); }
+				}
+			}
+			// a real call gives the callee's locals zeroed memory
+			zo = base + m->parameterStackSize;
+			ze = base + frame;
+			while (zo + 8 <= ze) { ADD(ST_ZERO8, zo, 0xffffffff, -1); zo += 8; }
+			while (zo + 4 <= ze) { ADD(ST_ZERO4, zo, 0xffffffff, -1); zo += 4; }
+			// the callee's body, with its frame moved to where its frame is now
+			baseIdx = nb;
+			ri = 0;
+			for (i = 0; i < r->n; i++) {
+				ADD(r->ids[i], IsFrameStencil(r->ids[i]) ? r->holes[i] + base : r->holes[i], 0xffffffff, r->tgt[i] >= 0 ? r->tgt[i] + (int)baseIdx : -1);
+				if (ri < r->numIslands && r->islandAt[ri] == i) {
+					// an island of the callee: the interpreter runs the same instruction here, in the caller's frame, and the block goes on after it
+					iwords[nb - 1] = r->islandWords[ri];
+					ilen[nb - 1] = r->islandLen[ri];
+					ientry[nb - 1] = numEntries;
+					entries[numEntries++] = nb;
+					numIslands++;
+					ri++;
+				}
+			}
+			if (!recipeOnly) { NativeBlock_CountInlined(); }
+			if (r->hasEnd) { ADD(ST_ZERO4, base, 0xffffffff, -1); }      // somewhere for the recipe's jumps to its end to land (the callee's frame is dead now)
+			if (frame > *c->pInlineFrame) { *c->pInlineFrame = frame; }
+			if (cj->maxStack > *c->pInlineStack) { *c->pInlineStack = cj->maxStack; }
+			continue;
+		}
+		if (c->kind[k + j] == K_FFI) {
+			// a call of a C function: its address into r11 (two 32-bit halves), then the stencil of its signature, which takes the arguments
+			// off the evaluation stack, calls it and puts the result there
+			const tFFIEntry *pFfi = (const tFFIEntry*)c->pOps->p[c->start[k + j] + 1];
+			U64 fnAddr = (U64)(uintptr_t)pFfi->fn;
+			ADD(ffiStFnLo, (U32)fnAddr, 0xffffffff, -1);
+			ADD(ffiStFnHi, (U32)(fnAddr >> 32), 0xffffffff, -1);
+			ADD(NativeBlock_FindStencil(pFfi->stencil), 0, 0xffffffff, -1);
+			continue;
+		}
+		if (c->kind[k + j] == K_ISLAND) {
+			// leave the block here, let the interpreter run this one instruction, and come back at the next stencil
+			ADD(ST_J, 0, 0xffffffff, -1);
+			iwords[nb - 1] = c->pOps->p + c->start[k + j];
+			ilen[nb - 1] = c->end[k + j] - c->start[k + j];
+			ientry[nb - 1] = numEntries;
+			entries[numEntries++] = nb;
+			numIslands++;
+			continue;
+		}
+		ADD(StencilIdFor(c->kind[k + j], c->idx[k + j]), IsBranchKind(c->kind[k + j]) ? 0 : c->val[k + j],
+			IsBranchKind(c->kind[k + j]) ? k + j : 0xffffffff, -1);
+	}
+	if (!recipeOnly) {
+		// The register pass: keep values in registers instead of on the evaluation stack in memory (VStack.c). Where something can jump or
+		// be entered, nothing may be held in a register, and after it the places that point into the list are moved.
+		unsigned char *flushAt = (unsigned char*)calloc(nb + 1, 1);
+		U32 *remap = (U32*)malloc((nb + 1) * sizeof(U32));
+		tStencilList list;
+		U32 newNb;
+		list.ids = ids; list.hole0 = holes; list.hole1 = holes1; list.hole2 = holes2; list.srcInstr = srcInstr;
+		list.iwords = iwords; list.ilen = ilen; list.ientry = ientry; list.endJump = endJump; list.tgt = tgt;
+		for (j = 0; j < n; j++) {
+			if (c->isTarget[c->instrList[k + j]]) { flushAt[stencilOf[j]] = 1; }
+		}
+		for (e = 1; e < numEntries; e++) { flushAt[entries[e]] = 1; }
+		for (i = 0; i < nb; i++) {
+			if (tgt[i] >= 0 && (U32)tgt[i] <= nb) { flushAt[tgt[i]] = 1; }       // (a branch inside an inlined recipe)
+		}
+		newNb = VStack_Run(&list, nb, flushAt, remap, &pool64, &numPool);
+		for (j = 0; j < n; j++) { stencilOf[j] = remap[stencilOf[j]]; }
+		for (e = 1; e < numEntries; e++) { entries[e] = remap[entries[e]]; }
+		nb = newNb;
+		free(flushAt); free(remap);
+	}
+	entries[0] = 0;
+	for (i = 0; i < nb; i++) {
+		if (iwords[i] != NULL) {
+			// an island is always an exit
+			exitSrc[numExits] = 0xffffffff;
+			exitSten[numExits] = i;
+			tgt[i] = (int)(nb + numExits);
+			numExits++;
+		} else if (srcInstr[i] != 0xffffffff) {
+			I32 t = c->cilToInstr[c->val[srcInstr[i]]];
+			if (t >= (I32)k && t < (I32)(k + n)) {
+				tgt[i] = (int)stencilOf[t - k];
+				if ((U32)tgt[i] <= i) { anyBackward = 1; }
+				if ((U32)tgt[i] <= i && tgt[i] != 0) {
+					// a backward branch: where it goes is a place the block can be entered again
+					for (e = 0; e < numEntries && entries[e] != (U32)tgt[i]; e++) { }
+					if (e == numEntries) { entries[numEntries++] = (U32)tgt[i]; }
+				}
+			} else {
+				if (t == (I32)(k + n) && k + n < c->numInstr && c->kind[k + n] == K_RET) { endJump[i] = 1; numEndJumps++; }
+				exitSrc[numExits] = srcInstr[i];
+				tgt[i] = (int)(nb + numExits);
+				numExits++;
+			}
+		}
+	}
+#undef ADD
+	if (getenv("DNA_FUSION_DEBUG") != NULL && !recipeOnly) { NativeBlock_Dump(ids, holes, tgt, nb); }
+	for (e = 1; e < numEntries; e++) {
+		if (entries[e] >= nb) { entryBad = 1; }       // (a block that would end with an island has no stencil to come back to)
+	}
+	code = (recipeOnly || entryBad) ? NULL : NativeBlock_Compile(ids, holes, holes1, holes2, tgt, nb, numExits, entries, numEntries, pool64, numPool);
+	if (code != NULL || recipeOnly) {
+		if (code != NULL) {
+		blockOfs = *pNewOfs;
+		NativeBlock_CountIslands(numIslands);
+		newP[(*pNewOfs)++] = Translate((anyBackward || numIslands) ? JIT_NATIVE_LOOP : JIT_NATIVE_BLOCK, 0);   // (only the loop form can be entered again)
+		newP[(*pNewOfs)++] = (tOpWord)(uintptr_t)code;
+		newP[(*pNewOfs)++] = (tOpWord)numExits;
+		for (j = 0; j < n; j++) {
+			if (IsBranchKind(c->kind[k + j])) {
+				remap[c->start[k + j] + 1] = 0xfffffffe;       // (replaced below if this branch is an exit)
+			}
+		}
+		for (i = 0; i < numExits; i++) {
+			U32 ex = exitSrc[i];
+			if (ex == 0xffffffff) {
+				// the exit goes to the island's stub, whose place is not known until the method's ops are all laid out
+				tIslandStubs *st = c->pStubs;
+				if (st->n == st->cap) {
+					st->cap = st->cap ? st->cap * 2 : 16;
+					st->item = (struct tIslandStub_*)realloc(st->item, st->cap * sizeof(st->item[0]));
+				}
+				st->item[st->n].words = iwords[exitSten[i]];
+				st->item[st->n].len = ilen[exitSten[i]];
+				st->item[st->n].exitWord = *pNewOfs;
+				st->item[st->n].blockOfs = blockOfs;
+				st->item[st->n].entry = ientry[exitSten[i]];
+				st->n++;
+				newP[(*pNewOfs)++] = 0;
+			} else {
+				U32 pos = c->start[ex] + 1;
+				remap[pos] = *pNewOfs;
+				newP[(*pNewOfs)++] = c->pOps->p[pos];
+			}
+		}
+		}
+		if (!anyBackward && numExits == numIslands + numEndJumps && (code != NULL || recipeOnly) && (numEndJumps == 0 || c->inlineBase >= 4)) {
+			// loop-free and leaving only by islands: it can be a recipe, if it turns out to be the whole method (the caller decides)
+			tBlockRecipe *r = (tBlockRecipe*)malloc(sizeof(tBlockRecipe));
+			U32 q, ni = 0;
+			r->n = nb;
+			r->numIslands = numIslands;
+			r->islandAt = (U32*)malloc((numIslands + 1) * sizeof(U32));
+			r->islandWords = (tOpWord**)malloc((numIslands + 1) * sizeof(tOpWord*));
+			r->islandLen = (U32*)malloc((numIslands + 1) * sizeof(U32));
+			r->hasEnd = numEndJumps > 0;
+			for (q = 0; q < nb; q++) {
+				if (iwords[q] != NULL) {
+					// the words of the instruction. An ldstr looks its string up in the metadata of the method it is running in, and this
+					// will run in another: so it gets the metadata of this method with it.
+					U32 len = ilen[q];
+					tOpWord *w = (tOpWord*)malloc((len + 1) * sizeof(tOpWord));
+					if (iwords[q][0] == fc.loadString) {
+						w[0] = fc.loadStringMd; w[1] = (tOpWord)(uintptr_t)c->pMethodDef->pMetaData; w[2] = iwords[q][1]; len = 3;
+					} else {
+						memcpy(w, iwords[q], len * sizeof(tOpWord));
+					}
+					r->islandAt[ni] = q; r->islandWords[ni] = w; r->islandLen[ni] = len;
+					ni++;
+				}
+			}
+			r->ids = (unsigned*)malloc(nb * sizeof(unsigned)); memcpy(r->ids, ids, nb * sizeof(unsigned));
+			r->holes = (U32*)malloc(nb * sizeof(U32)); memcpy(r->holes, holes, nb * sizeof(U32));
+			r->tgt = (int*)malloc(nb * sizeof(int)); memcpy(r->tgt, tgt, nb * sizeof(int));
+			for (q = 0; q < nb; q++) {
+				if (iwords[q] != NULL) { r->tgt[q] = -1; }          // (an island is re-made where the recipe is used, not a branch)
+				if (endJump[q]) { r->tgt[q] = (int)nb; }            // (the end of the recipe)
+			}
+			*ppRecipe = r;
+		}
+		ok = (code != NULL);
+	}
+	free(pool64); free(ids); free(holes); free(holes1); free(holes2); free(srcInstr); free(stencilOf); free(exitSrc); free(entries); free(tgt); free(iwords); free(ilen); free(ientry); free(exitSten); free(endJump);
+	return ok;
+}
+#endif
+
+static void FuseOps(tOps *pOps, tOps *pBranches, U32 *pJITOffsets, const U32 *instrList, U32 numInstr,
+		tJITted *pJITted, U32 codeSize, tMD_MethodDef *pMethodDef) {
+	static int enabled = -1;
+	U32 k, i, newOfs, newCap, *start, *end, *val, *idx, *newJIT, *remap;
+	int fusedAny = 0;
+#if NATIVE_BLOCKS
+	tBlockRecipe **recipeOf = NULL;
+	U32 inlineFrame = 0, inlineStack = 0;
+	tIslandStubs stubs = { 0, 0, NULL };
+	int allowIslands;
+	tBlockCtx blockCtx;
+#endif
+	U8 *kind, *isTarget, *isHard;
+	I32 *cilToInstr;
+	U32 *instrOfWord, *minSrc, *maxSrc;
+	tOpWord *newP;
+	I32 *newSeq;
+
+	if (enabled < 0) {
+		enabled = (getenv("DNA_NO_FUSION") == NULL);
+	}
+	if (!enabled || numInstr < 2) {
+		return;
+	}
+	if (!fc.ready) {
+		InitFuseCodes();
+	}
+
+	// everything that may be jumped to, or that bounds a region
+	isTarget = (U8*)calloc(codeSize + 2, 1);
+	isHard = (U8*)calloc(codeSize + 2, 1);       // targets that no block may contain: region boundaries, sequence points
+	for (i = 0; i < pBranches->ofs; i++) {
+		U32 t = (U32)pOps->p[pBranches->p[i]];
+		if (t <= codeSize) { isTarget[t] = 1; }
+	}
+	for (i = 0; i < pJITted->numExceptionHandlers; i++) {
+		tExceptionHeader *pEx = &pJITted->pExceptionHeaders[i];
+		U32 marks[5];
+		U32 j, n = 0;
+		marks[n++] = pEx->tryStart;
+		marks[n++] = pEx->tryStart + pEx->tryEnd;            // (still lengths, not yet converted)
+		marks[n++] = pEx->handlerStart;
+		marks[n++] = pEx->handlerStart + pEx->handlerEnd;
+		if (pEx->flags == COR_ILEXCEPTION_CLAUSE_FILTER) { marks[n++] = pEx->u.filterOffset; }
+		for (j = 0; j < n; j++) {
+			if (marks[j] <= codeSize) { isTarget[marks[j]] = 1; isHard[marks[j]] = 1; }
+		}
+	}
+
+	start = (U32*)malloc(numInstr * sizeof(U32));
+	end = (U32*)malloc(numInstr * sizeof(U32));
+	val = (U32*)calloc(numInstr, sizeof(U32));
+	idx = (U32*)calloc(numInstr, sizeof(U32));
+	kind = (U8*)calloc(numInstr, 1);
+	newJIT = (U32*)malloc(numInstr * sizeof(U32));
+	for (k = 0; k < numInstr; k++) {
+		start[k] = pJITOffsets[instrList[k]];
+		end[k] = (k + 1 < numInstr) ? pJITOffsets[instrList[k + 1]] : pOps->ofs;
+		if (pOps->pSequencePoints != NULL && end[k] > start[k] && pOps->pSequencePoints[start[k]] >= 0) {
+			isTarget[instrList[k]] = 1;       // keep a debugger's statement boundaries where they are
+			isHard[instrList[k]] = 1;
+		}
+		kind[k] = (U8)ClassifyOps(pOps->p + start[k], end[k] - start[k], &val[k], &idx[k]);
+	}
+
+	// Who branches to whom, for the native blocks: for each instruction, the first and last instruction that branches to it
+	cilToInstr = (I32*)malloc((codeSize + 2) * sizeof(I32));
+	for (i = 0; i <= codeSize + 1; i++) { cilToInstr[i] = -1; }
+	for (k = 0; k < numInstr; k++) { cilToInstr[instrList[k]] = (I32)k; }
+	instrOfWord = (U32*)calloc(pOps->ofs + 1, sizeof(U32));
+	for (k = 0; k < numInstr; k++) {
+		for (i = start[k]; i < end[k]; i++) { instrOfWord[i] = k; }
+	}
+	minSrc = (U32*)malloc(numInstr * sizeof(U32));
+	maxSrc = (U32*)calloc(numInstr, sizeof(U32));
+	for (k = 0; k < numInstr; k++) { minSrc[k] = 0xffffffff; }
+	for (i = 0; i < pBranches->ofs; i++) {
+		U32 pos = pBranches->p[i], target = (U32)pOps->p[pos];
+		if (target <= codeSize && cilToInstr[target] >= 0) {
+			U32 s = instrOfWord[pos], t = (U32)cilToInstr[target];
+			if (s < minSrc[t]) { minSrc[t] = s; }
+			if (s > maxSrc[t]) { maxSrc[t] = s; }
+		}
+	}
+#if NATIVE_BLOCKS
+	blockCtx.numInstr = numInstr; blockCtx.instrList = instrList; blockCtx.start = start; blockCtx.val = val;
+	blockCtx.idx = idx; blockCtx.minSrc = minSrc; blockCtx.maxSrc = maxSrc; blockCtx.kind = kind;
+	blockCtx.isHard = isHard; blockCtx.isTarget = isTarget; blockCtx.cilToInstr = cilToInstr; blockCtx.pOps = pOps;
+	// Which calls a block may contain the callee of (compiling the callee if need be): a call that cannot be inlined is not something
+	// a block can contain, so its kind is cleared before any region is looked for
+	// Islands are instructions that the interpreter runs in the middle of a block. A stub that lets it do so is after the end of the method's ops,
+	// outside every try range, so a method with exception handlers has none (a throw from an island would not find its handler).
+	{
+		static int noIslands = -1;
+		if (noIslands < 0) { noIslands = (getenv("DNA_NO_ISLANDS") != NULL); }
+		allowIslands = !noIslands && pJITted->numExceptionHandlers == 0;
+	}
+	recipeOf = (tBlockRecipe**)calloc(numInstr, sizeof(tBlockRecipe*));
+	for (k = 0; k < numInstr; k++) {
+		if (kind[k] == K_CALLD || kind[k] == K_CALLVIRTD) {
+			recipeOf[k] = InlineRecipeFor((tMD_MethodDef*)pOps->p[start[k] + 1], kind[k] == K_CALLVIRTD, pMethodDef, allowIslands);
+			if (recipeOf[k] == NULL) { kind[k] = K_ISLAND; }        // (a call that is not inlined is an island, if there are any)
+		}
+		if (kind[k] == K_ISLAND && !allowIslands) { kind[k] = K_OTHER; }
+	}
+	blockCtx.end = end;
+	blockCtx.pMethodDef = pMethodDef;
+	blockCtx.pStubs = &stubs;
+	blockCtx.recipeOf = recipeOf;
+	blockCtx.inlineBase = pMethodDef->parameterStackSize + pJITted->localsStackSize;
+	blockCtx.pInlineFrame = &inlineFrame;
+	blockCtx.pInlineStack = &inlineStack;
+#endif
+
+	// Every fused form is no longer than what it replaces, except LOAD2 (two one-word slot loads become three words),
+	// so the output can be longer than the input by half at most.
+	newCap = pOps->ofs + pOps->ofs / 2 + 8;
+	if (getenv("DNA_FUSION_DEBUG") != NULL) {
+		fprintf(stderr, "fuse %s:", Sys_GetMethodDesc(pMethodDef));
+		for (k = 0; k < numInstr; k++) {
+			fprintf(stderr, " %d%s", kind[k], isTarget[instrList[k]] ? "T" : "");
+		}
+		fprintf(stderr, "\n");
+	}
+	newP = (tOpWord*)malloc(newCap * sizeof(tOpWord));
+	newSeq = (pOps->pSequencePoints != NULL) ? (I32*)malloc(newCap * sizeof(I32)) : NULL;
+	remap = (U32*)malloc((pOps->ofs + 1) * sizeof(U32));
+	for (i = 0; i <= pOps->ofs; i++) {
+		remap[i] = 0xffffffff;
+	}
+	newOfs = 0;
+
+#define KIND(j) ((k + (j) < numInstr) ? kind[k + (j)] : K_OTHER)
+#define FREE(j) (!isTarget[instrList[k + (j)]])
+	for (k = 0; k < numInstr; ) {
+		U32 consumed = 1, w, fusedStart = newOfs;
+		I32 seq0 = (newSeq != NULL && end[k] > start[k]) ? pOps->pSequencePoints[start[k]] : -1;
+
+		U32 blockN = 0;
+#if NATIVE_BLOCKS
+		if (NativeBlock_Enabled()) {
+			blockN = FindBlockRegion(&blockCtx, k);
+			if (k == 0 && lastRegionRaw + 1 == numInstr && kind[numInstr - 1] == K_RET && pJITted->numExceptionHandlers == 0) {
+				// the whole method but its return is a loop-free block (which may have islands, and may be too short or too poor to be worth
+				// a block of its own): a recipe, so that callers can contain it instead of calling it
+				tBlockRecipe *recipe = NULL;
+				EmitBlock(&blockCtx, 0, lastRegionRaw, newP, &newOfs, remap, &recipe, 1);
+				pJITted->pRecipe = recipe;
+			}
+			if (blockN != 0) {
+				tBlockRecipe *recipe = NULL;
+				if (EmitBlock(&blockCtx, k, blockN, newP, &newOfs, remap, &recipe, 0)) {
+					consumed = blockN;
+					if (recipe != NULL) {
+						free(recipe->ids); free(recipe->holes); free(recipe->tgt); free(recipe->islandAt); free(recipe->islandLen);
+						free(recipe);        // (leaks the island words: the recipe of a whole method is the one made above)
+					}
+				} else {
+					blockN = 0;
+				}
+			}
+		}
+#endif
+		if (blockN != 0) {
+			// done above
+		} else if (KIND(0) == K_LOADL && KIND(1) == K_CONSTI && KIND(2) == K_BIN && FREE(1) && FREE(2) &&
+				(idx[k + 2] == fc.addIdx || idx[k + 2] == fc.subIdx) && KIND(3) == K_STOREL && FREE(3) &&
+				val[k + 3] == val[k]) {
+			// ldloc a; ldc c; add/sub; stloc a   ->   a += c
+			newP[newOfs++] = fc.inc;
+			newP[newOfs++] = val[k];
+			newP[newOfs++] = (idx[k + 2] == fc.addIdx) ? val[k + 1] : (U32)(0 - val[k + 1]);
+			consumed = 4;
+		} else if (KIND(0) == K_LOADL && KIND(1) == K_LOADL && KIND(2) == K_BIN && FREE(1) && FREE(2) &&
+				fusedBins[idx[k + 2]].ll != 0) {
+			newP[newOfs++] = Translate(fusedBins[idx[k + 2]].ll, 0);
+			newP[newOfs++] = val[k];
+			newP[newOfs++] = val[k + 1];
+			consumed = 3;
+		} else if (KIND(0) == K_LOADL && KIND(2) == K_BIN && FREE(1) && FREE(2) &&
+				KIND(1) == (fusedBins[idx[k + 2]].isFloat ? K_CONSTF : K_CONSTI)) {
+			newP[newOfs++] = Translate(fusedBins[idx[k + 2]].lc, 0);
+			newP[newOfs++] = val[k];
+			newP[newOfs++] = val[k + 1];
+			consumed = 3;
+		} else if (KIND(0) == K_LOADL && KIND(1) == K_LOADL && KIND(2) == K_BCC && FREE(1) && FREE(2)) {
+			newP[newOfs++] = Translate(fusedBccs[idx[k + 2]].ll, 0);
+			newP[newOfs++] = val[k];
+			newP[newOfs++] = val[k + 1];
+			remap[start[k + 2] + 1] = newOfs;               // the branch operand moves here
+			newP[newOfs++] = pOps->p[start[k + 2] + 1];     // still a CIL offset: converted by the fixup that follows
+			consumed = 3;
+		} else if (KIND(0) == K_LOADL && KIND(1) == K_CONSTI && KIND(2) == K_BCC && FREE(1) && FREE(2)) {
+			newP[newOfs++] = Translate(fusedBccs[idx[k + 2]].lc, 0);
+			newP[newOfs++] = val[k];
+			newP[newOfs++] = val[k + 1];
+			remap[start[k + 2] + 1] = newOfs;
+			newP[newOfs++] = pOps->p[start[k + 2] + 1];
+			consumed = 3;
+		} else if (KIND(0) == K_LOADL && KIND(1) == K_LOADL && FREE(1)) {
+			newP[newOfs++] = fc.load2;
+			newP[newOfs++] = val[k];
+			newP[newOfs++] = val[k + 1];
+			consumed = 2;
+		}
+
+		// (a block replaces what it covers even when that is one instruction: an inlined call is, and "consumed == 1" would copy it again)
+		if (consumed > 1 || blockN != 0) {
+			fusedAny = 1;
+			// the fused instruction stands for instructions k .. k+consumed-1
+			for (w = 0; w < consumed; w++) {
+				newJIT[k + w] = fusedStart;
+			}
+			if (newSeq != NULL) {
+				for (w = fusedStart; w < newOfs; w++) { newSeq[w] = -1; }
+				newSeq[fusedStart] = seq0;
+			}
+		} else {
+			// copied as it is
+			newJIT[k] = newOfs;
+			for (w = start[k]; w < end[k]; w++) {
+				remap[w] = newOfs;
+				if (newSeq != NULL) { newSeq[newOfs] = pOps->pSequencePoints[w]; }
+				newP[newOfs++] = pOps->p[w];
+			}
+		}
+		k += consumed;
+	}
+#undef KIND
+#undef FREE
+
+#if NATIVE_BLOCKS
+	if (stubs.n > 0) {
+		// the islands' stubs: [the instruction][JIT_NATIVE_RESUME block entry], after everything else (nothing falls into them)
+		U32 q, extra = 0;
+		for (q = 0; q < stubs.n; q++) { extra += stubs.item[q].len + 3; }
+		if (newOfs + extra > newCap) {
+			newCap = newOfs + extra + 8;
+			newP = (tOpWord*)realloc(newP, newCap * sizeof(tOpWord));
+			if (newSeq != NULL) { newSeq = (I32*)realloc(newSeq, newCap * sizeof(I32)); }
+		}
+		for (q = 0; q < stubs.n; q++) {
+			U32 at = newOfs, w2;
+			for (w2 = 0; w2 < stubs.item[q].len; w2++) {
+				if (newSeq != NULL) { newSeq[newOfs] = -1; }
+				newP[newOfs++] = stubs.item[q].words[w2];
+			}
+			if (newSeq != NULL) { newSeq[newOfs] = -1; newSeq[newOfs + 1] = -1; newSeq[newOfs + 2] = -1; }
+			newP[newOfs++] = Translate(JIT_NATIVE_RESUME, 0);
+			newP[newOfs++] = (tOpWord)stubs.item[q].blockOfs;
+			newP[newOfs++] = (tOpWord)stubs.item[q].entry;
+			newP[stubs.item[q].exitWord] = (tOpWord)at;           // the block's exit goes here
+		}
+		free(stubs.item);
+		fusedAny = 1;
+	}
+#endif
+
+	if (fusedAny) {
+		// something was fused: install the compacted stream and remap everything that refers into it
+		for (k = 0; k < numInstr; k++) {
+			pJITOffsets[instrList[k]] = newJIT[k];
+		}
+		{
+			U32 kept = 0;
+			for (i = 0; i < pBranches->ofs; i++) {
+				U32 r = remap[pBranches->p[i]];
+				if (r == 0xfffffffe) { continue; }       // a branch that is now inside a native block: no operand word left
+				Assert(r != 0xffffffff);
+				pBranches->p[kept++] = r;
+			}
+			pBranches->ofs = kept;
+		}
+		free(pOps->p);
+		pOps->p = newP;
+		if (pOps->pSequencePoints != NULL) {
+			free(pOps->pSequencePoints);
+			pOps->pSequencePoints = newSeq;
+		}
+		pOps->ofs = newOfs;
+	} else {
+		free(newP);
+		free(newSeq);
+	}
+#if NATIVE_BLOCKS
+	if (inlineFrame > 0) {
+		// the callees inlined into blocks run in a frame of their own after this method's locals, and on evaluation stack above this
+		// method's: make room (maxStack is set at the end of JITit, and picks inlineExtraStack up there)
+		pJITted->localsStackSize += inlineFrame;
+		pJITted->inlineExtraStack += inlineStack;
+	}
+	free(recipeOf);
+#endif
+	free(isHard); free(cilToInstr); free(instrOfWord); free(minSrc); free(maxSrc);
+	free(isTarget); free(start); free(end); free(val); free(idx); free(kind); free(newJIT); free(remap);
+}
+
 static tOpWord* JITit(tMD_MethodDef *pMethodDef, U8 *pCIL, U32 codeSize, tParameter *pLocals, tJITted *pJITted, U32 genCombinedOpcodes, I32 **ppSequencePoints) {
 	U32 maxStack = pJITted->maxStack;
 	U32 i;
@@ -313,6 +1439,7 @@ static tOpWord* JITit(tMD_MethodDef *pMethodDef, U8 *pCIL, U32 codeSize, tParame
 	tOps ops; // The JITted op-codes
 	tOps branchOffsets; // Filled with all the branch instructions that need offsets fixing
 	U32 *pJITOffsets;	// To store the JITted code offset of each CIL byte.
+	U32 *instrList, numInstr;
 						// Only CIL bytes that are the first byte of an instruction will have meaningful data
 	tTypeStack **ppTypeStacks; // To store the evaluation stack state for forward jumps
 	tOpWord *pFinalOps;
@@ -361,6 +1488,9 @@ static tOpWord* JITit(tMD_MethodDef *pMethodDef, U8 *pCIL, U32 codeSize, tParame
     }
     
 	pJITOffsets = malloc(codeSize * sizeof(U32));
+	// The CIL offset of each instruction translated, in order (for the fusion pass)
+	instrList = (U32*)malloc((codeSize + 1) * sizeof(U32));
+	numInstr = 0;
 	// + 1 to handle cases where the stack is being restored at the last instruction in a method
 	ppTypeStacks = malloc((codeSize + 1) * sizeof(tTypeStack*));
 	memset(ppTypeStacks, 0, (codeSize + 1) * sizeof(tTypeStack*));
@@ -378,6 +1508,13 @@ static tOpWord* JITit(tMD_MethodDef *pMethodDef, U8 *pCIL, U32 codeSize, tParame
 		if (pEx->flags == COR_ILEXCEPTION_CLAUSE_EXCEPTION) {
 			tTypeStack *pTypeStack;
 
+			// The handler starts with the exception object on the stack, typed as the catch type, and its first
+			// instruction (usually `pop` or `stloc`) is sized from that type. Until the type is filled in its
+			// stackSize is 0, so the `pop` removed nothing: the exception reference stayed on the evaluation
+			// stack, which the method's maximum stack did not allow for, and the next pushes overflowed it onto
+			// the parameters. (This depended on whether the exception type had been used before this method was
+			// compiled.)
+			MetaData_Fill_TypeDef(pEx->u.pCatchTypeDef, NULL, NULL);
 			ppTypeStacks[pEx->handlerStart] = pTypeStack = TMALLOC(tTypeStack);
 			pTypeStack->maxBytes = sizeof(void*);   // the exception reference pushed on entry (was a hard-coded 4)
 			pTypeStack->ofs = 1;
@@ -425,6 +1562,7 @@ static tOpWord* JITit(tMD_MethodDef *pMethodDef, U8 *pCIL, U32 codeSize, tParame
 
 		// Set the JIT offset for this CIL opcode
 		pJITOffsets[cilOfs] = ops.ofs;
+		instrList[numInstr++] = cilOfs;
 
         U32 pcilOfs = cilOfs;
 
@@ -828,6 +1966,7 @@ cilLdInd:
 				{
 					tMD_MethodDef *pCallMethod;
 					tMD_TypeDef *pBoxCallType;
+					const tFFIEntry *pFfiEntry;
 					U32 derefRefType;
 					U8 dynamicallyBoxReturnValue;
 
@@ -835,6 +1974,7 @@ cilLdInd:
 
 cilCallVirtConstrained:
 					pBoxCallType = NULL;
+					pFfiEntry = NULL;          // (reset here for the same reason as the rest)
 					derefRefType = 0;
 					// Must be reset here, not at the declaration: the CIL_CONSTRAINED prefix
 					// jumps to the label above, past any initialiser on the declaration, which
@@ -900,7 +2040,18 @@ cilCallVirtConstrained:
 						pStackType = types[TYPE_SYSTEM_OBJECT];
 					}
 					MetaData_Fill_TypeDef(pStackType, NULL, NULL);
-					if (TYPE_ISINTERFACE(pCallMethod->pParentType) && op == CIL_CALLVIRT) {
+					// A DllImport of a function named in the FFI manifest is a call to the function itself, on the evaluation stack: no frame
+					if ((pCallMethod->flags & METHODATTRIBUTES_PINVOKEIMPL) && FFI_Count() > 0) {
+						tMD_ImplMap *pFfiImpl = MetaData_GetImplMap(pCallMethod->pMetaData, pCallMethod->tableIndex);
+						pFfiEntry = FFI_Find(MetaData_GetModuleRefName(pCallMethod->pMetaData, pFfiImpl->importScope), pFfiImpl->importName);
+						if (pFfiEntry != NULL) {
+							const char *pBad = FFI_CheckSignature(pFfiEntry, pCallMethod);
+							if (pBad != NULL) { Crash("FFI manifest and DllImport disagree: %s", pBad); }
+						}
+					}
+					if (pFfiEntry != NULL) {
+						PushOp(JIT_FFI_CALL);
+					} else if (TYPE_ISINTERFACE(pCallMethod->pParentType) && op == CIL_CALLVIRT) {
 						PushOp(JIT_CALL_INTERFACE);
 					} else if (pCallMethod->pParentType->pParent == types[TYPE_SYSTEM_MULTICASTDELEGATE]) {
 						PushOp(JIT_INVOKE_DELEGATE);
@@ -938,7 +2089,11 @@ cilCallVirtConstrained:
 							Crash("JITit(): Cannot CALL or CALLVIRT with stack type: %d", pStackType->stackType);
 						}
 					}
-					PushPTR(pCallMethod);
+					if (pFfiEntry != NULL) {
+						PushPTR(pFfiEntry);
+					} else {
+						PushPTR(pCallMethod);
+					}
 
 					if (pCallMethod->pReturnType != NULL) {
 						PushStackType(pCallMethod->pReturnType);
@@ -1300,9 +2455,15 @@ cilConv:
 					default:
 						Crash("JITit() Conv cannot handle convOpOffset %d", convOpOffset);
 					}
-					PushOp(opCodeBase + convOpOffset);
-					if (useParam) {
-						PushU32(param);
+					if ((convOpOffset == JIT_CONV_OFFSET_I64 || convOpOffset == JIT_CONV_OFFSET_U64) &&
+							(opCodeBase == JIT_CONV_FROM_I64 || opCodeBase == JIT_CONV_FROM_U64)) {
+						// 64 bits to 64 bits (including a pointer, here): the 8 bytes on the stack are already what the result is. There is no op
+						// for it (they were "not used": IntPtr.ToInt64() could not be compiled on a 64-bit target).
+					} else {
+						PushOp(opCodeBase + convOpOffset);
+						if (useParam) {
+							PushU32(param);
+						}
 					}
 				}
 				PushStackType(types[toType]);
@@ -1483,8 +2644,16 @@ conv2:
 				PushStackType(types[TYPE_SYSTEM_INT32]);
 				break;
 
-			case CIL_LDELEM_I1:
 			case CIL_LDELEM_U1:
+				// byte[] has 1-byte elements and bool[] 4-byte ones: use the array's type, if it is known, to choose
+				PopStackTypeMulti(2);
+				{
+					U32 elemSize = KnownArrayElementSize(typeStack.ppTypes[typeStack.ofs]);   // the array: popped, still there
+					PushOp(elemSize == 1 ? JIT_LOAD_ELEMENT_U8_1 : (elemSize == 4 ? JIT_LOAD_ELEMENT_U8_4 : JIT_LOAD_ELEMENT_U8));
+				}
+				PushStackType(types[TYPE_SYSTEM_INT32]);
+				break;
+			case CIL_LDELEM_I1:
 			case CIL_LDELEM_I2:
 			case CIL_LDELEM_U2:
 			case CIL_LDELEM_I4:
@@ -1528,23 +2697,49 @@ conv2:
 				u32Value = GetUnalignedU32(pCIL, &cilOfs);
 				pStackType = (tMD_TypeDef*)MetaData_GetTypeDefFromDefRefOrSpec(pMetaData, u32Value, pMethodDef->pParentType->ppClassTypeArgs, pMethodDef->ppMethodTypeArgs);
 				PopStackTypeMulti(2); // Don't care what these are
-				PushOpParam(JIT_LOAD_ELEMENT, pStackType->stackSize);
+				MetaData_Fill_TypeDef(pStackType, NULL, NULL);
+				if (pStackType == types[TYPE_SYSTEM_SBYTE] || pStackType == types[TYPE_SYSTEM_INT16]) {
+					// a signed element narrower than the stack slot has to be sign-extended, as ldelem.i1 and ldelem.i2 do (the general load
+					// copied the element's bytes into a zeroed slot: -900 in a List<short> came back as 64636)
+					PushOp(pStackType == types[TYPE_SYSTEM_SBYTE] ? JIT_LOAD_ELEMENT_I8 : JIT_LOAD_ELEMENT_I16);
+				} else if (pStackType->arrayElementSize == 4 && pStackType->stackSize == 4) {
+					// a 4-byte element (List<int>, List<float>): the token says so, and then it is the same as ldelem.i4 (which a native block does)
+					PushOp(JIT_LOAD_ELEMENT_I32);
+				} else {
+					PushOpParam(JIT_LOAD_ELEMENT, pStackType->stackSize);
+				}
 				PushStackType(pStackType);
 				break;
 
 			case CIL_LDELEMA:
-				PopStackTypeMulti(2); // Don't care what any of these are
-				GetUnalignedU32(pCIL, &cilOfs); // Don't care what this is
-				PushOp(JIT_LOAD_ELEMENT_ADDR);
-				PushStackType(types[TYPE_SYSTEM_INTPTR]);
+				{
+					// the type token gives the element size, which the native blocks need to compute the address
+					tMD_TypeDef *pElemType;
+					u32Value = GetUnalignedU32(pCIL, &cilOfs);
+					pElemType = MetaData_GetTypeDefFromDefRefOrSpec(pMetaData, u32Value, pMethodDef->pParentType->ppClassTypeArgs, pMethodDef->ppMethodTypeArgs);
+					MetaData_Fill_TypeDef(pElemType, NULL, NULL);
+					PopStackTypeMulti(2); // Don't care what any of these are
+					PushOpParam(JIT_LOAD_ELEMENT_ADDR_N, pElemType->arrayElementSize);
+					PushStackType(types[TYPE_SYSTEM_INTPTR]);
+				}
 				break;
 
 			case CIL_STELEM_I1:
+				PopStackTypeMulti(3); // Don't care what any of these are
+				{
+					// byte[] and sbyte[] have 1-byte elements, bool[] 4-byte ones: choose from the array's type, if it is known
+					U32 elemSize = KnownArrayElementSize(typeStack.ppTypes[typeStack.ofs]);
+					PushOp(elemSize == 1 ? JIT_STORE_ELEMENT_I1 : (elemSize == 4 ? JIT_STORE_ELEMENT_I4 : JIT_STORE_ELEMENT_32));
+				}
+				break;
 			case CIL_STELEM_I2:
+				PopStackTypeMulti(3);
+				PushOp(JIT_STORE_ELEMENT_I2);
+				break;
 			case CIL_STELEM_I4:
 			case CIL_STELEM_R4:
-				PopStackTypeMulti(3); // Don't care what any of these are
-				PushOp(JIT_STORE_ELEMENT_32);
+				PopStackTypeMulti(3);
+				PushOp(JIT_STORE_ELEMENT_I4);
 				break;
 
 			case CIL_STELEM_I:   // native int and references are pointer-sized
@@ -1563,7 +2758,11 @@ conv2:
 				GetUnalignedU32(pCIL, &cilOfs); // Don't need this token, as the type stack will contain the same type
 				pStackType = PopStackType(); // This is the type to store
 				PopStackTypeMulti(2); // Don't care what these are
-				PushOpParam(JIT_STORE_ELEMENT, pStackType->stackSize);
+				if (pStackType->stackSize == 4 && KnownArrayElementSize(typeStack.ppTypes[typeStack.ofs]) == 4) {
+					PushOp(JIT_STORE_ELEMENT_I4);     // (the array's type, still on the type stack, says its elements are 4 bytes)
+				} else {
+					PushOpParam(JIT_STORE_ELEMENT, pStackType->stackSize);
+				}
 				break;
 
 			case CIL_STFLD:
@@ -1953,6 +3152,10 @@ cilLeave:
 
 	} while (cilOfs < codeSize);
 
+	// Replace runs of instructions that have a fused form (before the branch targets are converted, while every target
+	// is still known from branchOffsets)
+	FuseOps(&ops, &branchOffsets, pJITOffsets, instrList, numInstr, pJITted, codeSize, pMethodDef);
+
 	// Apply branch offset fixes
 	for (i=0; i<branchOffsets.ofs; i++) {
 		U32 ofs, jumpTarget;
@@ -2065,7 +3268,7 @@ combineDone:
 
 	// Change maxStack to indicate the number of bytes needed on the evaluation stack.
 	// This is the largest number of bytes needed by all objects/value-types on the stack,
-	pJITted->maxStack = typeStack.maxBytes;
+	pJITted->maxStack = typeStack.maxBytes + pJITted->inlineExtraStack;   // (what the methods inlined into native blocks need)
 
 	free(typeStack.ppTypes);
 
@@ -2078,6 +3281,7 @@ combineDone:
 
 	DeleteOps(branchOffsets);
 	free(pJITOffsets);
+	free(instrList);
 
 	// Copy ops to some memory of exactly the correct size. To not waste memory.
 	// (The op stream is made of tOpWord, and the sequence points of I32: they are different sizes on 64-bit.)
@@ -2122,6 +3326,9 @@ void JIT_Prepare(tMD_MethodDef *pMethodDef, U32 genCombinedOpcodes) {
 
 	pMetaData = pMethodDef->pMetaData;
 	pJITted = (genCombinedOpcodes)?TMALLOC(tJITted):TMALLOCFOREVER(tJITted);
+	// (malloc does not clear it; pOps in particular must be NULL until the method has been compiled, which is how a method that is
+	// still being compiled is told from one that is done)
+	memset(pJITted, 0, sizeof(tJITted));
 #ifdef GEN_COMBINED_OPCODES
 	pJITted->pCombinedOpcodesMem = NULL;
 	pJITted->opsMemSize = 0;
@@ -2162,14 +3369,23 @@ void JIT_Prepare(tMD_MethodDef *pMethodDef, U32 genCombinedOpcodes) {
 
 		// PInvoke call
 		tMD_ImplMap *pImplMap = MetaData_GetImplMap(pMetaData, pMethodDef->tableIndex);
-		fnPInvoke fn = PInvoke_GetFunction(pMetaData, pImplMap);
-		if (fn == NULL) {
-			Crash("PInvoke library or function not found: %s()", pImplMap->importName);
+		const tFFIEntry *pFfi = FFI_Find(MetaData_GetModuleRefName(pMetaData, pImplMap->importScope), pImplMap->importName);
+		fnPInvoke fn = NULL;
+		if (pFfi != NULL) {
+			// named in the FFI manifest: called through its wrapper (from here, with the parameters in a frame)
+			const char *pBad = FFI_CheckSignature(pFfi, pMethodDef);
+			if (pBad != NULL) { Crash("FFI manifest and DllImport disagree: %s", pBad); }
+		} else {
+			fn = PInvoke_GetFunction(pMetaData, pImplMap);
+			if (fn == NULL) {
+				Crash("PInvoke library or function not found: %s()", pImplMap->importName);
+			}
 		}
 
 		pCallPInvoke = TMALLOCFOREVER(tJITCallPInvoke);
 		pCallPInvoke->opCode = Translate(JIT_CALL_PINVOKE, 0);
 		pCallPInvoke->fn = fn;
+		pCallPInvoke->ffi = pFfi;
 		pCallPInvoke->pMethod = pMethodDef;
 		pCallPInvoke->pImplMap = pImplMap;
 
