@@ -87,6 +87,17 @@ Each has a regression test, and expectations were checked against Mono.
   compiles `if (a < b) body` to) shared the ordered handlers, so `if (NaN < 1f)` ran its body.
 * `Thread.Sleep` in the main thread ended the program (rc = the sleep time): the scheduler returned when every thread was
   sleeping, which only a JavaScript host wants.
+* **Delegates**: every invocation `malloc`'d a copy of its arguments and kept it on the *caller's* frame, so a loop calling a delegate
+  N times lost N-1 buffers (53 MB peak on the `delegates` benchmark; now 11.5 MB, and 2.7x faster: a one-target delegate uses its
+  arguments where they are). `d -= x` crashed ("Opcode not available": `Delegate.Equals` boxes an `IntPtr`, and boxing a pointer-typed
+  value had no handler, on 32 bit as well), and behind that `RemoveImpl` removed *every* matching target where .NET removes the last.
+* **Interface calls on `null`** crashed the process (the receiver was never checked); they throw `NullReferenceException`.
+* **Casts of arrays**: `x is Array` was false for every array, and an `int[]` was an `object[]` (covariance was applied to value-type
+  elements). `castclass`/`isinst` also accept an exact type, or an interface the type lists, without the general walk.
+* `List<short>` and `List<sbyte>` indexers returned zero-extended values (-900 came back as 64636): the generic `ldelem.any` copied the
+  element's bytes into a zeroed slot. `short` and `sbyte` now use the signed loads, as `ldelem.i2` and `ldelem.i1` do.
+* `IntPtr.ToInt64()` (and any `(long)` of a pointer) could not be compiled on a 64-bit target: a 64-bit to 64-bit conversion chose an opcode that
+  was "not used" on 32 bit and has no handler. It emits nothing now, as the 8 bytes are already the result.
 
 ## Tests
 
@@ -102,6 +113,20 @@ timeout, `DNA_TEST_TIMEOUT`, so a hang fails its own check):
   `tests/gen_*.py`. `MathBits` compares every `Math`/`MathF` result bit for bit with real .NET (it needs a .NET SDK,
   and is skipped without one: Mono 6.8 lacks `Math.Log2`);
 * `tests/il/*.il`: IL for opcodes C# does not emit, assembled once for Mono and once for DNA.
+* `tests/dotnet/StencilRegisters.cs`, **generated from the table of register stencils** (`tools/gen_vstencil_tests.py`; the suite checks that
+  it is current): a method for each shape of expression that one of the 851 stencils is for (operands that are locals, literals, 64-bit
+  literals, a result in the register or a value in memory; results that go on in the register, to another local or back into the first
+  operand; all six comparisons, and their negations for floating point, which are the unordered branches), run over awkward values (the
+  extremes of each type, shift counts of 0 to 65, NaN, both zeros, infinities) and compared with Mono, plus whole-expression shapes for what the
+  pass must get right between operations (two values alive at once, a store to a local that a pending operand describes, a value on the stack
+  where two paths meet, a value held across a call). One program compiles all 851 stencils, and the suite checks that every stencil, plain and
+  register (the plain ones through `DNA_NO_VSTACK=1`, which is also how they are reached for what the pass does not do), is compiled by some test.
+  Not generated, because C# cannot produce them and so nothing could test them: a shift by a bare local (a compiler masks the count with `& 31`),
+  `==` and `!=` with the constant first, `brtrue` on a computed 8-byte value, the conversion of a constant (folded by the compiler, and by the JIT). Those shapes
+  take the plain stencils, which is also what the pass does for anything it does not know. 22 mutations of the pass and the templates (the wrong
+  condition code, no unordered test, operands swapped, a pending operand not flushed before a store, nothing flushed at a branch target, two values in the
+  register, the wrong pool constant, a popped operand not popped, ...) were all caught but two, which are equivalent: a value in the register that is
+  duplicated is read correctly because anything that would overwrite the register spills every entry that names it, and an island is already preceded by a flush.
 
 Files named `*.dnaonly.*` are self-checking programs for behaviour the reference runtime does not
 share, `*.dnafail.il` must be refused by DNA with the stated message. Cases where Mono aborts or the
@@ -115,8 +140,8 @@ Crust itself refuses (passed to its `assert_refuses`) are excluded. Currently 55
 ## Performance
 
 DNA is an interpreter, and `tools/benchmark_mono.py` measures it against Mono's JIT on small programs (the same C# for both,
-each timing its own work, with a checksum so that a wrong answer shows). Steady-state code is slower, by 6 to 74 times, and
-start-up, cold code, exceptions, string building and `Array.Copy` are faster. What has been done about the first, each step
+each timing its own work, with a checksum so that a wrong answer shows). Steady-state code is slower, by 1.1 to 40 times (most of it
+by 2 to 9), and start-up, cold code, exceptions, string building, `Array.Copy` and calls into C (`[DllImport]`, see Native FFI below) are faster. What has been done about the first, each step
 measured on its own and each switchable so that a suspected miscompile can be bisected:
 
 * **The call path** (`MethodState_Direct`): one allocation for a frame, and inline copies for the few words of arguments,
@@ -129,19 +154,72 @@ measured on its own and each switchable so that a suspected miscompile can be bi
   instruction reading both locals, likewise local-op-constant, `i += k`, and compare-and-branch. It is never done across a
   branch target, a try block boundary or a debugger sequence point. `int_loop` 1.55x, `recursion`/`virtual_calls` 16-19%.
   `DNA_NO_FUSION=1` turns it (and native blocks) off.
+* **Fast call and return** (`JIT_Execute.c`, `FAST_CALL`): `call` and `callvirt` (once the target is found in the vtable) make the new
+  frame right in the handler instead of through `MethodState_Direct`, `CreateParameters` and a `Thread_StackAlloc` call: no test of
+  which kind of call it is, only the locals cleared (the parameters are written by the copy of the arguments), the arguments copied
+  with fixed-size moves for the usual sizes, and a returning frame is freed by resetting the thread-stack offset. Anything unusual (a
+  method not yet compiled, a null `this`, a finalizer or delegate frame) goes the long way as before. 18% fewer instructions on
+  `recursion`; in time `recursion` -22%, `list_int` and `struct_math` -14%, `virtual_calls` -8%. Off with `-DNO_FAST_CALL`, and
+  automatically with `GEN_COMBINED_OPCODES`, `DIAG_METHOD_CALLS` or `_DEBUG`. Interface calls use it too (the interface map is searched
+  in the handler), `ldelem.ref` reads the pointer directly, and a delegate with one target needs no copy of its arguments:
+  `virtual_calls` is 21% faster than with none of it.
+* **Garbage collection of candidate pointers** (`Heap.c`): marking looked up every word of every scanned object in the allocation tree,
+  and worked out the size of each entry on the way down (`GetSize`: a type lookup, and a length for arrays and strings) just to
+  choose left or right. A candidate outside the addresses of all heap entries, which is nearly every integer in an array of structs,
+  is now dropped at once, and the search compares start addresses only and sizes the one entry it ends at (the end stays inclusive, as
+  a zero-sized object needs). `dictionary` -44%, `list_int` -20%. `GcRoots` checks what must stay alive (references only inside arrays
+  of structs, zero-sized objects, interior pointers held across collections, collections under allocation pressure, the evaluation
+  stack, weak references) against Mono; it cannot see over-retention, which changes memory use and not output.
 * **Native blocks** (`native/stencils/stencils.c`, `tools/gen_stencils.py`, `NativeBlocks.c`): copy-and-patch compilation, as in
   CPython's JIT. Each stencil is a tiny C function that does what one interpreter instruction does to the memory evaluation
   stack, compiled by gcc; the generator reads the object file, checks that it is straight-line code whose only relocations are
   holes, and writes the bytes and the holes into `Stencils.gen.h`. When the JIT finds a region made only of instructions that
   have stencils, it copies them into executable memory, patches the holes (a local's offset, a constant, a field offset, a
   branch target) and the region becomes one instruction. The stencils cover loads and stores of 4- and 8-byte locals,
-  constants (a 64-bit one is two stencils), `float32`, `double`, 32-bit and 64-bit integer arithmetic, `int`/`float` conversions and the narrowing `conv.i1`..`conv.u4`, array access
+  constants (a 64-bit one is two stencils), `float32`, `double`, 32-bit and 64-bit integer arithmetic, `int`/`long`/`float`/`double` conversions and the narrowing `conv.i1`..`conv.u4`, array access
   (`ldelem`/`stelem` of 4-byte elements and of bytes, `ldelema`, `ldlen`, with null and bounds checks that exit to the
-  interpreter), `ldloca`/`ldfld`/`stfld` on 4-byte fields
-  (structs in locals, `ref` arguments, objects), `dup`, and `br`/`brtrue`/`brfalse`, the six integer compare-and-branches and
+  interpreter), `ldloca`/`ldfld`/`stfld`/`ldflda` on fields of 4 bytes and of 8 (`long`, `double`,
+  references: structs in locals, `ref` arguments, objects), `dup`, and `br`/`brtrue`/`brfalse`, the six integer compare-and-branches and
   the ten `float32` and ten `double` ones (with NaN handled as the interpreter does) and the six `long` ones, so straight-line vector code, loops and conditionals are
   covered, as long as they contain nothing else.
-  * Same semantics as the interpreter: the evaluation stack is still in memory, so the collector, exceptions and everything
+  * **Calls are inlined.** A method whose whole body is one loop-free native block that calls and allocates nothing keeps a *recipe*
+    (its stencils, holes and internal branch targets). A call to it from a block (`call`, or `callvirt` of a method that is not
+    virtual) is replaced by: for `callvirt`, a check of `this`; the arguments, popped into an extension of the caller's frame;
+    the callee's locals, cleared; then the callee's stencils with their frame offsets and branch targets moved. A leaf that
+    inlined a leaf is still one recipe. A region that is the whole of a short method gets a recipe at any length, and a block
+    containing an inlinable call counts it as worth a block. Not inlined: virtual targets (the object decides), recursion, anything
+    that calls, allocates, boxes, loops, or has a handler. The callee is compiled when its caller is (so the cost of compiling it
+    moves earlier, and a callee that is never called is still compiled). `DNA_NO_INLINE=1` turns it off, `DNA_INLINE_LIMIT=n`
+    allows only the first n (to find by bisection which inline is at fault), and `DNA_FUSION_DEBUG=1` says for every call why it
+    was or was not inlined and dumps each block. `vec_calls` 10.4 -> 3.3 ms and `vec_class` 5.7 -> 3.4 ms in A/B runs.
+  * **Islands, and inlining methods with cold paths.** The evaluation stack is in memory, so the interpreter can run *any* instruction in the
+    middle of a block: calls, `throw`, `newobj`, `ldstr`, casts, boxing and static fields are islands. The block leaves by an exit to a stub
+    (the instruction's own words, then `JIT_NATIVE_RESUME block entry`, placed after the end of the method's ops) and is entered again at the
+    stencil after it. Only in methods without exception handlers, because a stub is outside every `try` range. An island costs an exit, a stub
+    and a re-entry, so a region needs 6 stencils of compiled code per island or it ends at its first island (without that rule `recursion` was
+    38% slower). Islands let a *callee* with a cold path be inlined: its recipe carries its islands, `ldstr` becomes `JIT_LOAD_STRING_MD` with the
+    metadata of the method it came from (a corlib `throw new ArgumentOutOfRangeException("index")` inlined into user code finds its string), and
+    a branch to the method's own `ret` is a jump to the end of the recipe. `final` virtual methods (every interface implementation) and the
+    methods of sealed classes are called directly. `List<int>`'s `Add`, `get_Count` and `get_Item` are now a few stencils in the caller's
+    block (`list_int` 33.7 -> 8.7 ms). `DNA_NO_ISLANDS=1` turns islands off.
+  * **Values in registers** (`native/src/VStack.c`, `tools/gen_vstencils.py`). The plain stencils each do what one instruction does to the
+    evaluation stack in memory, so `x = a + b` is four of them and a round trip through memory for every value. A pass over the list
+    of stencils keeps a *virtual* evaluation stack instead: a load of a local or a constant emits nothing and only records where the
+    value is (a frame offset, an immediate, or the one cached register, `eax`/`rax`/`xmm0`); an operator takes its operands from where
+    they are, and one three-address stencil does it and leaves the result in the register, or writes it to the local that the next
+    instruction stores it to, or (`a += b`) updates the local in place. A first operand that was spilled to the stack in memory (there
+    is only one register: `(a*b) ^ (c>>3)` spills one) is read from there and popped by the stencil; a 64-bit constant is read from a
+    per-block pool (`HOLE5`, RIP-relative), and compares with a local or constant are a single `cmp`. There are 851 such stencils, one for each
+    operator and each combination of where the operands are, written by `gen_vstencils.py` from templates. `i++; s += i; i < n` is 4 stencils
+    instead of 12. Anything the pass does not do (a field, an array, a call, an island) takes its operands from the stack in memory, so
+    the virtual stack is first written there; the same is done at every place that something can jump or be entered to, and at the end
+    of the block, so the rest of the compiler never sees a value that is not in memory. A value that is only a description of a local is
+    read late, so before a store to that local every entry that describes it is flushed (`a + (a = b)`). A recipe that is inlined stays in
+    plain stencils and is optimised again in its caller's block. In one run: `vec_calls` 3.6x faster than without it, `vec_inline` 3.5x,
+    `vec_struct` 2.5x, `double_loop` 2.3x, `vec_bounce` 2.3x, `sieve` 1.9x, `int_loop` 1.8x; what is bound by calls, allocation or memory
+    (`alloc`, `boxing`, `dictionary`, `recursion`, `virtual_calls`) is within 5% either way. `DNA_NO_VSTACK=1` turns it off.
+  * Same semantics as the interpreter: between the places where the pass keeps a value in a register the evaluation stack is in
+    memory, and at every branch target, entry, island and exit it is, so the collector, exceptions and everything
     else see what they always did. A null reference in a field access makes the block return a status, and the interpreter
     throws `NullReferenceException` at that instruction, with the earlier effects done and the later ones not.
   * A block is entered only at its start (and, after giving up the processor, at the target of one of its backward
@@ -157,40 +235,60 @@ measured on its own and each switchable so that a suspected miscompile can be bi
 
 Measured on one machine, best of 3 (`python3 tools/benchmark_mono.py`; Mono 6.8, DNA 64-bit release):
 
-| | Mono ms | DNA ms | |
-|---|---|---|---|
-| `exceptions` | 10.8 | 1.4 | 7.64x faster |
-| `string_concat` | 56.0 | 7.6 | 7.35x faster |
-| `cold_methods` | 7.4 | 1.7 | 4.24x faster |
-| `startup` | 8.0 | 2.4 | 3.34x faster |
-| `array_copy` | 6.5 | 4.9 | 1.31x faster |
-| `vec_inline` | 3.5 | 4.1 | 1.16x slower |
-| `math_calls` | 14.8 | 22.3 | 1.51x slower |
-| `double_loop` | 2.9 | 5.5 | 1.9x slower |
-| `vec_array` | 0.13 | 0.42 | 3.14x slower |
-| `vec_aos` | 0.17 | 0.59 | 3.39x slower |
-| `vec_bounce` | 0.89 | 3.3 | 3.65x slower |
-| `sieve` | 4.1 | 16.3 | 3.95x slower |
-| `vec_struct` | 0.61 | 2.4 | 3.96x slower |
-| `int_loop` | 1.9 | 11.1 | 5.9x slower |
-| `recursion` | 0.38 | 3.4 | 8.95x slower |
-| `vec_calls` | 0.85 | 9.2 | 10.8x slower |
-| `list_int` | 3.6 | 41.7 | 11.6x slower |
-| `vec_class` | 0.40 | 5.2 | 12.9x slower |
-| `struct_math` | 4.8 | 71.3 | 14.9x slower |
-| `boxing` | 3.0 | 47.2 | 15.7x slower |
-| `virtual_calls` | 2.5 | 43.0 | 17x slower |
-| `delegates` | 3.8 | 75.8 | 19.7x slower |
-| `alloc` | 3.1 | 60.5 | 19.8x slower |
-| `dictionary` | 2.7 | 226 | 84.5x slower |
+| | Mono ms | .NET 8 ms | DNA ms | DNA against Mono |
+|---|---|---|---|---|
+| `cold_methods` * | 6.4 | 15.7 | 0.03 | (see note) |
+| `ffi_ref` | 28.8 | 5.3 | 1.5 | 19.8x faster |
+| `ffi_sum6` | 110 | 4.9 | 10.0 | 10.9x faster |
+| `ffi_add` | 110 | 4.4 | 10.3 | 10.7x faster |
+| `ffi_mixed` | 114 | 5.8 | 11.8 | 9.63x faster |
+| `string_concat` | 69.7 | 17.6 | 7.6 | 9.17x faster |
+| `exceptions` | 9.0 | 29.0 | 1.0 | 8.84x faster |
+| `ffi_buf` | 60.6 | 9.6 | 8.5 | 7.11x faster |
+| `ffi_str` | 74.1 | 17.2 | 21.1 | 3.52x faster |
+| `startup` | 9.2 | 26.3 | 3.2 | 2.92x faster |
+| `vec_inline` | 3.9 | 1.1 | 1.7 | 2.26x faster |
+| `ffi_echo` | 51.7 | 22.3 | 50.2 | about the same |
+| `math_calls` | 15.3 | 3.3 | 15.0 | about the same |
+| `array_copy` | 7.7 | 7.4 | 7.8 | about the same |
+| `double_loop` | 3.3 | 2.0 | 3.4 | about the same |
+| `vec_calls` | 1.1 | 0.82 | 1.3 | 1.2x slower |
+| `vec_bounce` | 0.95 | 0.84 | 1.4 | 1.46x slower |
+| `vec_struct` | 0.77 | 0.83 | 1.4 | 1.82x slower |
+| `list_int` | 3.6 | 2.3 | 7.9 | 2.19x slower |
+| `sieve` | 4.8 | 3.1 | 12.9 | 2.7x slower |
+| `vec_array` | 0.16 | 1.1 | 0.56 | 3.48x slower |
+| `vec_aos` | 0.20 | 1.0 | 0.85 | 4.26x slower |
+| `int_loop` | 2.3 | 2.1 | 10.6 | 4.53x slower |
+| `recursion` | 0.47 | 0.27 | 2.6 | 5.61x slower |
+| `struct_math` | 6.2 | 0.55 | 37.2 | 5.96x slower |
+| `vec_class` | 0.48 | 0.99 | 3.5 | 7.2x slower |
+| `delegates` | 3.7 | 2.7 | 35.8 | 9.72x slower |
+| `boxing` | 3.6 | 4.4 | 52.9 | 14.8x slower |
+| `alloc` | 4.1 | 6.1 | 64.7 | 15.9x slower |
+| `virtual_calls` | 2.7 | 3.4 | 50.6 | 18.8x slower |
+| `dictionary` | 2.9 | 8.6 | 129 | 43.8x slower |
 
-What that shows, and what it does not: the native blocks bring code that stays in locals, fields and arrays (`float32`, `int`, `long`,
-`double`) within 1.2 to 7 times of Mono's JIT (`vec_inline`, `vec_bounce`, `vec_array`, `vec_aos`, `vec_struct`, `double_loop`, `int_loop`),
-where the plain interpreter is 15 to 25 times behind; anything that calls, allocates, boxes or does virtual dispatch is still interpreted
-and still 10 to 80 times behind, and the calls dominate the particle benchmark (`vec_class`). Inside a block the cost is about two cycles a
-stencil, because the evaluation stack is still in memory; keeping stack values in registers (a virtual stack, three-address stencils) is the
-next step for that, and 2- and 8-byte array elements, `ldelem.ref`, value-producing comparisons (`clt`, `ceq`) and calls are what would
-make more code eligible. None of this has been tried on any other operating system or CPU.
+\* `cold_methods` times the first call of many methods. Inlining compiles a callee when its caller is compiled, which is before the
+timer starts, so the timed region shrinks from about 1.7 ms to 0.04 ms; the whole run is not faster (3 ms against 2 ms with
+`DNA_NO_INLINE=1`: compiling callees early costs a little). Read that row as an artifact, not a speedup. Absolute times also vary
+by up to 2x between runs and sessions (the same build gave 10.5 ms for `int_loop` in one session and 19 ms in another while Mono and .NET 8 did not
+move: code that goes through memory this much is sensitive to the host CPU); only ratios within one run, or interleaved A/B runs, mean anything. The
+.NET 8 column is from the same run.
+
+What that shows, and what it does not: the native blocks bring code that stays in locals, fields and arrays (`float32`, `int`,
+`long`, `double`, references) between 2.3 times faster and 4.5 times slower than Mono's JIT (`vec_inline`, `vec_array`, `vec_bounce`, `vec_aos`, `vec_struct`,
+`double_loop`, `sieve`, `int_loop`), where the plain interpreter is 15 to 25 times behind, and small methods that qualify, including ones with a cold path to throw or initialise, are part of
+their callers' blocks (`vec_calls`, `list_int`). What is still interpreted and still 5 to 50 times behind is what calls something that is not a small
+leaf (recursion, virtual and interface calls, delegates), allocates (`alloc`, `boxing`, `dictionary`: the collector and the allocation
+tree), or uses what has no stencil yet: structs by value in
+locals and arguments, `ldelem.ref`/`stelem.ref` and 2- and 8-byte array elements, `clt`/`ceq`. The register pass took the cost of the plain
+stencils (about two cycles each, every value through memory) out of arithmetic and compares; what remains slower than .NET 8 there is mostly
+what it does not yet do: field and array accesses still go through the stack in memory and so cost a flush, only one value is cached, and
+there is no use of a value across a loop iteration. Against .NET 8 the code inside blocks is 0.5 to 5 times slower (`vec_array` and `vec_aos`
+are faster, `int_loop` 5x and `sieve` 4x slower in the run below). The ordinary call path is about a quarter shorter than it was (it still builds a frame object of a dozen fields
+per call), so what cannot be inlined costs somewhat less than it did, not a different order of magnitude. None of this has been tried on any other operating
+system or CPU.
 
 How a stencil is matched, and what that costs when it goes wrong. An instruction is recognised by the address of its handler, so
 a stencil is only used for instructions the JIT emits as a distinct handler: `stelem.i1`/`.i2`/`.i4` are separate instructions
@@ -202,6 +300,79 @@ interpreted with a diagnostic build (`-DDIAG_OPCODE_USE`, `DNA_OPCODE_TOP=n`) or
 every stencil is exercised by some stencil test, which catches a stencil nobody uses but not a missed source instruction, and a second
 check fails if the classification compares some of the instructions that share a handler body but not all of them. Those do not share an
 address: `JIT_LOAD_I64` and `JIT_LOAD_F64` are adjacent labels with different values (which is why `ldc.r8` was missed).
+
+## Native FFI: `[DllImport]` of C functions (`build.py --ffi`)
+
+On a native build (not the browser one) a `DllImport` could not call C at all: `PInvoke_GetFunction` returned the JavaScript bridge off Windows.
+`build.py --ffi MANIFEST.json` builds the runtime with the C functions of a manifest in it (`build/dna_ffi`, with its own objects, so the normal
+build is untouched), and calls to them are direct.
+
+```json
+{
+  "c_files":  ["mylib.c"],
+  "cflags":   ["-O2"],
+  "functions": [
+    {"library": "mylib", "entry": "add_numbers", "ret": "int", "args": ["int", "int"]}
+  ]
+}
+```
+
+```csharp
+[DllImport("mylib", EntryPoint = "add_numbers", CallingConvention = CallingConvention.Cdecl)]
+public static extern int AddNumbers(int a, int b);
+```
+
+Types (`tools/gen_ffi.py` has the full description; at most 6 arguments):
+
+* `int uint short ushort sbyte byte long` (`int64_t`) `ulong` (`uint64_t`) `longlong ulonglong float double`, and `void` for a result.
+* `intptr`: a pointer-sized value passed as it is: an `IntPtr`, a `ref` or `out` argument (the managed pointer itself: nothing moves in this
+  runtime, so there is no pinning and no copy), an unsafe pointer. `"ref:int32_t*"` gives the C prototype's pointer type.
+* `buf`: a C# array of a blittable type; C gets a pointer to its first element (null for null). Zero copy. `"buf:const double*"`.
+* `cstr`: a C# `string`; C gets a temporary NUL-terminated UTF-8 copy for the duration of the call (on the stack if it fits in 256 bytes). As a result,
+  a `char*` that becomes a string and is then freed with `free()`, which is what .NET does with a string result.
+
+Not yet: structs by value (pass them by `ref`), callbacks, `StringBuilder`, more than 6 arguments. How it works (`tools/gen_ffi.py`, `native/src/FFI.c`):
+
+* The generated unit declares each function from the manifest and then `#include`s your C files, so a definition that disagrees with the
+  manifest is a compile error. (Name the functions without `static`, and avoid helper names that clash between files.)
+* A `DllImport` is looked up in the generated table when the method that calls it is compiled (`FFI_Find`, by library and entry point; `libmylib.so`,
+  `mylib.dll` and `mylib` are the same library). There is no `dlopen` and no name at run time. The C# declaration is checked against the
+  manifest and a disagreement is refused when the method is compiled, with a message, instead of running with a corrupt stack.
+* The call site is `JIT_FFI_CALL`: a generated wrapper reads the arguments where they lie on the evaluation stack, calls the function and
+  writes the result where the first argument was. No frame, no copy, no marshalling. (A method reached any other way, such as through a
+  delegate, calls the same wrapper from its frame.)
+* **In a native block the call is stencils.** For each distinct signature the generator writes a stencil (assembly: each argument from its stack
+  slot to its C ABI register, integers and floating point assigned independently; the stack aligned; a call through `r11`; a narrow result
+  extended; the stack pointer adjusted) and two small ones put the function's address in `r11` from 32-bit holes. The loop around the call stays
+  in one block. `gen_stencils.py --extra-c/--extra-names/--out` compiles them into a `Stencils.gen.h` of the FFI build's own.
+* The functions run on the interpreter's thread, with the collector not involved; they must not call back into .NET. A signature with a string has
+  no stencil (the wrapper converts it), and runs as an island in a block.
+
+Measured against Mono 6.8 and against **.NET 8**, which is the stricter baseline: the same C#, the same C as a shared library (`benchmark_mono.py
+--net8` builds all three; times are for the whole loop):
+
+| | Mono 6.8 | .NET 8 | DNA | DNA against .NET 8 |
+|---|---|---|---|---|
+| `add_numbers(int, int)`, 2M calls | 109 ms | 4.7 ms | 7.3 ms | 1.6x slower |
+| six integer arguments, 2M calls | 115 ms | 4.3 ms | 10.2 ms | 2.4x slower |
+| int, double, long, float, int; double result, 2M | 119 ms | 5.1 ms | 11.2 ms | 2.2x slower |
+| an `int[]` argument (C reads 16 elements), 500k | 66 ms | 9.5 ms | 8.2 ms | 1.2x **faster** |
+| two `ref` arguments, 500k | 28 ms | 4.6 ms | 1.9 ms | 2.5x **faster** |
+| a string argument, 500k | 72 ms | 14.1 ms | 22.7 ms | 1.6x slower |
+| a string in and a string out, 200k | 52 ms | 21.0 ms | 47.3 ms | 2.3x slower |
+
+DNA is 3 to 15 times faster than Mono and, against .NET 8, between 2.5x faster and 2.4x slower. The calls are not what costs: a loop of nothing but
+`s += i` takes 2.9 ns an iteration here, as long as .NET 8 takes for a whole `DllImport` call, and the C call itself adds about 0.9 ns to it
+(`add`: 3.8 ns). The rest is the code around the call, whose values still go through the evaluation stack in memory; keeping them in registers
+is what would close the gap, for FFI and for everything else. The string results are slow because making a managed string is an allocation.
+
+(Mono pays for a marshalling stub and a managed/native transition on every call.) `tests/dotnet/FfiCalls.cs` calls 14 functions (narrow results,
+64-bit values, integer and floating-point arguments mixed, a pointer, state in C, delegates, a C function that needs an aligned stack) and
+`FfiMarshal.cs` arrays, `ref`/`out` (into locals, array elements, struct and object fields, statics) and strings (empty, accents, CJK, a surrogate pair,
+255/256 bytes and longer than the buffer, null); both are identical to Mono. The suite also checks that the generated stencils were compiled into blocks and
+that a mismatched `DllImport` (an int for a long, an int for a string, a string for an int) is refused.
+64-bit values, integer and floating-point arguments mixed, a pointer, state in C, delegates, a C function that needs an aligned stack) and is
+identical to Mono; the suite also checks that the generated stencils were compiled into blocks and that a mismatched `DllImport` is refused.
 
 ## Where DNA deliberately differs
 
@@ -265,6 +436,8 @@ operating systems and architectures are untested; WebAssembly is paused (see abo
 
 ## Known gaps
 
+* A class that implements two instantiations of the same generic interface (`IG<int>` and `IG<long>`) crashes on the first call
+  through either. One instantiation per class works.
 * `localloc` (`stackalloc`) and `__arglist` are not implemented. `stackalloc` needs a decision on
   raw-pointer access width, which this runtime currently infers from the address.
 * 64-bit enums are handled as 32-bit values.

@@ -39,6 +39,7 @@ git clone https://github.com/brentharts/crust.git ../crust
 make                                  # python3 build.py: build/dna (native, 64-bit on x86-64) and build/corlib.dll
 make ARGS="--m32"                     # python3 build.py --m32: build/dna32 (32-bit)
 make test                             # build, then the whole suite     (python3 tests/run_tests.py)
+python3 build.py --ffi M.json            # the runtime with the C functions of a manifest built in (build/dna_ffi): [DllImport] of them is a direct call; see NATIVE.md
 python3 tests/crust_conformance.py    # Crust's C# programs, DNA against Mono   (--32 / --64 choose the binary)
 make clean
 ```
@@ -58,7 +59,7 @@ mcs -nostdlib -r:build/corlib.dll prog.cs      # corlib.dll must sit beside prog
 
 | | 32-bit | 64-bit |
 |---|---|---|
-| `tests/run_tests.py` | 54 of 54 | 55 of 55 |
+| `tests/run_tests.py` | 68 of 68 | 76 of 76 |
 | Crust survey (`crust_conformance.py`) | 55 of 55 | 55 of 55 |
 | `Math`/`MathF` against .NET 8 (`MathBits`) | 41 of 56 | 56 of 56 |
 
@@ -86,8 +87,11 @@ DNA deliberately differs from the reference runtimes, and the known gaps.
 | `Makefile` | `make` calls `python3 build.py`; `ARGS="..."` passes options, and `test` and `clean` forward too |
 | `tools/gen_metadata_layout.py` | generates `native/src/MetaDataLayout.gen.h`, how each metadata table row maps onto its C struct, for any word size |
 | `tools/gen_fused_ops.py` | generates the fused instructions (one instruction for a run such as `ldloc; ldloc; add`): opcode numbers, interpreter handlers, and what the JIT matches |
+| `tools/gen_vstencils.py` | the 851 register (three-address) stencils, from templates: one for each operator and each place its operands can be (a local, a constant, the register, the stack in memory, a 64-bit constant) |
+| `tools/gen_vstencil_tests.py` | `tests/dotnet/StencilRegisters.cs`, a method for each shape of expression that one of them is for, compared with Mono |
 | `tools/gen_stencils.py` | turns `native/stencils/stencils.c` into machine-code templates with holes, for the native blocks (x86-64 Linux; needs gcc and objdump) |
-| `tools/benchmark_mono.py` | 24 small C# benchmarks, DNA against Mono, with a table and a matplotlib chart (`--help`) |
+| `tools/benchmark_mono.py` | 31 small C# benchmarks (7 of them `[DllImport]` calls, which build the `--ffi` runtime themselves), DNA against Mono and with `--net8` against .NET 8, with a table and a matplotlib chart (`--help`) |
+| `tools/gen_ffi.py` | from a manifest of C files and functions (`build.py --ffi`): the wrappers, the table and the call stencils that make `[DllImport]` of them a direct call |
 | `tools/check_internalcall_params.py` | checks every native method's argument reads against its registered signature, for 32- and 64-bit pointers (`--fix` rewrites them) |
 | `tests/gen_*.py` | generate the large test programs |
 
