@@ -11,6 +11,7 @@ Usage:
     python build.py --no-corlib     # skip build/corlib.dll
     python build.py --lower-only    # only run cpprust on native/src/cpp/*.cpp
     python build.py --run X.exe     # build, then run: build/dna X.exe
+    python build.py --ffi M.json    # the runtime with the C functions of a manifest built in -> build/dna_ffi (see tools/gen_ffi.py)
 
 `make` is a one-line wrapper around `python3 build.py`.
 
@@ -26,6 +27,7 @@ Crust's tools/cpprust.py into build/gen/, then compiled like any other C file.
 Crust is located with --crust DIR, $CRUST_ROOT, or a sibling ../crust checkout.
 """
 import argparse
+import json
 import concurrent.futures as cf
 import os
 import shutil
@@ -38,6 +40,9 @@ CPP_SRC = os.path.join(SRC, "cpp")
 BUILD = os.path.join(ROOT, "build")
 OBJ = os.path.join(BUILD, "obj")
 GEN = os.path.join(BUILD, "gen")
+
+FFI_INPUTS = []      # the manifest and C files of a --ffi build (what FFI.gen.c depends on)
+
 
 def sources():
     # NativeHost.c stubs the JavaScript bridge (js-interop.js) for native builds
@@ -118,6 +123,9 @@ LAYOUT_GEN = os.path.join(SRC, "MetaDataLayout.gen.h")
 LAYOUT_TOOL = os.path.join(ROOT, "tools", "gen_metadata_layout.py")
 FUSED_TOOL = os.path.join(ROOT, "tools", "gen_fused_ops.py")
 FUSED_GEN = [os.path.join(SRC, "JIT_FusedOps.gen.h"), os.path.join(SRC, "JIT_Fused.gen.h")]
+VSTENCIL_TOOL = os.path.join(ROOT, "tools", "gen_vstencils.py")
+VSTENCIL_GEN = [os.path.join(ROOT, "native", "stencils", "vstencils.gen.c"), os.path.join(ROOT, "native", "stencils", "vstencils.json"),
+                os.path.join(SRC, "VStencils.gen.h")]
 STENCIL_TOOL = os.path.join(ROOT, "tools", "gen_stencils.py")
 STENCIL_GEN = [os.path.join(SRC, "Stencils.gen.h")]
 
@@ -125,7 +133,8 @@ STENCIL_GEN = [os.path.join(SRC, "Stencils.gen.h")]
 GENERATED = [
     (LAYOUT_TOOL, [LAYOUT_GEN], [os.path.join(SRC, n) for n in ("MetaDataTables.h", "Types.h", "Compat.h")]),
     (FUSED_TOOL, FUSED_GEN, []),
-    (STENCIL_TOOL, STENCIL_GEN, [os.path.join(ROOT, "native", "stencils", "stencils.c")]),
+    (VSTENCIL_TOOL, VSTENCIL_GEN, []),
+    (STENCIL_TOOL, STENCIL_GEN, [os.path.join(ROOT, "native", "stencils", "stencils.c")] + VSTENCIL_GEN[:2]),
 ]
 
 
@@ -183,6 +192,9 @@ def main():
     ap.add_argument("--no-corlib", action="store_true", help="do not build build/corlib.dll")
     ap.add_argument("--lower-only", action="store_true",
                     help="only lower native/src/cpp/*.cpp to build/gen/*.c, then stop")
+    ap.add_argument("--ffi", metavar="MANIFEST.json",
+                    help="build the C files and functions of this manifest into the runtime, so that [DllImport] of them is a direct "
+                         "call (tools/gen_ffi.py says what the manifest holds). Makes build/dna_ffi, with its own objects")
     ap.add_argument("--verbose", "-v", action="store_true")
     ap.add_argument("-j", type=int, default=os.cpu_count() or 1)
     ap.add_argument("--run", nargs=argparse.REMAINDER,
@@ -206,11 +218,35 @@ def main():
         print(f"error: compiler '{args.cc}' not found", file=sys.stderr)
         return 1
 
-    global OBJ
+    global OBJ, GEN
     if args.m32:
         OBJ = os.path.join(BUILD, "obj32")
+    if args.ffi:
+        # its own objects and generated files: the generated C changes what the runtime is, and the normal build must stay as it is
+        OBJ = os.path.join(BUILD, "obj_ffi32" if args.m32 else "obj_ffi")
+        GEN = os.path.join(BUILD, "gen_ffi")
+        os.makedirs(GEN, exist_ok=True)
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import gen_ffi
+        import gen_stencils
+        manifest, ffi_files, ffi_funcs = gen_ffi.generate(args.ffi, GEN)
+        print("ffi: %d function(s) from %s" % (len(ffi_funcs), os.path.relpath(args.ffi, ROOT)))
+        # the stencils that call them go in a Stencils.gen.h of their own, which the include path puts before the normal one
+        sigs = json.load(open(os.path.join(GEN, "ffi_sigs.json")))
+        text = gen_stencils.generate(os.path.join(GEN, "ffi_stencils.gen.c"), sigs["stencil_names"]) if not args.m32 else None
+        hdr = os.path.join(GEN, "Stencils.gen.h")
+        if text is not None and (not os.path.exists(hdr) or open(hdr).read() != text):
+            open(hdr, "w").write(text)
+        elif text is None and os.path.exists(hdr):
+            os.remove(hdr)
+        ffi_extra = list(manifest.get("cflags", [])) + sum([["-I", os.path.dirname(p)] for p in ffi_files], [])
+        FFI_INPUTS[:] = [os.path.abspath(args.ffi)] + ffi_files
     cflags = ["-std=gnu99", "-Wno-pointer-sign", "-Wno-unused-result",
               "-fno-strict-aliasing", "-I", SRC]
+    if args.ffi and os.path.exists(os.path.join(GEN, "Stencils.gen.h")):
+        # the FFI build's Stencils.gen.h, with the stencils that call C functions as well. (-I would not do: a quoted include looks in the
+        # including file's own directory first, and finds the normal one there)
+        cflags = ["-DSTENCILS_HEADER=\"%s\"" % os.path.join(GEN, "Stencils.gen.h")] + cflags
     if args.m32:
         # -msse2 -mfpmath=sse: IEEE single/double arithmetic. The 32-bit default is the x87 FPU, which
         # computes in 80 bits and rounds a second time when storing, so some double divisions come out
@@ -227,6 +263,8 @@ def main():
     os.makedirs(OBJ, exist_ok=True)
     os.makedirs(GEN, exist_ok=True)
     hdr_time = newest_header()
+    if args.ffi and os.path.exists(os.path.join(GEN, "Stencils.gen.h")):
+        hdr_time = max(hdr_time, os.path.getmtime(os.path.join(GEN, "Stencils.gen.h")))
 
     # Objects are only valid for the flags they were built with: when the
     # compiler or flags change (e.g. --debug), throw the cached objects away.
@@ -244,6 +282,9 @@ def main():
     if rc:
         return rc
     units += gen_units
+    ffi_extra = ffi_extra if args.ffi else []
+    if args.ffi:
+        units.append(os.path.join(GEN, "FFI.gen.c"))
 
     if args.lower_only:
         return 0
@@ -253,6 +294,8 @@ def main():
         base = os.path.basename(unit)
         obj = os.path.join(OBJ, base[:-2] + ".o")
         dep_time = max(os.path.getmtime(unit), hdr_time)
+        if args.ffi and base == "FFI.gen.c":
+            dep_time = max([dep_time] + [os.path.getmtime(p) for p in FFI_INPUTS])     # the manifest and the C files it includes
         if not os.path.exists(obj) or os.path.getmtime(obj) < dep_time:
             todo.append(unit)
 
@@ -260,7 +303,7 @@ def main():
     if todo:
         print(f"compiling {len(todo)} file(s) with {args.cc}...")
         with cf.ThreadPoolExecutor(args.j) as ex:
-            for name, cmd, r in ex.map(lambda n: compile_one(args.cc, cflags, n), todo):
+            for name, cmd, r in ex.map(lambda n: compile_one(args.cc, cflags + (ffi_extra if os.path.basename(n) == "FFI.gen.c" else []), n), todo):
                 name = os.path.basename(name)
                 if args.verbose:
                     print(" ".join(cmd))
@@ -279,7 +322,7 @@ def main():
         return 1
 
     objs = [os.path.join(OBJ, os.path.basename(u)[:-2] + ".o") for u in units]
-    out = os.path.join(BUILD, "dna32" if args.m32 else "dna")
+    out = os.path.join(BUILD, ("dna_ffi" if args.ffi else "dna") + ("32" if args.m32 else ""))
     cmd = [args.cc, "-o", out] + (["-m32"] if args.m32 else []) + objs + ["-lm", "-lpthread"]
     if args.verbose:
         print(" ".join(cmd))
