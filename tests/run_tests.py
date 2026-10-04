@@ -140,12 +140,14 @@ def dotnet_programs():
               "Int64AndFloatOps", "RefAccess", "ConversionChains",
               "DelegateVirtual", "TypedReferences"}
     # Generated programs that print one line per case: DNA's whole stdout must equal Mono's.
-    output_parity = {"CheckedConversions", "UncheckedConversions", "ArithmeticMatrix", "UnboxChecks", "EnumFormatting", "ValueTypeBases", "ExceptionFilters", "Stopwatch", "StaticFields", "TryRegions", "DictionaryOps", "StructArrays", "FusedOps", "StencilBlocks", "StencilFields", "StencilLoops", "ThreadSleep", "ArrayBounds", "FloatCompare", "StencilFloat", "StencilArrays", "StencilWide"}
+    output_parity = {"CheckedConversions", "UncheckedConversions", "ArithmeticMatrix", "UnboxChecks", "EnumFormatting", "ValueTypeBases", "ExceptionFilters", "Stopwatch", "StaticFields", "TryRegions", "DictionaryOps", "StructArrays", "FusedOps", "StencilBlocks", "StencilFields", "StencilLoops", "ThreadSleep", "ArrayBounds", "FloatCompare", "StencilFloat", "StencilArrays", "StencilWide", "StencilInline", "StencilFields8", "CallPaths", "DelegatePaths", "GcRoots", "StencilIslands", "StencilInlineCold", "StencilRegisters"}
     out = os.path.join(BUILD, "dotnet"); os.makedirs(out, exist_ok=True)
     shutil.copy(os.path.join(BUILD, "corlib.dll"), out)
     ok = True
     for cs in sorted(glob.glob(os.path.join(ROOT, "tests", "dotnet", "*.cs"))):
         name = os.path.basename(cs)[:-3]
+        if name.startswith("Ffi"):
+            continue        # needs the runtime built with an FFI manifest and the C library: ffi_calls() below
         dna_only_cs = name.endswith(".dnaonly")   # self-checking; the reference runtime cannot run it
         exe = os.path.join(out, name + ".exe")
         r = subprocess.run(["mcs", "-nostdlib", "-unsafe", "-r:" + os.path.join(out, "corlib.dll"),
@@ -279,8 +281,9 @@ def stencil_coverage():
     answer, only slower, so no comparison with Mono can notice: (it is how every ldelem.r4 went unrecognised for a while, because
     its handler's address was not the one that was compared). Counted with DNA_STENCIL_STATS=1."""
     import re
-    if os.path.basename(DNA_BIN) != "dna" or os.environ.get("DNA_NO_STENCILS") or os.environ.get("DNA_NO_FUSION"):
-        print("  SKIP (native blocks are only used by build/dna, and not with DNA_NO_STENCILS / DNA_NO_FUSION)")
+    if os.path.basename(DNA_BIN) != "dna" or os.environ.get("DNA_NO_STENCILS") or os.environ.get("DNA_NO_FUSION") or os.environ.get("DNA_NO_INLINE") \
+            or os.environ.get("DNA_NO_VSTACK"):
+        print("  SKIP (native blocks are only used by build/dna, and not with DNA_NO_STENCILS / DNA_NO_FUSION / DNA_NO_VSTACK; some stencils exist only for inlining, DNA_NO_INLINE)")
         return True
     header = os.path.join(ROOT, "native", "src", "Stencils.gen.h")
     text = open(header).read() if os.path.exists(header) else ""
@@ -296,14 +299,18 @@ def stencil_coverage():
         base = os.path.basename(exe)[:-4]
         if not (base.startswith("Stencil") or base in ("ArrayBounds", "FloatCompare", "FusedOps")):
             continue
-        env = dict(os.environ, DNA_STENCIL_STATS="1")
-        r = _run_with_timeout([DNA_BIN, exe], cwd=out, capture_output=True, text=True, env=env)
         ran += 1
-        for line in r.stderr.splitlines():
-            mm = re.match(r"\s+(\w+)\s+(\d+)$", line)
-            if mm and mm.group(1) in used:
-                used[mm.group(1)] += int(mm.group(2))
-    never = [n for n in names if used[n] == 0]
+        # twice: the register pass (the default) takes the place of the plain stencils where it can, and DNA_NO_VSTACK=1 reaches them
+        # (they are also what it falls back to for what it does not do)
+        for extra in ({}, {"DNA_NO_VSTACK": "1"}):
+            env = dict(os.environ, DNA_STENCIL_STATS="1", **extra)
+            r = _run_with_timeout([DNA_BIN, exe], cwd=out, capture_output=True, text=True, env=env)
+            for line in r.stderr.splitlines():
+                mm = re.match(r"\s+(\w+)\s+(\d+)$", line)
+                if mm and mm.group(1) in used:
+                    used[mm.group(1)] += int(mm.group(2))
+    # (without islands a result that goes to a call is not in a block, so a few shapes of register stencil do not occur; those names start with v)
+    never = [n for n in names if used[n] == 0 and not (os.environ.get("DNA_NO_ISLANDS") and n.startswith("v"))]
     if ran == 0:
         print("  SKIP (the stencil tests were not built)")
         return True
@@ -312,6 +319,143 @@ def stencil_coverage():
         return False
     print("  ok   all %d stencils are exercised (%d programs)" % (len(names), ran))
     return True
+
+
+def register_tests_in_sync():
+    """tests/dotnet/StencilRegisters.cs is generated from the table of register stencils; a stencil added without regenerating it would not be tested"""
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "gen_vstencil_tests.py"), "--check"], capture_output=True, text=True)
+    print("  %s %s" % ("ok  " if r.returncode == 0 else "FAIL", r.stdout.strip() or r.stderr.strip()[-200:]))
+    return r.returncode == 0
+
+
+def inlining_happens():
+    """StencilInline and StencilInlineCold compare equal with and without inlining, which says nothing about whether any call was inlined: a
+    call that is not is only slower. So count them (DNA_STENCIL_STATS=1 prints how many calls were put into blocks), and check that
+    DNA_NO_INLINE=1 turns it off."""
+    import re
+    if os.path.basename(DNA_BIN) != "dna" or os.environ.get("DNA_NO_STENCILS") or os.environ.get("DNA_NO_FUSION") or os.environ.get("DNA_NO_INLINE"):
+        print("  SKIP (native blocks are only used by build/dna, and not with DNA_NO_STENCILS / DNA_NO_FUSION / DNA_NO_INLINE)")
+        return True
+    out = os.path.join(BUILD, "dotnet")
+    ok = True
+    # (what has a cold path can only be inlined with islands, so with DNA_NO_ISLANDS=1 far fewer are)
+    no_islands = bool(os.environ.get("DNA_NO_ISLANDS"))
+    for name, least in (("StencilInline", 60 if not no_islands else 40), ("StencilInlineCold", 150 if not no_islands else 30)):
+        exe = os.path.join(out, name + ".exe")
+        if not os.path.exists(exe):
+            print("  SKIP (%s was not built)" % name)
+            continue
+        def count(extra):
+            env = dict(os.environ, DNA_STENCIL_STATS="1", **extra)
+            r = _run_with_timeout([DNA_BIN, exe], cwd=out, capture_output=True, text=True, env=env)
+            m = re.search(r"calls inlined into blocks: (\d+)", r.stderr)
+            return int(m.group(1)) if m else None
+        on, off = count({}), count({"DNA_NO_INLINE": "1"})
+        if on is None:
+            print("  SKIP (no native blocks on this host)")
+            return True
+        if on < least or off != 0:
+            print("  FAIL: %s: %s calls inlined by default (expected at least %d), %s with DNA_NO_INLINE=1 (expected 0)" % (name, on, least, off))
+            ok = False
+        else:
+            print("  ok   %s: %d calls inlined into blocks, 0 with DNA_NO_INLINE=1" % (name, on))
+    return ok
+
+
+def islands_happen():
+    """StencilIslands compares equal with and without islands, which says nothing about whether any instruction was run as an island (one
+    that is not is only slower), so count them with DNA_STENCIL_STATS=1 and check that DNA_NO_ISLANDS=1 turns them off."""
+    import re
+    if os.path.basename(DNA_BIN) != "dna" or os.environ.get("DNA_NO_STENCILS") or os.environ.get("DNA_NO_FUSION") or os.environ.get("DNA_NO_ISLANDS"):
+        print("  SKIP (native blocks are only used by build/dna, and not with DNA_NO_STENCILS / DNA_NO_FUSION / DNA_NO_ISLANDS)")
+        return True
+    out = os.path.join(BUILD, "dotnet")
+    exe = os.path.join(out, "StencilIslands.exe")
+    if not os.path.exists(exe):
+        print("  SKIP (StencilIslands was not built)")
+        return True
+    def count(extra):
+        env = dict(os.environ, DNA_STENCIL_STATS="1", **extra)
+        r = _run_with_timeout([DNA_BIN, exe], cwd=out, capture_output=True, text=True, env=env)
+        m = re.search(r"islands in blocks: (\d+)", r.stderr)
+        return int(m.group(1)) if m else None
+    on, off = count({}), count({"DNA_NO_ISLANDS": "1"})
+    if on is None:
+        print("  SKIP (no native blocks on this host)")
+        return True
+    if on < 20 or off != 0:
+        print("  FAIL: %s islands by default (expected at least 20), %s with DNA_NO_ISLANDS=1 (expected 0)" % (on, off))
+        return False
+    print("  ok   %d islands in blocks in StencilIslands, 0 with DNA_NO_ISLANDS=1" % on)
+    return True
+
+
+def ffi_calls():
+    """[DllImport] of C functions named in a manifest (build.py --ffi tests/ffi/mylib.json). Builds that runtime (build/dna_ffi, or dna_ffi32
+    for the 32-bit run) and the same C as a shared library for Mono, and compares FfiCalls with Mono's output (in the default mode and
+    with DNA_NO_STENCILS=1). On the 64-bit build it also checks that the generated stencils were used (a call that is not one is only
+    slower), and that a DllImport that disagrees with the manifest is refused when it is compiled."""
+    import re, shutil
+    m32 = os.path.basename(DNA_BIN) == "dna32"
+    if not (shutil.which("mono") and shutil.which("gcc") and shutil.which("mcs")) or not os.path.exists(os.path.join(BUILD, "corlib.dll")):
+        print("  SKIP (needs: mono, mcs, gcc and build/corlib.dll)")
+        return True
+    manifest = os.path.join(ROOT, "tests", "ffi", "mylib.json")
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "build.py"), "--ffi", manifest, "--no-corlib"] + (["--m32"] if m32 else []),
+                       capture_output=True, text=True)
+    binary = os.path.join(BUILD, "dna_ffi32" if m32 else "dna_ffi")
+    if r.returncode != 0 or not os.path.exists(binary):
+        print("  FAIL: the runtime with the FFI manifest did not build:\n" + (r.stdout + r.stderr)[-600:])
+        return False
+    out = os.path.join(BUILD, "ffi"); os.makedirs(out, exist_ok=True)
+    shutil.copy(os.path.join(BUILD, "corlib.dll"), out)
+    lib = subprocess.run(["gcc", "-shared", "-fPIC", "-O2", "-o", os.path.join(out, "libmylib.so"), os.path.join(ROOT, "tests", "ffi", "mylib.c")],
+                         capture_output=True, text=True)
+    if lib.returncode:
+        print("  FAIL: libmylib.so did not build:", lib.stderr[:300]); return False
+    ok = True
+    clean = lambda t: "\n".join(l.rstrip() for l in t.splitlines() if l.strip() and not l.startswith("Total execution time"))
+    for name, least_stencils in (("FfiCalls", 12), ("FfiMarshal", 4)):
+        cs = os.path.join(ROOT, "tests", "dotnet", name + ".cs")
+        ref, exe = os.path.join(out, name + ".ref.exe"), os.path.join(out, name + ".exe")
+        a = subprocess.run(["mcs", "-unsafe", "-out:" + ref, cs], capture_output=True, text=True)
+        b = subprocess.run(["mcs", "-nostdlib", "-unsafe", "-r:" + os.path.join(out, "corlib.dll"), "-out:" + exe, cs], capture_output=True, text=True)
+        if a.returncode or b.returncode:
+            print("  FAIL: %s did not compile:" % name, (a.stdout + a.stderr + b.stdout + b.stderr)[:300]); ok = False; continue
+        want = clean(subprocess.run(["mono", ref], capture_output=True, text=True, env=dict(os.environ, LD_LIBRARY_PATH=out)).stdout)
+        if want == "":
+            print("  FAIL: Mono printed nothing for %s" % name); ok = False; continue
+        for label, env in (("default", {}), ("DNA_NO_STENCILS=1", {"DNA_NO_STENCILS": "1"})):
+            if m32 and label != "default":
+                continue
+            d = subprocess.run([binary, exe], cwd=out, capture_output=True, text=True, env=dict(os.environ, **env))
+            if d.returncode != 0 or clean(d.stdout) != want:
+                print("  FAIL %s [%s]: %s" % (name, label, (d.stdout + d.stderr)[-200:])); ok = False
+            else:
+                print("  ok   %s [%s] (%d lines identical to Mono)" % (name, label, len(want.splitlines())))
+        if not m32 and not os.environ.get("DNA_NO_STENCILS") and not os.environ.get("DNA_NO_FUSION"):
+            d = subprocess.run([binary, exe], cwd=out, capture_output=True, text=True, env=dict(os.environ, DNA_STENCIL_STATS="1"))
+            used = sorted(set(n for n, c in re.findall(r"^\s*(ffi_\w+)\s+(\d+)", d.stderr, re.M) if int(c) > 0))
+            least = max(2, least_stencils // 2) if os.environ.get("DNA_NO_ISLANDS") else least_stencils    # (without islands a call among other calls is often not in a block)
+            if len(used) < least:
+                print("  FAIL: %s used only %d of the generated call stencils (expected at least %d): %s" % (name, len(used), least, ", ".join(used))); ok = False
+            else:
+                print("  ok   %s: %d generated FFI stencils were compiled into native blocks" % (name, len(used)))
+    # a declaration that disagrees with the manifest must be refused, not run
+    for what, decl, call in (("an int where the manifest has a long", "static extern int add_numbers(int a, long b);", "add_numbers(1, 2)"),
+                             ("an int where the manifest has a string", "static extern int str_len(int s);", "str_len(1)"),
+                             ("a string where the manifest has an int", "static extern int add_numbers(string a, int b);", 'add_numbers("x", 2)')):
+        bad = os.path.join(out, "FfiMismatch.cs"); badexe = os.path.join(out, "FfiMismatch.exe")
+        open(bad, "w").write("using System; using System.Runtime.InteropServices;\n"
+                             "class P { [DllImport(\"mylib\")] %s\n"
+                             "  static int Main() { Console.WriteLine(%s); return 0; } }\n" % (decl, call))
+        c = subprocess.run(["mcs", "-nostdlib", "-r:" + os.path.join(out, "corlib.dll"), "-out:" + badexe, bad], capture_output=True, text=True)
+        d = subprocess.run([binary, badexe], cwd=out, capture_output=True, text=True)
+        if c.returncode == 0 and d.returncode != 0 and "disagree" in (d.stdout + d.stderr):
+            print("  ok   a DllImport with %s is refused" % what)
+        else:
+            print("  FAIL: a mismatched DllImport (%s) was not refused (rc=%s): %s" % (what, d.returncode, (d.stdout + d.stderr)[:200])); ok = False
+    return ok
 
 
 def stencil_alias_groups():
@@ -334,7 +478,7 @@ def stencil_alias_groups():
             cur = []
     jit = open(os.path.join(SRC, "JIT.c")).read()
     used = set(re.findall(r"Translate\((JIT_\w+),", jit))
-    for tbl in ("simpleOps", "lbccOps", "dbccOps", "fbccOps"):
+    for tbl in ("simpleOps", "lbccOps", "dbccOps", "fbccOps", "islandOps"):
         m = re.search(tbl + r"\[[^\]]*\]\s*=\s*\{([^}]*)\}", jit, re.S)
         if m:
             used |= set(re.findall(r"JIT_\w+", m.group(1)))
@@ -357,7 +501,11 @@ TESTS = [("heaptree_difftest (C reference vs cpprust-lowered C++)", heaptree_dif
          ("native parameter reads match their signatures", internalcall_params_ok),
          ("JIT.c: no conditionally-initialised locals", jit_uninitialised_locals),
          ("dotnet programs on " + os.path.basename(DNA_BIN), dotnet_programs),
+         ("the register stencil test is generated from the current table", register_tests_in_sync),
          ("every stencil is exercised by a stencil test", stencil_coverage),
+         ("native FFI: DllImport of C functions named in a manifest", ffi_calls),
+         ("calls are inlined into native blocks", inlining_happens),
+         ("instructions run as islands inside native blocks", islands_happen),
          ("stencil classification compares every alias of a handler", stencil_alias_groups),
          ("IL programs (opcodes C# does not emit), DNA vs Mono", il_programs)]
 
