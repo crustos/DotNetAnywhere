@@ -50,6 +50,11 @@ def metadata_layout_current():
     """native/src/MetaDataLayout.gen.h is generated (by build.py) from tools/gen_metadata_layout.py and the row
     structs; it must be what they produce now."""
     # --verify-with-compiler also cross-checks the layout the generator computes against gcc -m32's, when there is one
+    for gen in ("gen_fused_ops.py", "gen_stencils.py"):
+        fr = subprocess.run([sys.executable, os.path.join(ROOT, "tools", gen), "--check"], capture_output=True, text=True)
+        if fr.returncode:
+            print("  FAIL", (fr.stdout + fr.stderr).strip().splitlines()[-1])
+            return False
     r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "gen_metadata_layout.py"), "--check",
                         "--verify-with-compiler"], capture_output=True, text=True)
     out = (r.stdout + r.stderr).strip().splitlines()
@@ -135,7 +140,7 @@ def dotnet_programs():
               "Int64AndFloatOps", "RefAccess", "ConversionChains",
               "DelegateVirtual", "TypedReferences"}
     # Generated programs that print one line per case: DNA's whole stdout must equal Mono's.
-    output_parity = {"CheckedConversions", "UncheckedConversions", "ArithmeticMatrix", "UnboxChecks", "EnumFormatting", "ValueTypeBases", "ExceptionFilters"}
+    output_parity = {"CheckedConversions", "UncheckedConversions", "ArithmeticMatrix", "UnboxChecks", "EnumFormatting", "ValueTypeBases", "ExceptionFilters", "Stopwatch", "StaticFields", "TryRegions", "DictionaryOps", "StructArrays", "FusedOps", "StencilBlocks", "StencilFields", "StencilLoops", "ThreadSleep", "ArrayBounds", "FloatCompare", "StencilFloat", "StencilArrays", "StencilWide"}
     out = os.path.join(BUILD, "dotnet"); os.makedirs(out, exist_ok=True)
     shutil.copy(os.path.join(BUILD, "corlib.dll"), out)
     ok = True
@@ -269,11 +274,91 @@ def il_programs():
     return ok
 
 
+def stencil_coverage():
+    """Every stencil must be compiled by at least one of the stencil tests. A native block that is never made gives the right
+    answer, only slower, so no comparison with Mono can notice: (it is how every ldelem.r4 went unrecognised for a while, because
+    its handler's address was not the one that was compared). Counted with DNA_STENCIL_STATS=1."""
+    import re
+    if os.path.basename(DNA_BIN) != "dna" or os.environ.get("DNA_NO_STENCILS") or os.environ.get("DNA_NO_FUSION"):
+        print("  SKIP (native blocks are only used by build/dna, and not with DNA_NO_STENCILS / DNA_NO_FUSION)")
+        return True
+    header = os.path.join(ROOT, "native", "src", "Stencils.gen.h")
+    text = open(header).read() if os.path.exists(header) else ""
+    m = re.search(r"stencilNames\[ST_COUNT\] = \{([^}]*)\}", text)
+    if not m:
+        print("  SKIP (no stencils on this host)")
+        return True
+    names = re.findall(r'"(\w+)"', m.group(1))
+    out = os.path.join(BUILD, "dotnet")
+    used = dict((n, 0) for n in names)
+    ran = 0
+    for exe in sorted(glob.glob(os.path.join(out, "*.exe"))):
+        base = os.path.basename(exe)[:-4]
+        if not (base.startswith("Stencil") or base in ("ArrayBounds", "FloatCompare", "FusedOps")):
+            continue
+        env = dict(os.environ, DNA_STENCIL_STATS="1")
+        r = _run_with_timeout([DNA_BIN, exe], cwd=out, capture_output=True, text=True, env=env)
+        ran += 1
+        for line in r.stderr.splitlines():
+            mm = re.match(r"\s+(\w+)\s+(\d+)$", line)
+            if mm and mm.group(1) in used:
+                used[mm.group(1)] += int(mm.group(2))
+    never = [n for n in names if used[n] == 0]
+    if ran == 0:
+        print("  SKIP (the stencil tests were not built)")
+        return True
+    if never:
+        print("  FAIL: these stencils were never compiled by any stencil test: " + ", ".join(never))
+        return False
+    print("  ok   all %d stencils are exercised (%d programs)" % (len(names), ran))
+    return True
+
+
+def stencil_alias_groups():
+    """The JIT recognises an instruction by the address of its handler, and instructions that share a handler body (JIT_LOAD_I64
+    and JIT_LOAD_F64, say) do NOT share an address. So where the classification in JIT.c compares one member of such a group, it must
+    compare all of them, or the missed ones are never made native: still the right answer, only slower, which nothing that compares
+    output can see (ldelem.r4 and ldc.r8 were both missed this way)."""
+    import re
+    lines = open(os.path.join(SRC, "JIT_Execute.c")).read().split("\n")
+    groups, cur = [], []
+    for l in lines:
+        m = re.match(r"^(JIT_\w+)_start:", l)
+        if m:
+            cur.append(m.group(1))
+        elif l.strip() == "" or l.strip().startswith("//"):
+            continue
+        else:
+            if len(cur) > 1:
+                groups.append(cur)
+            cur = []
+    jit = open(os.path.join(SRC, "JIT.c")).read()
+    used = set(re.findall(r"Translate\((JIT_\w+),", jit))
+    for tbl in ("simpleOps", "lbccOps", "dbccOps", "fbccOps"):
+        m = re.search(tbl + r"\[[^\]]*\]\s*=\s*\{([^}]*)\}", jit, re.S)
+        if m:
+            used |= set(re.findall(r"JIT_\w+", m.group(1)))
+    gen = os.path.join(SRC, "JIT_Fused.gen.h")
+    if os.path.exists(gen):
+        used |= set(re.findall(r"\{ (JIT_\w+),", open(gen).read()))
+    used |= set(re.findall(r"JIT_(?:LOADPARAMLOCAL|STOREPARAMLOCAL)_[0-7]", jit))
+    bad = [(sorted(o for o in g if o in used), sorted(o for o in g if o not in used)) for g in groups
+           if any(o in used for o in g) and not all(o in used for o in g)]
+    if bad:
+        for have, missing in bad:
+            print("  FAIL: JIT.c compares %s but not %s, which share its handler body" % (", ".join(have), ", ".join(missing)))
+        return False
+    print("  ok   %d groups of instructions that share a handler: wherever one is compared, all are" % len(groups))
+    return True
+
+
 TESTS = [("heaptree_difftest (C reference vs cpprust-lowered C++)", heaptree_difftest),
          ("metadata layout (generated) is current", metadata_layout_current),
          ("native parameter reads match their signatures", internalcall_params_ok),
          ("JIT.c: no conditionally-initialised locals", jit_uninitialised_locals),
          ("dotnet programs on " + os.path.basename(DNA_BIN), dotnet_programs),
+         ("every stencil is exercised by a stencil test", stencil_coverage),
+         ("stencil classification compares every alias of a handler", stencil_alias_groups),
          ("IL programs (opcodes C# does not emit), DNA vs Mono", il_programs)]
 
 if __name__ == "__main__":
