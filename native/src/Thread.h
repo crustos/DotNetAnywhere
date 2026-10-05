@@ -141,6 +141,16 @@ U32 Internal_Debugger_Resume_Check(PTR pThis_, PTR pParams, PTR pReturnValue, tA
 tThread* Thread();
 void Thread_SetEntryPoint(tThread *pThis, tMetaData *pMetaData, IDX_TABLE entryPointToken, PTR params, U32 paramBytes);
 extern int Thread_HostSchedules;
+
+// The value that the entry method of the thread that last exited returned, as it lay on the evaluation stack (its stackSize bytes;
+// 0 for void, or for a result too large to keep). A native host (Host.c) reads it right after Thread_Execute / Thread_ExecuteNested.
+extern U8 Thread_LastReturn[16];
+extern U32 Thread_LastReturnSize;
+
+// Run `pThread` (made with Thread() and Thread_SetEntryPoint()) to its end *inside* a call that is itself running in JIT_Execute(), the
+// way a C function called from managed code, which calls managed code again, has to: Thread_Execute() would go on to schedule the
+// thread that is waiting for this C function. Only this thread runs; one that blocks or sleeps is not supported. Returns its exit value.
+I32 Thread_ExecuteNested(tThread *pThread);
 I32 Thread_Execute();
 tThread* Thread_GetCurrent();
 void* Thread_StackAlloc(tThread *pThread, U32 size);

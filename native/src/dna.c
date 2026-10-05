@@ -29,6 +29,7 @@
 #include "System.Net.Sockets.Socket.h"
 #include "MethodState.h"
 #include "JSInterop.h"
+#include "Host.h"
 
 static void ShowUsage() {
 	printf("Usage:\n");
@@ -75,12 +76,10 @@ doneArgs:;
 		}
 	}
 
-	JIT_Execute_Init();
-	MetaData_Init();
-	Type_Init();
-	Heap_Init();
-	Finalizer_Init();
-	Socket_Init();
+	if (i < (U32)argc) {
+		DNA_SetAssemblyDirFromFile(argp[i]);      // (corlib.dll is looked for beside the program first, then in the current directory)
+	}
+	DNA_Init();                  // (Host.c: JIT, metadata, types, heap, finalizer, sockets; a host program calls the same)
 
 #ifdef DIAG_OPCODE_TIMES
 #ifdef _WIN32
@@ -105,7 +104,7 @@ doneArgs:;
 #endif
 
 	if (pCLIFile->entryPoint) {
-		retValue = CLIFile_Execute(pCLIFile, argc - i, argp + i);
+		retValue = DNA_RunMain(pCLIFile, argc - i, argp + i);
 	} else {
 		printf("File %s has no entry point, skipping execution\n", pFileName);
 		retValue = 0;

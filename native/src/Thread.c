@@ -34,6 +34,9 @@ int alwaysBreak = 0;
 static tThread *pAllThreads = NULL;
 static tThread *pCurrentThread;
 
+U8 Thread_LastReturn[16];
+U32 Thread_LastReturnSize = 0;
+
 U32 Internal_Debugger_Resume_Check(PTR pThis_, PTR pParams, PTR pReturnValue, tAsyncCall *pAsync) {
     if (releaseBreakPoint) {
         releaseBreakPoint = 0;
@@ -335,4 +338,34 @@ void Thread_GetHeapRoots(tHeapRoots *pHeapRoots) {
 
 		pThread = pThread->pNextThread;
 	}
+}
+
+I32 Thread_ExecuteNested(tThread *pThread) {
+	tThread *pSavedCurrent = pCurrentThread;
+	I32 exitValue;
+	U32 status;
+
+	pThread->state = THREADSTATE_RUNNING;
+	pCurrentThread = pThread;
+	for (;;) {
+		status = JIT_Execute(pThread, 1000000);
+		if (status == THREAD_STATUS_EXIT) {
+			break;
+		}
+		if (status == THREAD_STATUS_ASYNC || status == THREAD_STATUS_LOCK_EXIT) {
+			Crash("a managed method called from native code blocked (Sleep, a lock, or I/O): not supported while the native code that called it is itself called from managed code");
+		}
+		// THREAD_STATUS_RUNNING: its timeslice ended; go on
+	}
+	exitValue = pThread->threadExitValue;
+	{
+		tThread **ppThread = &pAllThreads;
+		while (*ppThread != pThread) {
+			ppThread = &((*ppThread)->pNextThread);
+		}
+		*ppThread = (*ppThread)->pNextThread;
+	}
+	Thread_Delete(pThread);
+	pCurrentThread = pSavedCurrent;
+	return exitValue;
 }

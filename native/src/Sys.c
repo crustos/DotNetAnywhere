@@ -30,8 +30,23 @@
 #include "MetaData.h"
 #include "Types.h"
 
+int Crash_AbortMode = 0;
+
 void Crash(char *pMsg, ...) {
 	va_list va;
+
+	if (Crash_AbortMode) {
+		// As an unhandled exception ends a .NET program: what the program printed so far is kept, the report goes to stderr, and the
+		// process is killed by SIGABRT (so the exit status is the same too)
+		fflush(stdout);
+		fprintf(stderr, "\nUnhandled exception: ");
+		va_start(va, pMsg);
+		vfprintf(stderr, pMsg, va);
+		va_end(va);
+		fprintf(stderr, "\n");
+		fflush(stderr);
+		abort();
+	}
 
 	printf("\n\n*** CRASH ***\n");
 

@@ -48,6 +48,10 @@ struct tHeapRoots_ {
 
 void Heap_Init();
 void Heap_SetRoots(tHeapRoots *pHeapRoots, void *pRoots, U32 sizeInBytes);
+// Roots that a native host keeps (Host.c: the handles it has given out for managed objects).  Called at the start of every collection.
+// Unlike Heap_MakeUndeletable, which only protects the object itself (the mark phase never looks inside an undeletable one), roots are
+// followed: what an object refers to stays alive as long as the object does.
+void Host_GetHeapRoots(tHeapRoots *pHeapRoots);
 void Heap_UnmarkFinalizer(HEAP_PTR heapPtr);
 void Heap_GarbageCollect();
 U32 Heap_NumCollections();

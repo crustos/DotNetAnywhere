@@ -51,6 +51,30 @@ static int numAssembliesMappedToDnaCorlib = sizeof(assembliesMappedToDnaCorlib)/
 // Keep track of all the files currently loaded
 static tFilesLoaded *pFilesLoaded = NULL;
 
+// The directory of the first assembly loaded: where the assemblies it refers to (corlib.dll) are looked for first.  Without it a program only
+// worked when it was started in the directory that holds corlib.dll.
+static char assemblyDir[1024] = "";
+
+// Set it explicitly: corlib.dll is loaded while the runtime starts (Type_Init), before any program has been, so "the first assembly loaded"
+// is too late for it.  (Host.h: DNA_SetAssemblyDir; dna.c calls it with the program's directory before it starts the runtime.)
+void CLIFile_SetAssemblyDir(const char *dir) {
+	snprintf(assemblyDir, sizeof(assemblyDir), "%s", dir);
+}
+
+// An assembly that is loaded already, by its assembly name; NULL if there is none (for a native host, which must not Crash)
+tCLIFile* CLIFile_FindLoaded(const char *pAssemblyName) {
+	tFilesLoaded *pFiles = pFilesLoaded;
+	while (pFiles != NULL) {
+		tCLIFile *pCLIFile = pFiles->pCLIFile;
+		tMD_Assembly *pThisAssembly = MetaData_GetTableRow(pCLIFile->pMetaData, MAKE_TABLE_INDEX(0x20, 1));
+		if (strcmp(pAssemblyName, (const char*)pThisAssembly->name) == 0) {
+			return pCLIFile;
+		}
+		pFiles = pFiles->pNext;
+	}
+	return NULL;
+}
+
 tMetaData* CLIFile_GetMetaDataForLoadedAssembly(unsigned char *pLoadedAssemblyName) {
 	tFilesLoaded *pFiles = pFilesLoaded;
 
@@ -101,12 +125,22 @@ tMetaData* CLIFile_GetMetaDataForAssembly(unsigned char *pAssemblyName) {
 		pFiles = pFiles->pNext;
 	}
 
-	// Assembly not loaded, so load it if possible
+	// Assembly not loaded, so load it if possible: beside the first assembly that was loaded (the program), else in the current directory
 	{
 		tCLIFile *pCLIFile;
-		unsigned char fileName[128];
-		sprintf(fileName, "%s.dll", pAssemblyName);
-		pCLIFile = CLIFile_Load(fileName);
+		char fileName[1280];
+		snprintf(fileName, sizeof(fileName), "%s.dll", pAssemblyName);
+		if (assemblyDir[0] != 0) {
+			char beside[1280];
+			FILE *f;
+			snprintf(beside, sizeof(beside), "%s/%s.dll", assemblyDir, pAssemblyName);
+			f = fopen(beside, "rb");
+			if (f != NULL) {
+				fclose(f);
+				strcpy(fileName, beside);
+			}
+		}
+		pCLIFile = CLIFile_Load((char*)fileName);
 		if (pCLIFile == NULL) {
 			Crash("Cannot load required assembly file: %s", fileName);
 		}
@@ -367,6 +401,15 @@ static tCLIFile* LoadPEFile(void *pData) {
 }
 
 tCLIFile* CLIFile_Load(char *pFileName) {
+	if (assemblyDir[0] == 0) {
+		const char *slash = strrchr(pFileName, '/');
+		if (slash != NULL && (size_t)(slash - pFileName) < sizeof(assemblyDir)) {
+			memcpy(assemblyDir, pFileName, (size_t)(slash - pFileName));
+			assemblyDir[slash - pFileName] = 0;
+		} else if (slash == NULL) {
+			strcpy(assemblyDir, ".");
+		}
+	}
 	void *pRawFile;
     void* pRawDebugFile;
 	tCLIFile *pRet;

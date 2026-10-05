@@ -160,6 +160,7 @@ static void GarbageCollect() {
 
 	Thread_GetHeapRoots(&heapRoots);
 	CLIFile_GetHeapRoots(&heapRoots);
+	Host_GetHeapRoots(&heapRoots);
 
 	// Mark phase
 	while (heapRoots.num > 0) {

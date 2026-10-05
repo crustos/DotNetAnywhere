@@ -163,6 +163,7 @@ tMD_MethodDef* Generics_GetMethodDefFromSpec
 	(tMD_MethodSpec *pMethodSpec, tMD_TypeDef **ppCallingClassTypeArgs, tMD_TypeDef **ppCallingMethodTypeArgs) {
 
 	tMD_MethodDef *pCoreMethod, *pMethod;
+	tMD_TypeDef *pParentType;
 	SIG sig;
 	U32 argCount, i;
 	tMD_TypeDef **ppTypeArgs;
@@ -182,7 +183,15 @@ tMD_MethodDef* Generics_GetMethodDefFromSpec
 		ppTypeArgs[i] = pArgType;
 	}
 
-	pMethod = Generics_GetMethodDefFromCoreMethod(pCoreMethod, pCoreMethod->pParentType, argCount, ppTypeArgs);
+	// The generic method's own class: not known yet (pParentType is set when the method is filled) if nothing has used the method before and
+	// the caller is in another class, so find it from the MethodDef table.  (A call from a method of the same class never hit this: that class
+	// was being filled already.)
+	pParentType = pCoreMethod->pParentType;
+	if (pParentType == NULL) {
+		pParentType = MetaData_GetTypeDefFromMethodDef(pCoreMethod);
+		MetaData_Fill_TypeDef(pParentType, NULL, NULL);
+	}
+	pMethod = Generics_GetMethodDefFromCoreMethod(pCoreMethod, pParentType, argCount, ppTypeArgs);
 	free(ppTypeArgs);
 
 	return pMethod;

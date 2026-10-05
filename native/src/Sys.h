@@ -45,6 +45,9 @@ void* mallocTrace(int s, char *pFile, int line);
 
 #include "MetaData.h"
 
+// Set by a host (Host.h: DNA_SetCrashMode) so that a Crash ends the process like an unhandled exception in .NET: see Sys.c
+extern int Crash_AbortMode;
+
 // Prints a message and exits; never returns. Declared so the compiler knows that the
 // `default: Crash(...)` arm of a switch leaves nothing uninitialised.
 #if defined(__GNUC__) || defined(__clang__)

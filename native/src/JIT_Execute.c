@@ -1435,6 +1435,16 @@ JIT_RETURN_start:
 	//printf("Returned from %s() to %s()\n", pCurrentMethodState->pMethod->name, (pCurrentMethodState->pCaller)?pCurrentMethodState->pCaller->pMethod->name:"<none>");
 	if (pCurrentMethodState->pCaller == NULL) {
 		// End of thread!
+		{
+			tMD_TypeDef *pRetType = pCurrentMethodState->pMethod->pReturnType;
+			if (pRetType != NULL && pRetType->stackSize <= sizeof(Thread_LastReturn)) {
+				// (for a native host: the result of any type, not only an int32)
+				Thread_LastReturnSize = pRetType->stackSize;
+				memcpy(Thread_LastReturn, pCurEvalStack - pRetType->stackSize, pRetType->stackSize);
+			} else {
+				Thread_LastReturnSize = 0;
+			}
+		}
 		if (pCurrentMethodState->pMethod->pReturnType == types[TYPE_SYSTEM_INT32]) {
 			// If function returned an int32, then make it the thread exit-value
 			pThread->threadExitValue = (I32)POP_U32();
