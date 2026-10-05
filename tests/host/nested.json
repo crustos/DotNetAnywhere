@@ -1,0 +1,12 @@
+{
+  "c_files":  ["nested.c"],
+  "cflags":   ["-O1"],
+  "functions": [
+    {"library": "nested", "entry": "native_twice",     "ret": "int",  "args": ["int"]},
+    {"library": "nested", "entry": "native_sumsq",     "ret": "int",  "args": ["int"]},
+    {"library": "nested", "entry": "native_greet_len", "ret": "int",  "args": ["cstr"]},
+    {"library": "nested", "entry": "native_depth",     "ret": "int",  "args": ["int"]},
+    {"library": "nested", "entry": "native_fill",      "ret": "void", "args": ["buf:int*", "int", "int"]},
+    {"library": "nested", "entry": "native_churn",     "ret": "int",  "args": ["int"]}
+  ]
+}
