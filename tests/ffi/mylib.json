@@ -1,32 +1,809 @@
 {
-  "c_files": ["mylib.c"],
-  "cflags": ["-O2"],
+  "c_files": [
+    "mylib.c"
+  ],
+  "cflags": [
+    "-O2"
+  ],
   "functions": [
-    {"library": "mylib", "entry": "add_numbers",  "ret": "int",    "args": ["int", "int"]},
-    {"library": "mylib", "entry": "sum6",         "ret": "int",    "args": ["int", "int", "int", "int", "int", "int"]},
-    {"library": "mylib", "entry": "mix64",        "ret": "long",   "args": ["long", "int"]},
-    {"library": "mylib", "entry": "uclamp",       "ret": "uint",   "args": ["uint", "uint", "uint"]},
-    {"library": "mylib", "entry": "hyp2",         "ret": "double", "args": ["double", "double"]},
-    {"library": "mylib", "entry": "scalef",       "ret": "float",  "args": ["float", "float"]},
-    {"library": "mylib", "entry": "mixed",        "ret": "double", "args": ["int", "double", "long", "float", "int"]},
-    {"library": "mylib", "entry": "narrow16",     "ret": "short",  "args": ["int"]},
-    {"library": "mylib", "entry": "low8",         "ret": "byte",   "args": ["int"]},
-    {"library": "mylib", "entry": "ptr_bump",     "ret": "intptr", "args": ["intptr", "int"]},
-    {"library": "mylib", "entry": "bump_counter", "ret": "void",   "args": ["int"]},
-    {"library": "mylib", "entry": "get_counter",  "ret": "int",    "args": []},
-    {"library": "mylib", "entry": "bump_get",     "ret": "int",    "args": ["int"]},
-    {"library": "mylib", "entry": "aligned_sum",  "ret": "double", "args": ["double", "double"]},
-    {"library": "mylib", "entry": "sum_buf",      "ret": "int",    "args": ["buf:const int32_t*", "int"]},
-    {"library": "mylib", "entry": "sum_i64",      "ret": "long",   "args": ["buf:const int64_t*", "int"]},
-    {"library": "mylib", "entry": "fill_buf",     "ret": "void",   "args": ["buf:int32_t*", "int", "int"]},
-    {"library": "mylib", "entry": "dot",          "ret": "double", "args": ["buf:const double*", "buf:const double*", "int"]},
-    {"library": "mylib", "entry": "upcase",       "ret": "void",   "args": ["buf:unsigned char*", "int"]},
-    {"library": "mylib", "entry": "is_null",      "ret": "int",    "args": ["buf:const void*"]},
-    {"library": "mylib", "entry": "swap_ref",     "ret": "void",   "args": ["ref:int32_t*", "ref:int32_t*"]},
-    {"library": "mylib", "entry": "divmod",       "ret": "void",   "args": ["int", "int", "ref:int32_t*", "ref:int32_t*"]},
-    {"library": "mylib", "entry": "str_len",      "ret": "int",    "args": ["cstr"]},
-    {"library": "mylib", "entry": "str_sum",      "ret": "int",    "args": ["cstr"]},
-    {"library": "mylib", "entry": "greeting",     "ret": "cstr",   "args": ["int"]},
-    {"library": "mylib", "entry": "echo_upper",   "ret": "cstr",   "args": ["cstr"]}
-  ]
+    {
+      "library": "mylib",
+      "entry": "add_numbers",
+      "ret": "int",
+      "args": [
+        "int",
+        "int"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "sum6",
+      "ret": "int",
+      "args": [
+        "int",
+        "int",
+        "int",
+        "int",
+        "int",
+        "int"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "mix64",
+      "ret": "long",
+      "args": [
+        "long",
+        "int"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "uclamp",
+      "ret": "uint",
+      "args": [
+        "uint",
+        "uint",
+        "uint"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "hyp2",
+      "ret": "double",
+      "args": [
+        "double",
+        "double"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "scalef",
+      "ret": "float",
+      "args": [
+        "float",
+        "float"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "mixed",
+      "ret": "double",
+      "args": [
+        "int",
+        "double",
+        "long",
+        "float",
+        "int"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "narrow16",
+      "ret": "short",
+      "args": [
+        "int"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "low8",
+      "ret": "byte",
+      "args": [
+        "int"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "ptr_bump",
+      "ret": "intptr",
+      "args": [
+        "intptr",
+        "int"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "bump_counter",
+      "ret": "void",
+      "args": [
+        "int"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "get_counter",
+      "ret": "int",
+      "args": []
+    },
+    {
+      "library": "mylib",
+      "entry": "bump_get",
+      "ret": "int",
+      "args": [
+        "int"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "aligned_sum",
+      "ret": "double",
+      "args": [
+        "double",
+        "double"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "sum_buf",
+      "ret": "int",
+      "args": [
+        "buf:const int32_t*",
+        "int"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "sum_i64",
+      "ret": "long",
+      "args": [
+        "buf:const int64_t*",
+        "int"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "fill_buf",
+      "ret": "void",
+      "args": [
+        "buf:int32_t*",
+        "int",
+        "int"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "dot",
+      "ret": "double",
+      "args": [
+        "buf:const double*",
+        "buf:const double*",
+        "int"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "upcase",
+      "ret": "void",
+      "args": [
+        "buf:unsigned char*",
+        "int"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "is_null",
+      "ret": "int",
+      "args": [
+        "buf:const void*"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "swap_ref",
+      "ret": "void",
+      "args": [
+        "ref:int32_t*",
+        "ref:int32_t*"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "divmod",
+      "ret": "void",
+      "args": [
+        "int",
+        "int",
+        "ref:int32_t*",
+        "ref:int32_t*"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "str_len",
+      "ret": "int",
+      "args": [
+        "cstr"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "str_sum",
+      "ret": "int",
+      "args": [
+        "cstr"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "greeting",
+      "ret": "cstr",
+      "args": [
+        "int"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "echo_upper",
+      "ret": "cstr",
+      "args": [
+        "cstr"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "sum9",
+      "ret": "int",
+      "args": [
+        "int",
+        "int",
+        "int",
+        "int",
+        "int",
+        "int",
+        "int",
+        "int",
+        "int"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "sum8l",
+      "ret": "long",
+      "args": [
+        "long",
+        "long",
+        "long",
+        "long",
+        "long",
+        "long",
+        "long",
+        "long"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "mix12",
+      "ret": "double",
+      "args": [
+        "int",
+        "double",
+        "long",
+        "float",
+        "int",
+        "double",
+        "int",
+        "long",
+        "float",
+        "int",
+        "double",
+        "int"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "sum10d",
+      "ret": "double",
+      "args": [
+        "double",
+        "double",
+        "double",
+        "double",
+        "double",
+        "double",
+        "double",
+        "double",
+        "double",
+        "double"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "sum10f",
+      "ret": "float",
+      "args": [
+        "float",
+        "float",
+        "float",
+        "float",
+        "float",
+        "float",
+        "float",
+        "float",
+        "float",
+        "float"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "wide_str",
+      "ret": "int",
+      "args": [
+        "cstr",
+        "int",
+        "int",
+        "int",
+        "int",
+        "int",
+        "int",
+        "int"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "wide_buf",
+      "ret": "int",
+      "args": [
+        "buf:const int32_t*",
+        "int",
+        "int",
+        "int",
+        "int",
+        "int",
+        "int",
+        "int",
+        "int"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "wide_out",
+      "ret": "void",
+      "args": [
+        "int",
+        "int",
+        "int",
+        "int",
+        "int",
+        "int",
+        "int",
+        "ref:int32_t*",
+        "ref:int32_t*"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "pair_make",
+      "ret": "struct:Pair",
+      "args": [
+        "int",
+        "float"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "pair_sum",
+      "ret": "int",
+      "args": [
+        "struct:Pair"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "pair_swap",
+      "ret": "struct:Pair",
+      "args": [
+        "struct:Pair",
+        "int"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "rgba_blend",
+      "ret": "struct:Rgba",
+      "args": [
+        "struct:Rgba",
+        "struct:Rgba"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "v3_add",
+      "ret": "struct:V3",
+      "args": [
+        "struct:V3",
+        "struct:V3"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "v3_dot",
+      "ret": "double",
+      "args": [
+        "struct:V3",
+        "struct:V3"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "v3_scale",
+      "ret": "struct:V3",
+      "args": [
+        "struct:V3",
+        "double"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "v3_make",
+      "ret": "struct:V3",
+      "args": [
+        "double",
+        "double",
+        "double"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "v3_mix",
+      "ret": "double",
+      "args": [
+        "struct:V3",
+        "int",
+        "struct:V3",
+        "double",
+        "int",
+        "int",
+        "int",
+        "float"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "xf_sum",
+      "ret": "float",
+      "args": [
+        "struct:Xf"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "xf_make",
+      "ret": "struct:Xf",
+      "args": [
+        "uint",
+        "float",
+        "float",
+        "float",
+        "int"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "xf_apply",
+      "ret": "int",
+      "args": [
+        "bufs:const Xf",
+        "int",
+        "float"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "xf_fill",
+      "ret": "void",
+      "args": [
+        "bufs:Xf",
+        "int"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "xf_init",
+      "ret": "void",
+      "args": [
+        "refs:Xf",
+        "int"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "padded_sum",
+      "ret": "double",
+      "args": [
+        "struct:Padded"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "padded_make",
+      "ret": "struct:Padded",
+      "args": [
+        "int",
+        "long",
+        "float"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "tail_sum",
+      "ret": "int",
+      "args": [
+        "struct:Tail"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "bytes_sum",
+      "ret": "int",
+      "args": [
+        "struct:Bytes"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "fold_ints",
+      "ret": "int",
+      "args": [
+        "buf:const int32_t*",
+        "int",
+        "int",
+        "callback:Binop"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "map_sum",
+      "ret": "double",
+      "args": [
+        "buf:const double*",
+        "int",
+        "callback:MapD"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "for_each",
+      "ret": "void",
+      "args": [
+        "int",
+        "callback:Visit"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "accum",
+      "ret": "long",
+      "args": [
+        "int",
+        "callback:Acc",
+        "intptr"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "sort_ints",
+      "ret": "void",
+      "args": [
+        "buf:int32_t*",
+        "int",
+        "callback:Cmp"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "call_twice",
+      "ret": "int",
+      "args": [
+        "callback:Binop",
+        "callback:Binop",
+        "int",
+        "int"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "call_null",
+      "ret": "int",
+      "args": [
+        "callback:Binop"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "many",
+      "ret": "int",
+      "args": [
+        "int",
+        "callback:Binop"
+      ]
+    },
+    {
+      "library": "mylib",
+      "entry": "wide_cb",
+      "ret": "double",
+      "args": [
+        "int",
+        "int",
+        "int",
+        "int",
+        "int",
+        "double",
+        "callback:Binop",
+        "int"
+      ]
+    }
+  ],
+  "includes": [
+    "mylib.h"
+  ],
+  "structs": {
+    "Pair": {
+      "fields": [
+        {
+          "name": "a",
+          "type": "int"
+        },
+        {
+          "name": "b",
+          "type": "float"
+        }
+      ]
+    },
+    "Rgba": {
+      "fields": [
+        {
+          "name": "r",
+          "type": "int"
+        },
+        {
+          "name": "g",
+          "type": "int"
+        },
+        {
+          "name": "b",
+          "type": "int"
+        },
+        {
+          "name": "a",
+          "type": "int"
+        }
+      ]
+    },
+    "V3": {
+      "fields": [
+        {
+          "name": "x",
+          "type": "double"
+        },
+        {
+          "name": "y",
+          "type": "double"
+        },
+        {
+          "name": "z",
+          "type": "double"
+        }
+      ]
+    },
+    "Xf": {
+      "fields": [
+        {
+          "name": "id",
+          "type": "uint"
+        },
+        {
+          "name": "x",
+          "type": "float"
+        },
+        {
+          "name": "y",
+          "type": "float"
+        },
+        {
+          "name": "angle",
+          "type": "float"
+        },
+        {
+          "name": "mode",
+          "type": "int"
+        }
+      ]
+    },
+    "Padded": {
+      "fields": [
+        {
+          "name": "s",
+          "type": "int"
+        },
+        {
+          "name": "l",
+          "type": "long"
+        },
+        {
+          "name": "f",
+          "type": "float"
+        }
+      ]
+    },
+    "Tail": {
+      "fields": [
+        {
+          "name": "a",
+          "type": "int"
+        },
+        {
+          "name": "b",
+          "type": "byte"
+        }
+      ]
+    },
+    "Bytes": {
+      "fields": [
+        {
+          "name": "r",
+          "type": "byte"
+        },
+        {
+          "name": "g",
+          "type": "byte"
+        },
+        {
+          "name": "b",
+          "type": "byte"
+        },
+        {
+          "name": "a",
+          "type": "byte"
+        }
+      ]
+    }
+  },
+  "callbacks": {
+    "Binop": {
+      "c": "binop_fn",
+      "ret": "int",
+      "args": [
+        "int",
+        "int"
+      ],
+      "slots": 8
+    },
+    "Visit": {
+      "c": "visit_fn",
+      "ret": "void",
+      "args": [
+        "int",
+        "double"
+      ],
+      "slots": 4
+    },
+    "MapD": {
+      "c": "mapd_fn",
+      "ret": "double",
+      "args": [
+        "double"
+      ],
+      "slots": 4
+    },
+    "Acc": {
+      "c": "acc_fn",
+      "ret": "long",
+      "args": [
+        "long",
+        "float",
+        "intptr"
+      ],
+      "slots": 4
+    },
+    "Cmp": {
+      "c": "cmp_fn",
+      "ret": "int",
+      "args": [
+        "intptr",
+        "intptr"
+      ],
+      "slots": 4
+    }
+  }
 }
