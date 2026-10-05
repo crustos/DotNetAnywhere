@@ -10,6 +10,7 @@ Usage:
     python build.py -j 8            # parallel jobs
     python build.py --no-corlib     # skip build/corlib.dll
     python build.py --run X.exe     # build, then run: build/dna X.exe
+    python build.py --lib            # also build/libdna.a, for a native host (native/src/Host.h)
     python build.py --ffi M.json    # the runtime with the C functions of a manifest built in -> build/dna_ffi (see tools/gen_ffi.py)
 
 `make` is a one-line wrapper around `python3 build.py`.
@@ -117,6 +118,7 @@ def ensure_generated():
 
 
 def main():
+    global BUILD, OBJ, GEN
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--cc", default=os.environ.get("CC", "gcc"))
@@ -131,11 +133,24 @@ def main():
     ap.add_argument("--ffi", metavar="MANIFEST.json",
                     help="build the C files and functions of this manifest into the runtime, so that [DllImport] of them is a direct "
                          "call (tools/gen_ffi.py says what the manifest holds). Makes build/dna_ffi, with its own objects")
+    ap.add_argument("--lib", action="store_true",
+                    help="also make build/libdna.a (build/libdna_ffi.a with --ffi, libdna32.a with --m32): the runtime without dna.c's main, "
+                         "for a native program that hosts it (native/src/Host.h)")
+    ap.add_argument("--lib-only", action="store_true",
+                    help="make only the library (--lib): do not link build/dna[_ffi], which cannot be linked when the --ffi manifest names "
+                         "functions that the host program defines")
+    ap.add_argument("--build-dir", metavar="DIR",
+                    help="build in DIR instead of ./build (objects, generated code, libraries, corlib.dll): a program that hosts DNA keeps its own, "
+                         "so building it does not disturb this checkout's build")
     ap.add_argument("--verbose", "-v", action="store_true")
     ap.add_argument("-j", type=int, default=os.cpu_count() or 1)
     ap.add_argument("--run", nargs=argparse.REMAINDER,
                     help="after building, run build/dna with these args")
     args = ap.parse_args()
+    if args.build_dir:
+        BUILD = os.path.abspath(args.build_dir)
+        OBJ = os.path.join(BUILD, "obj")
+        GEN = os.path.join(BUILD, "gen")
 
     if args.clean:
         shutil.rmtree(BUILD, ignore_errors=True)
@@ -154,7 +169,6 @@ def main():
         print(f"error: compiler '{args.cc}' not found", file=sys.stderr)
         return 1
 
-    global OBJ, GEN
     if args.m32:
         OBJ = os.path.join(BUILD, "obj32")
     if args.ffi:
@@ -249,6 +263,22 @@ def main():
         return 1
 
     objs = [os.path.join(OBJ, os.path.basename(u)[:-2] + ".o") for u in units]
+    if args.lib or args.lib_only:
+        lib = os.path.join(BUILD, "libdna" + ("_ffi" if args.ffi else "") + ("32" if args.m32 else "") + ".a")
+        if os.path.exists(lib):
+            os.remove(lib)
+        r = subprocess.run(["ar", "rcs", lib] + [o for o in objs if os.path.basename(o) != "dna.o"
+                                     # (the weak empty table of FFIDefault.c would satisfy FFI.c, so an archive would never pull in the real one)
+                                     and not (args.ffi and os.path.basename(o) == "FFIDefault.o")], capture_output=True, text=True)
+        if r.returncode != 0:
+            print("ar FAILED")
+            print(r.stderr)
+            return 1
+        print("built", os.path.relpath(lib, ROOT))
+    if args.lib_only:
+        if args.corlib or (not args.no_corlib and shutil.which("mcs")):
+            return build_corlib()
+        return 0
     out = os.path.join(BUILD, ("dna_ffi" if args.ffi else "dna") + ("32" if args.m32 else ""))
     cmd = [args.cc, "-o", out] + (["-m32"] if args.m32 else []) + objs + ["-lm", "-lpthread"]
     if args.verbose:
