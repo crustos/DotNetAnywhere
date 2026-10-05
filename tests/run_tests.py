@@ -390,6 +390,112 @@ def islands_happen():
     return True
 
 
+def corlib_beside_program():
+    """A program finds corlib.dll beside its own assembly, not only in the directory it is started in: run Hello.exe by its path from another
+    directory. (It used to need the current directory to hold corlib.dll, so a built program only worked when started from its own folder.)"""
+    import shutil, tempfile
+    if not shutil.which("mcs") or not os.path.exists(os.path.join(BUILD, "corlib.dll")):
+        print("  SKIP (needs: mcs and build/corlib.dll)")
+        return True
+    prog = tempfile.mkdtemp(prefix="dna-beside-")
+    elsewhere = tempfile.mkdtemp(prefix="dna-cwd-")
+    try:
+        shutil.copy(os.path.join(BUILD, "corlib.dll"), prog)
+        cs = os.path.join(prog, "Hello.cs")
+        open(cs, "w").write("using System; class P { static int Main() { Console.WriteLine(\"beside\"); return 0; } }\n")
+        c = subprocess.run(["mcs", "-nostdlib", "-r:" + os.path.join(prog, "corlib.dll"), "-out:" + os.path.join(prog, "Hello.exe"), cs], capture_output=True, text=True)
+        if c.returncode:
+            print("  FAIL: Hello.cs did not compile:", (c.stdout + c.stderr)[:300]); return False
+        d = subprocess.run([DNA_BIN, os.path.join(prog, "Hello.exe")], cwd=elsewhere, capture_output=True, text=True)
+        if d.returncode != 0 or "beside" not in d.stdout:
+            print("  FAIL: started from another directory: rc=%s %s" % (d.returncode, (d.stdout + d.stderr)[:200])); return False
+        print("  ok   Hello.exe run from another directory found the corlib.dll beside it")
+        return True
+    finally:
+        shutil.rmtree(prog, ignore_errors=True); shutil.rmtree(elsewhere, ignore_errors=True)
+
+
+def host_calls():
+    """DotNetAnywhere as a library inside a C program (native/src/Host.h; build.py --lib). tests/host/host.c calls the static methods of
+    tests/host/Managed.cs with every kind of argument and result; tests/host/Oracle.cs calls the same methods under Mono, and the two outputs
+    must be identical (host.c also checks, on lines that start with #, what the API refuses and says)."""
+    import shutil
+    m32 = os.path.basename(DNA_BIN) == "dna32"
+    if not (shutil.which("mono") and shutil.which("gcc") and shutil.which("mcs")) or not os.path.exists(os.path.join(BUILD, "corlib.dll")):
+        print("  SKIP (needs: mono, mcs, gcc and build/corlib.dll)")
+        return True
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "build.py"), "--lib", "--no-corlib"] + (["--m32"] if m32 else []), capture_output=True, text=True)
+    lib = os.path.join(BUILD, "libdna32.a" if m32 else "libdna.a")
+    if r.returncode != 0 or not os.path.exists(lib):
+        print("  FAIL: libdna did not build:\n" + (r.stdout + r.stderr)[-600:])
+        return False
+    out = os.path.join(BUILD, "host"); os.makedirs(out, exist_ok=True)
+    shutil.copy(os.path.join(BUILD, "corlib.dll"), out)
+    d = os.path.join(ROOT, "tests", "host")
+    steps = (["mcs", "-nostdlib", "-target:library", "-unsafe", "-r:" + os.path.join(out, "corlib.dll"), "-out:" + os.path.join(out, "Managed.dll"), os.path.join(d, "Managed.cs")],
+             ["mcs", "-unsafe", "-out:" + os.path.join(out, "oracle.exe"), os.path.join(d, "Managed.cs"), os.path.join(d, "Oracle.cs")],
+             ["gcc", "-O1", "-g", "-I", SRC, os.path.join(d, "host.c"), lib, "-lm", "-lpthread", "-o", os.path.join(out, "host")] + (["-m32"] if m32 else []))
+    for cmd in steps:
+        c = subprocess.run(cmd, capture_output=True, text=True)
+        if c.returncode:
+            print("  FAIL: %s did not build:" % os.path.basename(cmd[-1]), (c.stdout + c.stderr)[:400]); return False
+    want = subprocess.run(["mono", os.path.join(out, "oracle.exe")], capture_output=True, text=True).stdout
+    if not want.strip():
+        print("  FAIL: Mono printed nothing"); return False
+    ok = True
+    for label, env in (("default", {}), ("DNA_NO_FUSION=1", {"DNA_NO_FUSION": "1"}), ("DNA_NO_STENCILS=1", {"DNA_NO_STENCILS": "1"})):
+        h = subprocess.run([os.path.join(out, "host"), os.path.join(out, "Managed.dll")], cwd=out, capture_output=True, text=True, env=dict(os.environ, **env))
+        got = "\n".join(l for l in h.stdout.splitlines() if not l.startswith("#")) + "\n"
+        bad = [l for l in h.stdout.splitlines() if l.startswith("#FAIL")]
+        if h.returncode != 0 or got != want or bad:
+            print("  FAIL [%s] rc=%s: %s" % (label, h.returncode, "; ".join(bad) or "output differs from Mono"))
+            import difflib
+            print("\n".join(list(difflib.unified_diff(want.splitlines(), got.splitlines(), "mono", "dna", lineterm=""))[:12]) + "\n" + h.stderr[-200:])
+            ok = False
+        else:
+            print("  ok   host [%s] (%d lines identical to Mono, %d host-API checks)" % (label, len(want.splitlines()), sum(1 for l in h.stdout.splitlines() if l.startswith("#ok"))))
+    return ok
+
+
+def host_nested_calls():
+    """Managed code that calls C ([DllImport], build.py --ffi tests/host/nested.json) which calls managed code again through the host API: a
+    nested call, which runs only its own thread (Thread_ExecuteNested). Five levels deep, with arrays and strings, with the collector
+    running inside it, and from a hot loop (a native block, where the call to C is a stencil)."""
+    import shutil
+    m32 = os.path.basename(DNA_BIN) == "dna32"
+    if not (shutil.which("mcs") and shutil.which("gcc")) or not os.path.exists(os.path.join(BUILD, "corlib.dll")):
+        print("  SKIP (needs: mcs, gcc and build/corlib.dll)")
+        return True
+    d = os.path.join(ROOT, "tests", "host")
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "build.py"), "--ffi", os.path.join(d, "nested.json"), "--no-corlib"] + (["--m32"] if m32 else []),
+                       capture_output=True, text=True)
+    binary = os.path.join(BUILD, "dna_ffi32" if m32 else "dna_ffi")
+    if r.returncode != 0 or not os.path.exists(binary):
+        print("  FAIL: the runtime with the FFI manifest did not build:\n" + (r.stdout + r.stderr)[-600:])
+        return False
+    out = os.path.join(BUILD, "host"); os.makedirs(out, exist_ok=True)
+    shutil.copy(os.path.join(BUILD, "corlib.dll"), out)
+    c = subprocess.run(["mcs", "-nostdlib", "-unsafe", "-r:" + os.path.join(out, "corlib.dll"), "-out:" + os.path.join(out, "Nested.exe"),
+                        os.path.join(d, "Managed.cs"), os.path.join(d, "Nested.cs")], capture_output=True, text=True)
+    if c.returncode:
+        print("  FAIL: Nested.cs did not compile:", (c.stdout + c.stderr)[:400]); return False
+    # (what each C function gets from the managed methods it calls, worked out here)
+    sink = sum(i + len("x" + str(i)) for i in range(500))
+    want = ["twice 42", "sumsq %d" % sum(i * i for i in range(6)), "greet %d" % len("Hello, h\u00e9llo!".encode("utf-8")), "depth 5",
+            "fill 100,101,102,103", "churn %d" % (5 * 1000 + 6 + (sink & 1)), "loop %d" % sum(2 * (i & 7) for i in range(20000)), "after 2"]
+    ok = True
+    for label, env in (("default", {}), ("DNA_NO_FUSION=1", {"DNA_NO_FUSION": "1"}), ("DNA_NO_STENCILS=1", {"DNA_NO_STENCILS": "1"})):
+        if m32 and label != "default":
+            continue
+        h = subprocess.run([binary, os.path.join(out, "Nested.exe")], cwd=out, capture_output=True, text=True, env=dict(os.environ, **env))
+        got = [l.rstrip() for l in h.stdout.splitlines() if l.strip() and not l.startswith("Total execution time")]
+        if h.returncode != 0 or got != want:
+            print("  FAIL [%s] rc=%s\n    wanted %s\n    got    %s\n    %s" % (label, h.returncode, want, got, h.stderr[-200:])); ok = False
+        else:
+            print("  ok   nested [%s] (%d lines)" % (label, len(want)))
+    return ok
+
+
 def ffi_calls():
     """[DllImport] of C functions named in a manifest (build.py --ffi tests/ffi/mylib.json). Builds that runtime (build/dna_ffi, or dna_ffi32
     for the 32-bit run) and the same C as a shared library for Mono, and compares FfiCalls with Mono's output (in the default mode and
@@ -415,7 +521,7 @@ def ffi_calls():
         print("  FAIL: libmylib.so did not build:", lib.stderr[:300]); return False
     ok = True
     clean = lambda t: "\n".join(l.rstrip() for l in t.splitlines() if l.strip() and not l.startswith("Total execution time"))
-    for name, least_stencils in (("FfiCalls", 12), ("FfiMarshal", 4)):
+    for name, least_stencils in (("FfiCalls", 12), ("FfiMarshal", 4), ("FfiWide", 0), ("FfiStruct", 0), ("FfiCallback", 0)):
         cs = os.path.join(ROOT, "tests", "dotnet", name + ".cs")
         ref, exe = os.path.join(out, name + ".ref.exe"), os.path.join(out, name + ".exe")
         a = subprocess.run(["mcs", "-unsafe", "-out:" + ref, cs], capture_output=True, text=True)
@@ -455,6 +561,40 @@ def ffi_calls():
             print("  ok   a DllImport with %s is refused" % what)
         else:
             print("  FAIL: a mismatched DllImport (%s) was not refused (rc=%s): %s" % (what, d.returncode, (d.stdout + d.stderr)[:200])); ok = False
+    # a C# struct that disagrees with the C struct the manifest declares must be refused when the method that calls is compiled, with the reason, not run:
+    # a corrupt struct on the evaluation stack is memory corruption that nothing would report
+    P = "using System; using System.Runtime.InteropServices;\n"
+    for what, types, decl, call, want in (
+            ("a struct with a byte field and padding at its end in C", "struct Tail { public int a; public byte b; }", "static extern int tail_sum(Tail t);", "tail_sum(new Tail())", "narrower than 4 bytes"),
+            ("a struct of narrow fields (a byte takes a 4-byte slot)", "struct Bytes { public byte r, g, b, a; }", "static extern int bytes_sum(Bytes t);", "bytes_sum(new Bytes())", "narrower than 4 bytes"),
+            ("fields in another order", "struct Pair { public float b; public int a; }", "static extern int pair_sum(Pair p);", "pair_sum(new Pair())", "field 1"),
+            ("a field too many", "struct Pair { public int a; public float b; public int c; }", "static extern int pair_sum(Pair p);", "pair_sum(new Pair())", "bytes in C# and"),
+            ("a field too few in an array of structs", "struct Xf { public uint id; public float x, y, angle; }", "static extern int xf_apply(Xf[] x, int n, float dt);", "xf_apply(new Xf[2], 2, 1f)", "bytes in C# and"),
+            ("a result of the wrong struct", "struct Pair { public int a; public int b; }", "static extern Pair pair_make(int a, float b);", "pair_make(1, 2f).a", "the result"),
+            ("an int where the manifest has a struct", "struct Pair { public int a; public float b; }", "static extern int pair_sum(int p);", "pair_sum(1)", "disagree"),
+            ("a delegate with too few arguments", "delegate int Bad(int a);", "static extern int fold_ints(int[] a, int n, int i, Bad f);", "fold_ints(new int[1], 0, 0, null)", "takes 1 argument(s)"),
+            ("a delegate with an argument of the wrong kind", "delegate int Bad(int a, double b);", "static extern int fold_ints(int[] a, int n, int i, Bad f);", "fold_ints(new int[1], 0, 0, null)", "argument 2"),
+            ("a delegate with the wrong result", "delegate void Bad(int a, int b);", "static extern int fold_ints(int[] a, int n, int i, Bad f);", "fold_ints(new int[1], 0, 0, null)", "returns kind v"),
+            ("an int where the manifest has a callback", "delegate int Bad(int a, int b);", "static extern int fold_ints(int[] a, int n, int i, int f);", "fold_ints(new int[1], 0, 0, 1)", "disagree")):
+        bad = os.path.join(out, "FfiMismatchS.cs"); badexe = os.path.join(out, "FfiMismatchS.exe")
+        open(bad, "w").write(P + ("[StructLayout(LayoutKind.Sequential)] " if types.startswith("struct") else "") + "%s\nclass P { [DllImport(\"mylib\")] %s\n  static int Main() { Console.WriteLine(%s); return 0; } }\n" % (types, decl, call))
+        c = subprocess.run(["mcs", "-nostdlib", "-r:" + os.path.join(out, "corlib.dll"), "-out:" + badexe, bad], capture_output=True, text=True)
+        d = subprocess.run([binary, badexe], cwd=out, capture_output=True, text=True)
+        if c.returncode == 0 and d.returncode != 0 and "disagree" in (d.stdout + d.stderr) and want in (d.stdout + d.stderr):
+            print("  ok   %s is refused (\"%s\")" % (what, want))
+        else:
+            print("  FAIL: %s was not refused as expected (compile rc=%s, rc=%s, wanted '%s'): %s" % (what, c.returncode, d.returncode, want, (c.stdout + c.stderr + d.stdout + d.stderr)[:260])); ok = False
+    # callbacks in use at once beyond the pool: the program stops with a message, it does not hand C a pointer that is not backed
+    bad = os.path.join(out, "FfiPool.cs"); badexe = os.path.join(out, "FfiPool.exe")
+    open(bad, "w").write(P + "delegate void V(int i, double v);\nclass P { [DllImport(\"mylib\")] static extern void for_each(int n, V f);\n"
+                         "  static V v; static int depth;\n  static void Visit(int i, double d) { depth++; if (depth < 9) for_each(1, v); }\n"
+                         "  static int Main() { v = new V(Visit); for_each(1, v); Console.WriteLine(depth); return 0; } }\n")
+    c = subprocess.run(["mcs", "-nostdlib", "-r:" + os.path.join(out, "corlib.dll"), "-out:" + badexe, bad], capture_output=True, text=True)
+    d = subprocess.run([binary, badexe], cwd=out, capture_output=True, text=True)
+    if c.returncode == 0 and d.returncode != 0 and "more than 4 callbacks of type Visit are in use at once" in (d.stdout + d.stderr):
+        print("  ok   more callbacks in use than the pool has slots stops with a message")
+    else:
+        print("  FAIL: pool exhaustion was not reported as expected (compile rc=%s, rc=%s): %s" % (c.returncode, d.returncode, (c.stdout + c.stderr + d.stdout + d.stderr)[:260])); ok = False
     return ok
 
 
@@ -504,6 +644,9 @@ TESTS = [("heaptree_difftest (the original C vs native/src/HeapTree.c)", heaptre
          ("the register stencil test is generated from the current table", register_tests_in_sync),
          ("every stencil is exercised by a stencil test", stencil_coverage),
          ("native FFI: DllImport of C functions named in a manifest", ffi_calls),
+         ("assemblies are found beside the program, not in the current directory", corlib_beside_program),
+         ("host API: C calls managed static methods (native/src/Host.h)", host_calls),
+         ("host API: managed -> C -> managed (nested calls)", host_nested_calls),
          ("calls are inlined into native blocks", inlining_happens),
          ("instructions run as islands inside native blocks", islands_happen),
          ("stencil classification compares every alias of a handler", stencil_alias_groups),
