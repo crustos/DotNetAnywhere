@@ -522,5 +522,9 @@
 // (when it does not know, the old JIT_LOAD_ELEMENT_U8 / JIT_STORE_ELEMENT_32 look at the array at run time).
 #define JIT_LOAD_ELEMENT_U8_1                            0x1c6
 #define JIT_LOAD_ELEMENT_U8_4                            0x1c7
+// A pointer-wide array index (C# emits `conv.u` / `conv.i` before the element opcode for a uint, long or ulong index, and on a 64-bit target that is
+// 8 bytes on the evaluation stack, where the element operations take 4) that sits UNDER a value (stelem): narrow it to 32 bits and move the value
+// down over the four bytes that leaves.  operand: the size of the value in bytes.  (An index on top is narrowed by an ordinary conversion.)
+#define JIT_NARROW_INDEX_BELOW                           0x1cb   // (the opcodes are not numbered in the order they are listed: the highest in use is JIT_FFI_CALL, 0x1ca)
 
 #endif

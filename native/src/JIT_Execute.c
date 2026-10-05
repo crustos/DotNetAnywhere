@@ -726,6 +726,7 @@ U32 JIT_Execute(tThread *pThread, U32 numInst) {
 		GET_LABELS(JIT_LOAD_ELEMENT_ADDR_N);
 		GET_LABELS(JIT_LOAD_ELEMENT_U8_1);
 		GET_LABELS(JIT_LOAD_ELEMENT_U8_4);
+		GET_LABELS(JIT_NARROW_INDEX_BELOW);
 		GET_LABELS(JIT_BRANCH_TRUE);
 		GET_LABELS(JIT_LOADTOKEN_TYPE);
 		
@@ -4692,6 +4693,22 @@ JIT_LOAD_ELEMENT_ADDR_N_start:
 		PUSH_PTR(((tSystemArray*)heapPtr)->elements + (size_t)idx * size);
 	}
 JIT_LOAD_ELEMENT_ADDR_N_end:
+	GO_NEXT();
+
+JIT_NARROW_INDEX_BELOW_start:
+	OPCODE_USE(JIT_NARROW_INDEX_BELOW);
+	{
+		U32 valueSize = GET_OP();
+		PTR value = pCurEvalStack - valueSize;      // the value on top; the pointer-wide index is the 8 bytes below it
+		int64_t wide;
+		int32_t narrow;
+		memcpy(&wide, value - 8, sizeof(wide));
+		narrow = (int32_t)wide;
+		memcpy(value - 8, &narrow, sizeof(narrow));
+		memmove(value - 4, value, valueSize);
+		pCurEvalStack -= 4;
+	}
+JIT_NARROW_INDEX_BELOW_end:
 	GO_NEXT();
 
 JIT_NATIVE_BLOCK_start:

@@ -107,6 +107,23 @@ static tOpWord Translate(U32 op, U32 getDynamic) {
 
 #define PushBranch() PushU32_(&branchOffsets, ops.ofs, -1)
 
+// An array index, or the length of `newarr`, that is pointer-wide: C# puts a `conv.u` / `conv.i` before the element opcode for a uint, long or ulong, and
+// on a 64-bit target the result is 8 bytes on the evaluation stack, where the element operations (and newarr) take 4 -- the stack was left misaligned.
+// The index is narrowed here, where the type stack still says what it is: on top by an ordinary conversion, under a stelem's value by
+// JIT_NARROW_INDEX_BELOW.  (A 32-bit target has no wide index, and nothing is emitted.)
+#define NarrowWideIndexTop() \
+	do { \
+		if (typeStack.ppTypes[typeStack.ofs - 1]->stackSize > 4) { \
+			PushOp(JIT_CONV_FROM_U64 + JIT_CONV_OFFSET_I32); PushU32(0); \
+		} \
+	} while (0)
+#define NarrowWideIndexBelowValue() \
+	do { \
+		if (typeStack.ppTypes[typeStack.ofs - 2]->stackSize > 4) { \
+			PushOpParam(JIT_NARROW_INDEX_BELOW, typeStack.ppTypes[typeStack.ofs - 1]->stackSize); \
+		} \
+	} while (0)
+
 #define PushStackType(type) PushStackType_(&typeStack, type);
 #define PopStackType() (typeStack.ppTypes[--typeStack.ofs])
 #define PopStackTypeDontCare() typeStack.ofs--
@@ -2629,6 +2646,7 @@ conv2:
 
 					u32Value = GetUnalignedU32(pCIL, &cilOfs);
 					pTypeDef = MetaData_GetTypeDefFromDefRefOrSpec(pMethodDef->pMetaData, u32Value, pMethodDef->pParentType->ppClassTypeArgs, pMethodDef->ppMethodTypeArgs);
+					NarrowWideIndexTop();
 					PopStackTypeDontCare(); // Don't care what it is
 					PushOp(JIT_NEW_VECTOR);
 					MetaData_Fill_TypeDef(pTypeDef, NULL, NULL);
@@ -2646,7 +2664,7 @@ conv2:
 
 			case CIL_LDELEM_U1:
 				// byte[] has 1-byte elements and bool[] 4-byte ones: use the array's type, if it is known, to choose
-				PopStackTypeMulti(2);
+				NarrowWideIndexTop(); PopStackTypeMulti(2);
 				{
 					U32 elemSize = KnownArrayElementSize(typeStack.ppTypes[typeStack.ofs]);   // the array: popped, still there
 					PushOp(elemSize == 1 ? JIT_LOAD_ELEMENT_U8_1 : (elemSize == 4 ? JIT_LOAD_ELEMENT_U8_4 : JIT_LOAD_ELEMENT_U8));
@@ -2658,37 +2676,37 @@ conv2:
 			case CIL_LDELEM_U2:
 			case CIL_LDELEM_I4:
 			case CIL_LDELEM_U4:
-				PopStackTypeMulti(2); // Don't care what any of these are
+				NarrowWideIndexTop(); PopStackTypeMulti(2); // Don't care what any of these are
 				PushOp(JIT_LOAD_ELEMENT_I8 + (op - CIL_LDELEM_I1));
 				PushStackType(types[TYPE_SYSTEM_INT32]);
 				break;
 
 			case CIL_LDELEM_I8:
-				PopStackTypeMulti(2); // Don't care what any of these are
+				NarrowWideIndexTop(); PopStackTypeMulti(2); // Don't care what any of these are
 				PushOp(JIT_LOAD_ELEMENT_I64);
 				PushStackType(types[TYPE_SYSTEM_INT64]);
 				break;
 
 			case CIL_LDELEM_R4:
-				PopStackTypeMulti(2); // Don't care what any of these are
+				NarrowWideIndexTop(); PopStackTypeMulti(2); // Don't care what any of these are
 				PushOp(JIT_LOAD_ELEMENT_R32);
 				PushStackType(types[TYPE_SYSTEM_SINGLE]);
 				break;
 
 			case CIL_LDELEM_R8:
-				PopStackTypeMulti(2); // Don't care what any of these are
+				NarrowWideIndexTop(); PopStackTypeMulti(2); // Don't care what any of these are
 				PushOp(JIT_LOAD_ELEMENT_R64);
 				PushStackType(types[TYPE_SYSTEM_DOUBLE]);
 				break;
 
 			case CIL_LDELEM_REF:
-				PopStackTypeMulti(2); // Don't care what any of these are
+				NarrowWideIndexTop(); PopStackTypeMulti(2); // Don't care what any of these are
 				PushOp(JIT_LOAD_ELEMENT_PTR);
 				PushStackType(types[TYPE_SYSTEM_OBJECT]);
 				break;
 
 			case CIL_LDELEM_I: // native int: pointer-sized
-				PopStackTypeMulti(2); // Don't care what any of these are
+				NarrowWideIndexTop(); PopStackTypeMulti(2); // Don't care what any of these are
 				PushOp(JIT_LOAD_ELEMENT_PTR);
 				PushStackType(types[TYPE_SYSTEM_INTPTR]);
 				break;
@@ -2696,7 +2714,7 @@ conv2:
 			case CIL_LDELEM_ANY:
 				u32Value = GetUnalignedU32(pCIL, &cilOfs);
 				pStackType = (tMD_TypeDef*)MetaData_GetTypeDefFromDefRefOrSpec(pMetaData, u32Value, pMethodDef->pParentType->ppClassTypeArgs, pMethodDef->ppMethodTypeArgs);
-				PopStackTypeMulti(2); // Don't care what these are
+				NarrowWideIndexTop(); PopStackTypeMulti(2); // Don't care what these are
 				MetaData_Fill_TypeDef(pStackType, NULL, NULL);
 				if (pStackType == types[TYPE_SYSTEM_SBYTE] || pStackType == types[TYPE_SYSTEM_INT16]) {
 					// a signed element narrower than the stack slot has to be sign-extended, as ldelem.i1 and ldelem.i2 do (the general load
@@ -2718,14 +2736,14 @@ conv2:
 					u32Value = GetUnalignedU32(pCIL, &cilOfs);
 					pElemType = MetaData_GetTypeDefFromDefRefOrSpec(pMetaData, u32Value, pMethodDef->pParentType->ppClassTypeArgs, pMethodDef->ppMethodTypeArgs);
 					MetaData_Fill_TypeDef(pElemType, NULL, NULL);
-					PopStackTypeMulti(2); // Don't care what any of these are
+					NarrowWideIndexTop(); PopStackTypeMulti(2); // Don't care what any of these are
 					PushOpParam(JIT_LOAD_ELEMENT_ADDR_N, pElemType->arrayElementSize);
 					PushStackType(types[TYPE_SYSTEM_INTPTR]);
 				}
 				break;
 
 			case CIL_STELEM_I1:
-				PopStackTypeMulti(3); // Don't care what any of these are
+				NarrowWideIndexBelowValue(); PopStackTypeMulti(3); // Don't care what any of these are
 				{
 					// byte[] and sbyte[] have 1-byte elements, bool[] 4-byte ones: choose from the array's type, if it is known
 					U32 elemSize = KnownArrayElementSize(typeStack.ppTypes[typeStack.ofs]);
@@ -2733,29 +2751,30 @@ conv2:
 				}
 				break;
 			case CIL_STELEM_I2:
-				PopStackTypeMulti(3);
+				NarrowWideIndexBelowValue(); PopStackTypeMulti(3);
 				PushOp(JIT_STORE_ELEMENT_I2);
 				break;
 			case CIL_STELEM_I4:
 			case CIL_STELEM_R4:
-				PopStackTypeMulti(3);
+				NarrowWideIndexBelowValue(); PopStackTypeMulti(3);
 				PushOp(JIT_STORE_ELEMENT_I4);
 				break;
 
 			case CIL_STELEM_I:   // native int and references are pointer-sized
 			case CIL_STELEM_REF:
-				PopStackTypeMulti(3); // Don't care what any of these are
+				NarrowWideIndexBelowValue(); PopStackTypeMulti(3); // Don't care what any of these are
 				PushOp(JIT_STORE_ELEMENT_PTR);
 				break;
 
 			case CIL_STELEM_I8:
 			case CIL_STELEM_R8:
-				PopStackTypeMulti(3); // Don't care what any of these are
+				NarrowWideIndexBelowValue(); PopStackTypeMulti(3); // Don't care what any of these are
 				PushOp(JIT_STORE_ELEMENT_64);
 				break;
 
 			case CIL_STELEM_ANY:
 				GetUnalignedU32(pCIL, &cilOfs); // Don't need this token, as the type stack will contain the same type
+				NarrowWideIndexBelowValue();
 				pStackType = PopStackType(); // This is the type to store
 				PopStackTypeMulti(2); // Don't care what these are
 				if (pStackType->stackSize == 4 && KnownArrayElementSize(typeStack.ppTypes[typeStack.ofs]) == 4) {
