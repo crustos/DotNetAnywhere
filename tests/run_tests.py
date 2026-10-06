@@ -127,6 +127,9 @@ def net8_run(cs, out):
 LIBM_DEPENDENT = {"MathF.Tan", "MathF.Atan", "MathF.Sinh", "MathF.Tanh", "MathF.Log10", "MathF.Cbrt", "MathF.Atan2",
                   "Math.Sinh", "Math.Cosh", "Math.Tanh", "Math.Exp", "Math.Log10", "Math.Cbrt", "Math.Atan2", "Math.Pow"}
 
+# wasi-libc (musl) rounds these last-bit differently from glibc too.
+WASM_LIBM_EXTRA = {"MathF.Sin", "MathF.Cos", "MathF.Acos", "MathF.Cosh", "Math.Sin", "Math.Cos", "Math.Tan", "Math.Atan"}
+
 
 def dotnet_programs():
     """Compile tests/dotnet/*.cs against corlib.dll and run them on the runtime under test (build/dna32 or build/dna)."""
@@ -141,7 +144,7 @@ def dotnet_programs():
     # too, so a wrong expectation is caught there and not baked into DNA's behaviour.
     # (MarshalRefusal is deliberately DNA-only: the reference Marshal accepts strings.)
     parity = {"ManyLocalsAndArgs", "MarshalLayout", "ExceptionUnwind", "DictionaryConstrained", "ListBounds", "NullFields",
-              "Int64AndFloatOps", "RefAccess", "ConversionChains",
+              "Int64AndFloatOps", "Int64Branch", "RefAccess", "ConversionChains",
               "DelegateVirtual", "TypedReferences"}
     # Generated programs that print one line per case: DNA's whole stdout must equal Mono's.
     output_parity = {"CheckedConversions", "UncheckedConversions", "ArithmeticMatrix", "UnboxChecks", "EnumFormatting", "ValueTypeBases", "ExceptionFilters", "Stopwatch", "StaticFields", "TryRegions", "DictionaryOps", "StructArrays", "FusedOps", "StencilBlocks", "StencilFields", "StencilLoops", "ThreadSleep", "ArrayBounds", "FloatCompare", "StencilFloat", "StencilArrays", "StencilWide", "StencilInline", "StencilFields8", "CallPaths", "DelegatePaths", "GcRoots", "StencilIslands", "StencilInlineCold", "StencilRegisters"}
@@ -167,9 +170,9 @@ def dotnet_programs():
             d = subprocess.run([dna, exe], cwd=out, capture_output=True, text=True)
             key = lambda t: dict((l.rsplit(" ", 1)[0], l.rsplit(" ", 1)[1].strip()) for l in t.splitlines() if " " in l and not l.startswith("Total execution time"))
             a, b = key(ref), key(d.stdout)
-            # The libm-dependent results are only excused for the 32-bit build (which calls the i386 C library);
+            # The libm-dependent results are only excused for the 32-bit build (which calls the i386 C library) and the wasm one (wasi-libc's musl math);
             # a 64-bit build calls the same x86-64 one .NET does, so there every result must match.
-            excused = LIBM_DEPENDENT if os.path.basename(dna) == "dna32" else set()
+            excused = LIBM_DEPENDENT | WASM_LIBM_EXTRA if os.path.basename(dna) == "dna-wasm" else LIBM_DEPENDENT if os.path.basename(dna) == "dna32" else set()
             bad = [k for k in a if a[k] != b.get(k) and k not in excused]
             soft = [k for k in a if a[k] != b.get(k) and k in excused]
             good = d.returncode == 0 and not bad and len(b) == len(a) and len(a) > 0
