@@ -10,6 +10,7 @@ Usage:
     python build.py -j 8            # parallel jobs
     python build.py --no-corlib     # skip build/corlib.dll
     python build.py --run X.exe     # build, then run: build/dna X.exe
+    python build.py --wasm          # WebAssembly: build/dna.wasm with clang --target=wasm32-wasi (needs clang, lld, wasi-libc)
     python build.py --lib            # also build/libdna.a, for a native host (native/src/Host.h)
     python build.py --ffi M.json    # the runtime with the C functions of a manifest built in -> build/dna_ffi (see tools/gen_ffi.py)
 
@@ -142,6 +143,14 @@ def main():
     ap.add_argument("--build-dir", metavar="DIR",
                     help="build in DIR instead of ./build (objects, generated code, libraries, corlib.dll): a program that hosts DNA keeps its own, "
                          "so building it does not disturb this checkout's build")
+    ap.add_argument("--wasm", action="store_true",
+                    help="build build/dna.wasm for WebAssembly (clang --target=wasm32-wasi; apt install clang lld wasi-libc libclang-rt-dev-wasm32). "
+                         "Run it with: node tools/run_wasm.mjs build/dna.wasm prog.exe (or --run prog.exe)")
+    ap.add_argument("--no-wasm-jit", action="store_true",
+                    help="with --wasm: leave out the compiler from CIL to wasm (native/src/WasmJIT.c), so that the module needs no host import "
+                         "and runs on any WASI runtime. The default build has it, and needs a host that provides dna.emit_wasm (tools/run_wasm.mjs)")
+    ap.add_argument("--wasi-sysroot", metavar="DIR", default=os.environ.get("WASI_SYSROOT", "/usr"),
+                    help="the wasi-libc sysroot for --wasm (headers in DIR/include/wasm32-wasi, libraries in DIR/lib/wasm32-wasi; default /usr)")
     ap.add_argument("--verbose", "-v", action="store_true")
     ap.add_argument("-j", type=int, default=os.cpu_count() or 1)
     ap.add_argument("--run", nargs=argparse.REMAINDER,
@@ -165,12 +174,27 @@ def main():
     if rc:
         return rc
 
+    if args.wasm:
+        if args.m32 or args.ffi or args.lib or args.lib_only:
+            print("error: --wasm cannot be combined with --m32, --ffi, --lib or --lib-only", file=sys.stderr)
+            return 1
+        if args.cc == "gcc":
+            args.cc = "clang"        # gcc cannot target wasm
+        if not os.path.isdir(os.path.join(args.wasi_sysroot, "include", "wasm32-wasi")):
+            print("error: no wasi-libc under %s (apt install wasi-libc libclang-rt-dev-wasm32, or pass --wasi-sysroot)" % args.wasi_sysroot, file=sys.stderr)
+            return 1
     if not shutil.which(args.cc):
         print(f"error: compiler '{args.cc}' not found", file=sys.stderr)
         return 1
 
     if args.m32:
         OBJ = os.path.join(BUILD, "obj32")
+    wasm_flags = []
+    if args.wasm:
+        OBJ = os.path.join(BUILD, "obj_wasm")
+        # -nostdlibinc: without it clang also searches the host's /usr/include, which is the wrong libc (no wasm32 ABI)
+        wasm_flags = ["--target=wasm32-wasi", "--sysroot=" + args.wasi_sysroot, "-nostdlibinc",
+                      "-isystem", os.path.join(args.wasi_sysroot, "include", "wasm32-wasi")]
     if args.ffi:
         # its own objects and generated files: the generated C changes what the runtime is, and the normal build must stay as it is
         OBJ = os.path.join(BUILD, "obj_ffi32" if args.m32 else "obj_ffi")
@@ -205,6 +229,9 @@ def main():
         # Debian/Ubuntu multiarch keeps asm/*.h here; -m32 doesn't search it
         if os.path.isdir("/usr/include/x86_64-linux-gnu/asm"):
             cflags += ["-idirafter", "/usr/include/x86_64-linux-gnu"]
+    cflags += wasm_flags
+    if args.wasm and args.no_wasm_jit:
+        cflags += ["-DDNA_NO_WASM_JIT_BUILD"]
     if args.debug:
         cflags += ["-O0", "-g", "-fno-omit-frame-pointer"]
     else:
@@ -279,8 +306,15 @@ def main():
         if args.corlib or (not args.no_corlib and shutil.which("mcs")):
             return build_corlib()
         return 0
-    out = os.path.join(BUILD, ("dna_ffi" if args.ffi else "dna") + ("32" if args.m32 else ""))
-    cmd = [args.cc, "-o", out] + (["-m32"] if args.m32 else []) + objs + ["-lm", "-lpthread"]
+    out = os.path.join(BUILD, ("dna_ffi" if args.ffi else "dna") + ("32" if args.m32 else "") + (".wasm" if args.wasm else ""))
+    if args.wasm:
+        # the default 64 KB wasm stack is too small for the interpreter's C recursion; memory grows on demand
+        cmd = [args.cc, "-o", out] + wasm_flags + objs + ["-lm", "-fuse-ld=lld", "-Wl,-z,stack-size=1048576"]
+        if not args.no_wasm_jit:
+            # the host puts the functions it compiles at run time in the indirect function table, which therefore has to be exported and growable
+            cmd += ["-Wl,--export-table", "-Wl,--growable-table"]
+    else:
+        cmd = [args.cc, "-o", out] + (["-m32"] if args.m32 else []) + objs + ["-lm", "-lpthread"]
     if args.verbose:
         print(" ".join(cmd))
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -289,6 +323,14 @@ def main():
         print(r.stderr)
         return 1
     print("built", os.path.relpath(out, ROOT))
+    if args.wasm:
+        # build/dna-wasm runs like build/dna (`dna-wasm prog.exe`, any working directory, exit status and environment passed through), so
+        # anything that runs the native runtime -- tests/run_tests.py with --wasm, scripts -- can run the wasm one
+        launcher = os.path.join(BUILD, "dna-wasm")
+        with open(launcher, "w") as f:
+            f.write('#!/bin/sh\nexec node --no-warnings "%s" "%s" "$@"\n' % (os.path.join(ROOT, "tools", "run_wasm.mjs"), out))
+        os.chmod(launcher, 0o755)
+        print("built", os.path.relpath(launcher, ROOT))
     if args.corlib or (not args.no_corlib and shutil.which("mcs")):
         rc = build_corlib()
         if rc:
@@ -298,6 +340,8 @@ def main():
               "the runtime needs it to run anything")
 
     if args.run is not None:
+        if args.wasm:
+            return subprocess.call(["node", "--no-warnings", os.path.join(ROOT, "tools", "run_wasm.mjs"), out] + args.run)
         return subprocess.call([out] + args.run)
     return 0
 
