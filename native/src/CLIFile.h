@@ -48,6 +48,7 @@ tCLIFile* CLIFile_FindLoaded(const char *pAssemblyName);
 void CLIFile_SetAssemblyDir(const char *dir);
 tMD_TypeDef* CLIFile_FindTypeInAllLoadedAssemblies(STRING nameSpace, STRING name);
 void CLIFile_GetHeapRoots(tHeapRoots *pHeapRoots);
+void CLIFile_ForEachType(void (*fn)(tMD_TypeDef *pTypeDef, void *ctx), void *ctx);
 
 // instance methods
 tCLIFile* CLIFile_Load(char *pFileName);

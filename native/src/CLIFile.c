@@ -476,6 +476,18 @@ I32 CLIFile_Execute(tCLIFile *pThis, int argc, char **argp) {
 	return Thread_Execute();
 }
 
+// Calls fn for every type definition in every assembly that is loaded (not the instantiations of generic types).
+void CLIFile_ForEachType(void (*fn)(tMD_TypeDef *pTypeDef, void *ctx), void *ctx) {
+	tFilesLoaded *pFile;
+	for (pFile = pFilesLoaded; pFile != NULL; pFile = pFile->pNext) {
+		tMetaData *pMetaData = pFile->pCLIFile->pMetaData;
+		U32 i, top = pMetaData->tables.numRows[MD_TABLE_TYPEDEF];
+		for (i = 1; i <= top; i++) {
+			fn((tMD_TypeDef*)MetaData_GetTableRow(pMetaData, MAKE_TABLE_INDEX(MD_TABLE_TYPEDEF, i)), ctx);
+		}
+	}
+}
+
 void CLIFile_GetHeapRoots(tHeapRoots *pHeapRoots) {
 	tFilesLoaded *pFile;
 
