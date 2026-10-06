@@ -10,21 +10,21 @@ typedef unsigned char U8; typedef int I32;
 #define MAX_TREE_DEPTH 40
 
 // ---------------- reference: original C code ----------------
-static tHeapEntry *pHeapTreeRoot;
-static tHeapEntry *nil;
+static tHeapNode *pHeapTreeRoot;
+static tHeapNode *nil;
 
-static tHeapEntry* TreeSkew(tHeapEntry *pRoot) {
+static tHeapNode* TreeSkew(tHeapNode *pRoot) {
 	if (pRoot->pLink[0]->level == pRoot->level && pRoot->level != 0) {
-		tHeapEntry *pSave = pRoot->pLink[0];
+		tHeapNode *pSave = pRoot->pLink[0];
 		pRoot->pLink[0] = pSave->pLink[1];
 		pSave->pLink[1] = pRoot;
 		pRoot = pSave;
 	}
 	return pRoot;
 }
-static tHeapEntry* TreeSplit(tHeapEntry *pRoot) {
+static tHeapNode* TreeSplit(tHeapNode *pRoot) {
 	if (pRoot->pLink[1]->pLink[1]->level == pRoot->level && pRoot->level != 0) {
-		tHeapEntry *pSave = pRoot->pLink[1];
+		tHeapNode *pSave = pRoot->pLink[1];
 		pRoot->pLink[1] = pSave->pLink[0];
 		pSave->pLink[0] = pRoot;
 		pRoot = pSave;
@@ -32,15 +32,15 @@ static tHeapEntry* TreeSplit(tHeapEntry *pRoot) {
 	}
 	return pRoot;
 }
-static tHeapEntry* TreeInsert(tHeapEntry *pRoot, tHeapEntry *pEntry) {
+static tHeapNode* TreeInsert(tHeapNode *pRoot, tHeapNode *pEntry) {
 	if (pRoot == nil) {
 		pRoot = pEntry;
 		pRoot->level = 1;
 		pRoot->pLink[0] = pRoot->pLink[1] = nil;
 		pRoot->marked = 0;
 	} else {
-		tHeapEntry *pNode = pHeapTreeRoot;
-		tHeapEntry *pUp[MAX_TREE_DEPTH];
+		tHeapNode *pNode = pHeapTreeRoot;
+		tHeapNode *pUp[MAX_TREE_DEPTH];
 		I32 top = 0, dir;
 		for (;;) {
 			pUp[top++] = pNode;
@@ -62,12 +62,12 @@ static tHeapEntry* TreeInsert(tHeapEntry *pRoot, tHeapEntry *pEntry) {
 	}
 	return pRoot;
 }
-static tHeapEntry* TreeRemove(tHeapEntry *pRoot, tHeapEntry *pDelete) {
+static tHeapNode* TreeRemove(tHeapNode *pRoot, tHeapNode *pDelete) {
 	if (pRoot != nil) {
 		if (pRoot == pDelete) {
 			if (pRoot->pLink[0] != nil && pRoot->pLink[1] != nil) {
-				tHeapEntry *pL0; U8 l;
-				tHeapEntry *pHeir = pRoot->pLink[0], **ppHeirLink = &pHeir->pLink[0];
+				tHeapNode *pL0; U8 l;
+				tHeapNode *pHeir = pRoot->pLink[0], **ppHeirLink = &pHeir->pLink[0];
 				while (pHeir->pLink[1] != nil) {
 					ppHeirLink = &pHeir->pLink[1];
 					pHeir = pHeir->pLink[1];
@@ -105,14 +105,14 @@ static tHeapEntry* TreeRemove(tHeapEntry *pRoot, tHeapEntry *pDelete) {
 
 // ---------------- harness ----------------
 #define N 2000
-static tHeapEntry A[N], B[N];
+static tHeapNode A[N], B[N];
 static int inA[N];
 
-static int idx(tHeapEntry *arr, tHeapEntry *nilp, tHeapEntry *p) { return p == nilp ? -1 : (int)(p - arr); }
+static int idx(tHeapNode *arr, tHeapNode *nilp, tHeapNode *p) { return p == nilp ? -1 : (int)(p - arr); }
 
 // Compare shapes recursively; also check AA invariants on B. Returns node count or -1.
-static int walk(tHeapEntry *a, tHeapEntry *b, int depth) {
-	tHeapEntry *na = nil, *nb = HeapTree_NilNode;
+static int walk(tHeapNode *a, tHeapNode *b, int depth) {
+	tHeapNode *na = nil, *nb = HeapTree_NilNode;
 	if (a == na || b == nb) {
 		if ((a == na) != (b == nb)) { printf("shape mismatch (nil vs node)\n"); return -1; }
 		return 0;
@@ -135,7 +135,7 @@ int main(int argc, char **argv) {
 	int rounds = argc > 2 ? atoi(argv[2]) : 200000;
 	srand(seed);
 
-	nil = calloc(1, sizeof(tHeapEntry));
+	nil = calloc(1, sizeof(tHeapNode));
 	nil->pLink[0] = nil->pLink[1] = nil;
 	pHeapTreeRoot = nil;
 	HeapTree_Init();

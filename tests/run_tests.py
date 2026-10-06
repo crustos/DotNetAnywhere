@@ -4,16 +4,20 @@ import glob, os, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build")
-# The runtime under test. `--64` tests build/dna, `--32` tests build/dna32, DNA_BIN=path names one; with none of
+# The runtime under test. `--64` tests build/dna, `--32` tests build/dna32, `--wasm` tests build/dna.wasm (through the build/dna-wasm launcher that
+# `build.py --wasm` writes; it needs node), DNA_BIN=path names one; with none of
 # those it is build/dna if that exists, else build/dna32. The tests compare with Mono / .NET, so they do not depend
 # on the pointer size.
-for _flag, _name in (("--64", "dna"), ("--32", "dna32")):
+for _flag, _name in (("--64", "dna"), ("--32", "dna32"), ("--wasm", "dna-wasm")):
     if _flag in sys.argv:
         sys.argv.remove(_flag)
         os.environ["DNA_BIN"] = os.path.join(BUILD, _name)
 if "DNA_BIN" not in os.environ:
     os.environ["DNA_BIN"] = os.path.join(BUILD, "dna" if os.path.exists(os.path.join(BUILD, "dna")) else "dna32")
 DNA_BIN = os.environ["DNA_BIN"]
+if os.path.basename(DNA_BIN) == "dna-wasm":
+    # test the wasm JIT hard: compile every method it can, however small (the default leaves out the ones not worth the call)
+    os.environ.setdefault("DNA_WASM_JIT_MIN", "0")
 
 # Every external run gets a timeout, so one hanging program (a runtime that spins) fails its own check
 # instead of stalling the whole suite. DNA_TEST_TIMEOUT overrides the 60 seconds.
