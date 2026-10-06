@@ -42,6 +42,9 @@ tAsyncCall* System_Array_Resize(PTR pThis_, PTR pParams, PTR pReturnValue);
 tAsyncCall* System_Array_Reverse(PTR pThis_, PTR pParams, PTR pReturnValue);
 
 HEAP_PTR SystemArray_NewVector(tMD_TypeDef *pArrayTypeDef, U32 length);
+// The longest array of this type that can be made: a length above it (and a negative one, as an unsigned number) is what `newarr` must refuse,
+// because the size in bytes would not fit, and the allocation would be too small for the array it is used as.
+U32 SystemArray_MaxLength(tMD_TypeDef *pArrayTypeDef);
 #define SystemArray_GetLength(pArray) (*(U32*)(pArray))
 void SystemArray_StoreElement(HEAP_PTR pThis_, U32 index, PTR value);
 void SystemArray_LoadElement(HEAP_PTR pThis_, U32 index, PTR value);

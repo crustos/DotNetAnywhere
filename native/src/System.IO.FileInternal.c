@@ -228,6 +228,9 @@ tAsyncCall* System_IO_FileInternal_GetFileSystemEntries(PTR pThis_, PTR pParams,
 		} while (FindNextFile(hFind, &find) != 0);
 		FindClose(hFind);
 	}
+#elif defined(__wasm__)
+	// wasi-libc has no glob(): a directory listing is empty
+	(void)pathPattern; (void)pathPatternLen; (void)mask; (void)attrs; (void)pError;
 #else
 	unsigned char path8[256];
 	glob_t gl;

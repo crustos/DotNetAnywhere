@@ -27,7 +27,9 @@
 #include "System.Array.h"
 #include "System.String.h"
 
-#ifndef _WIN32
+#if defined(__wasm__)
+#include "WasmNet.h"
+#elif !defined(_WIN32)
 #include <netdb.h>
 #endif
 
@@ -47,6 +49,12 @@ tAsyncCall* System_Net_Dns_Internal_GetHostEnt(PTR pThis_, PTR pParams, PTR pRet
 	}
 	nameU8[i] = 0;
 	pHostEnt = gethostbyname(nameU8);
+	if (pHostEnt == NULL) {
+		// The lookup failed: no name and no addresses (this used to dereference NULL)
+		*pHostName = SystemString_FromCharPtrASCII("");
+		*(HEAP_PTR*)pReturnValue = SystemArray_NewVector(types[TYPE_SYSTEM_ARRAY_INT32], 0);
+		return NULL;
+	}
 	*pHostName = SystemString_FromCharPtrASCII(pHostEnt->h_name);
 
 	// Count how many entries there are

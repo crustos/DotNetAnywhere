@@ -28,6 +28,10 @@
 #ifdef _WIN32
 #define ERRNO WSAGetLastError()
 #define WOULDBLOCK WSAEWOULDBLOCK
+#elif defined(__wasm__)
+#include "WasmNet.h"
+#define ERRNO errno
+#define WOULDBLOCK EWOULDBLOCK
 #else
 #include <sys/types.h>
 #include <sys/socket.h>

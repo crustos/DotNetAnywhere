@@ -241,6 +241,12 @@ tAsyncCall* System_Array_Reverse(PTR pThis_, PTR pParams, PTR pReturnValue) {
 	return NULL;
 }
 
+U32 SystemArray_MaxLength(tMD_TypeDef *pArrayTypeDef) {
+	U32 elemSize = pArrayTypeDef->pArrayElementType->arrayElementSize;
+	if (elemSize == 0) elemSize = 1;
+	return (0x7fffffffU - (U32)sizeof(tSystemArray)) / elemSize;
+}
+
 HEAP_PTR SystemArray_NewVector(tMD_TypeDef *pArrayTypeDef, U32 length) {
 	U32 heapSize;
 	tSystemArray *pArray;
