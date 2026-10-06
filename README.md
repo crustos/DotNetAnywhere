@@ -69,10 +69,7 @@ matches on both. Tested on Linux x86-64 with gcc only.
 ### Not done
 
 * `stackalloc` (`localloc`) and `__arglist` are not implemented.
-* The WebAssembly build (`python3 build.py --wasm`) is untested beyond compiling: all of the sources compile under
-  Emscripten 3.1.6, but the only `emcc` available while this was written cannot link even a hello-world, so the
-  link and the result have never been run. Other operating systems and architectures are untested, and P/Invoke
-  has not been exercised on a 64-bit build.
+* Other operating systems and architectures are untested, and P/Invoke has not been exercised on a 64-bit Windows build.
 * 64-bit enums are handled as 32-bit values; `Enum.Parse` and `List<T>.Sort` do not exist.
 
 [NATIVE.md](NATIVE.md) has the details: what was added, every runtime bug fixed, how the 64-bit port was done, where
@@ -96,7 +93,13 @@ DNA deliberately differs from the reference runtimes, and the known gaps.
 
 ## WebAssembly
 
-Paused. The Emscripten build (`native/build.sh`, `build.cmd`, CMake, and for a while `build.py --wasm`) has been
-removed. The plan is to target WebAssembly directly with `clang --target=wasm32`, and later to adapt the JIT to emit
-wasm on the fly. The 32-bit build (`--m32`) is the closest thing to a wasm32 target until then; nothing here has been
-built or run as WebAssembly with this fork's changes.
+`python3 build.py --wasm` builds with `clang --target=wasm32-wasi` (needs clang, lld, wasi-libc, llvm-ar) into `build/dna.wasm` plus a
+`build/dna-wasm` launcher that runs it under node (`tools/run_wasm.mjs`, WASI). The same host also provides the wasm JIT import
+`dna.emit_wasm`, so hot methods are compiled to wasm at run time (the module's indirect function table is exported and growable).
+`python3 tests/run_tests.py --wasm` runs the suite on it.
+
+* `--wasm --lib-only` (optionally with `--ffi manifest.json`) builds `build/libdna[_ffi]_wasm.a` to link into another wasm program; CC#'s
+  `--wasm` does this. The x86-64 stencils are not used for wasm.
+* `tools/run_wasm.mjs --app prog.wasm args...` runs a program that embeds DNA (argv[0] is the program's name, paths are not rewritten,
+  `CCS_MANAGED_DLL` is set to `prog.managed.dll` when that exists, and a trap exits like abort(): SIGABRT).
+* wasi-libc is musl, so a few `Math.*` results differ in the last bit from glibc/.NET; `MathBits` does not assert them for wasm.
