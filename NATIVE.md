@@ -28,9 +28,7 @@ with `corlib.dll` beside the exe. `--debug` gives `-O0 -g`.
 Both word sizes pass the same suite, and the tests do not depend on the pointer size: they compare with Mono (or
 .NET), not with stored output. Tested on Linux x86-64 with gcc only.
 
-**WebAssembly is paused.** The Emscripten build is gone (`build.py --wasm` existed briefly and was removed too). The
-intended route is `clang --target=wasm32`, and later a JIT that emits wasm. `js-interop.js` and the JSInterop /
-Debugger entry points are left in the tree for that, but nothing builds or tests them now.
+**WebAssembly** is built with `python3 build.py --wasm` (`clang --target=wasm32-wasi`, run under node with `tools/run_wasm.mjs`); see the WebAssembly section of README.md. `js-interop.js` and the JSInterop / Debugger entry points are left in the tree but are not built or tested.
 
 ## What was added
 
