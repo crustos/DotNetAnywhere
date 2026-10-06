@@ -175,8 +175,8 @@ def main():
         return rc
 
     if args.wasm:
-        if args.m32 or args.ffi or args.lib or args.lib_only:
-            print("error: --wasm cannot be combined with --m32, --ffi, --lib or --lib-only", file=sys.stderr)
+        if args.m32:
+            print("error: --wasm cannot be combined with --m32", file=sys.stderr)
             return 1
         if args.cc == "gcc":
             args.cc = "clang"        # gcc cannot target wasm
@@ -197,8 +197,8 @@ def main():
                       "-isystem", os.path.join(args.wasi_sysroot, "include", "wasm32-wasi")]
     if args.ffi:
         # its own objects and generated files: the generated C changes what the runtime is, and the normal build must stay as it is
-        OBJ = os.path.join(BUILD, "obj_ffi32" if args.m32 else "obj_ffi")
-        GEN = os.path.join(BUILD, "gen_ffi")
+        OBJ = os.path.join(BUILD, "obj_ffi32" if args.m32 else "obj_ffi_wasm" if args.wasm else "obj_ffi")
+        GEN = os.path.join(BUILD, "gen_ffi_wasm" if args.wasm else "gen_ffi")
         os.makedirs(GEN, exist_ok=True)
         sys.path.insert(0, os.path.join(ROOT, "tools"))
         import gen_ffi
@@ -207,7 +207,7 @@ def main():
         print("ffi: %d function(s) from %s" % (len(ffi_funcs), os.path.relpath(args.ffi, ROOT)))
         # the stencils that call them go in a Stencils.gen.h of their own, which the include path puts before the normal one
         sigs = json.load(open(os.path.join(GEN, "ffi_sigs.json")))
-        text = gen_stencils.generate(os.path.join(GEN, "ffi_stencils.gen.c"), sigs["stencil_names"]) if not args.m32 else None
+        text = gen_stencils.generate(os.path.join(GEN, "ffi_stencils.gen.c"), sigs["stencil_names"]) if not (args.m32 or args.wasm) else None
         hdr = os.path.join(GEN, "Stencils.gen.h")
         if text is not None and (not os.path.exists(hdr) or open(hdr).read() != text):
             open(hdr, "w").write(text)
@@ -291,10 +291,11 @@ def main():
 
     objs = [os.path.join(OBJ, os.path.basename(u)[:-2] + ".o") for u in units]
     if args.lib or args.lib_only:
-        lib = os.path.join(BUILD, "libdna" + ("_ffi" if args.ffi else "") + ("32" if args.m32 else "") + ".a")
+        lib = os.path.join(BUILD, "libdna" + ("_ffi" if args.ffi else "") + ("32" if args.m32 else "") + ("_wasm" if args.wasm else "") + ".a")
         if os.path.exists(lib):
             os.remove(lib)
-        r = subprocess.run(["ar", "rcs", lib] + [o for o in objs if os.path.basename(o) != "dna.o"
+        ar = (shutil.which("llvm-ar") or "llvm-ar") if args.wasm else "ar"
+        r = subprocess.run([ar, "rcs", lib] + [o for o in objs if os.path.basename(o) != "dna.o"
                                      # (the weak empty table of FFIDefault.c would satisfy FFI.c, so an archive would never pull in the real one)
                                      and not (args.ffi and os.path.basename(o) == "FFIDefault.o")], capture_output=True, text=True)
         if r.returncode != 0:
@@ -303,6 +304,9 @@ def main():
             return 1
         print("built", os.path.relpath(lib, ROOT))
     if args.lib_only:
+        if args.wasm:
+            print("(for a program built with --wasm: link it with %s and these flags: -Wl,-z,stack-size=1048576 -Wl,--export-table -Wl,--growable-table -fuse-ld=lld)"
+                  % os.path.relpath(lib, ROOT))
         if args.corlib or (not args.no_corlib and shutil.which("mcs")):
             return build_corlib()
         return 0
