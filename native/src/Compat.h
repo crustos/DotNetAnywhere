@@ -65,6 +65,20 @@
 #define LIB_SUFFIX "dll"
 #define STDCALL __stdcall
 
+#elif defined(__wasm__)
+
+// WebAssembly (clang --target=wasm32-wasi): the subset of POSIX that wasi-libc has. No termios, ioctl, dlopen,
+// glob or sockets; the files that need those test __wasm__ themselves and stub them out.
+#include <stdlib.h>
+#include <strings.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#define O_BINARY 0
+#define LIB_PREFIX "./"
+#define LIB_SUFFIX "wasm"
+#define STDCALL
+
 #else // _WIN32
 
 #include <stdlib.h>

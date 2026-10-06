@@ -307,6 +307,13 @@ void Thread_GetHeapRoots(tHeapRoots *pHeapRoots) {
 	while (pThread != NULL) {
 		tMethodState *pMethodState;
 
+		// Heap objects that the thread holds in its own structure, outside any frame: the exception that is in flight while the stack unwinds (a
+		// finally block can run, and allocate, and so cause a collection, before a handler takes it onto its evaluation stack), and what the thread
+		// was started with. (The first was not a root: it survived only because the memory of a collected object used to stay readable.)
+		Heap_SetRoots(pHeapRoots, &pThread->pCurrentExceptionObject, sizeof(HEAP_PTR));
+		Heap_SetRoots(pHeapRoots, &pThread->param, sizeof(HEAP_PTR));
+		Heap_SetRoots(pHeapRoots, &pThread->startDelegate, sizeof(PTR));
+
 		pMethodState = pThread->pCurrentMethodState;
 		while (pMethodState != NULL) {
 			// Put the evaluation stack on the roots

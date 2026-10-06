@@ -64,13 +64,15 @@ static tLoadedLib* GetLib(STRING name) {
 	sprintf(strchr(libName, 0), ".%s", LIB_SUFFIX);
 #if _WIN32
 	pNativeLib = LoadLibraryA(libName);
+#elif defined(__wasm__)
+	pNativeLib = NULL;      // no dlopen: a wasm module has no shared libraries to load (C functions are linked in, see --ffi)
 #else
 	pNativeLib = dlopen(libName, RTLD_LAZY); //DL_LAZY);
 #endif
 	if (pNativeLib == NULL) {
 		// Failed to load library
 		printf("Failed to load library: %s\n", libName);
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasm__)
 		{
 			char *pError;
 			pError = dlerror();

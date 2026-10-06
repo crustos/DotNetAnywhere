@@ -92,9 +92,9 @@ static tInternalCall internalCalls[] = {
 	{NULL, NULL,    "Internal_SetValue", System_Array_Internal_SetValue, TYPE_SYSTEM_BOOLEAN, 2, {TYPE_SYSTEM_OBJECT, TYPE_SYSTEM_INT32}},
 	{NULL, NULL,    "Clear", System_Array_Clear, TYPE_SYSTEM_VOID, 3, {TYPE_SYSTEM_ARRAY_NO_TYPE, TYPE_SYSTEM_INT32, TYPE_SYSTEM_INT32}},
 	{NULL, NULL,    "Internal_Copy", System_Array_Internal_Copy, TYPE_SYSTEM_BOOLEAN, 5, {TYPE_SYSTEM_ARRAY_NO_TYPE, TYPE_SYSTEM_INT32, TYPE_SYSTEM_ARRAY_NO_TYPE, TYPE_SYSTEM_INT32, TYPE_SYSTEM_INT32}},
-	{NULL, NULL,    "Resize", System_Array_Resize, TYPE_SYSTEM_VOID, 2, {TYPE_SYSTEM_INTPTR, TYPE_SYSTEM_INT32}},
+	{NULL, NULL,    "ResizeInternal", System_Array_Resize, TYPE_SYSTEM_VOID, 2, {TYPE_SYSTEM_INTPTR, TYPE_SYSTEM_INT32}},
 	{NULL, NULL,    "Reverse", System_Array_Reverse, TYPE_SYSTEM_VOID, 3, {TYPE_SYSTEM_ARRAY_NO_TYPE, TYPE_SYSTEM_INT32, TYPE_SYSTEM_INT32}},
-	{NULL, NULL,    "CreateInstance", System_Array_CreateInstance, TYPE_SYSTEM_ARRAY_NO_TYPE, 2, {TYPE_SYSTEM_TYPE, TYPE_SYSTEM_INT32}},
+	{NULL, NULL,    "CreateInstanceInternal", System_Array_CreateInstance, TYPE_SYSTEM_ARRAY_NO_TYPE, 2, {TYPE_SYSTEM_TYPE, TYPE_SYSTEM_INT32}},
 
 	{NULL, "Console", "Write", System_Console_Write, TYPE_SYSTEM_VOID, 1, {TYPE_SYSTEM_STRING}},
 	{NULL, NULL     , "Internal_ReadKey", System_Console_Internal_ReadKey, TYPE_SYSTEM_INT32, 0},
