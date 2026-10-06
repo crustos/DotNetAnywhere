@@ -1881,9 +1881,9 @@ JIT_SWITCH_end:
 JIT_BRANCH_FALSE_PTR_start:
 	OPCODE_USE(JIT_BRANCH_FALSE_PTR);
 	{
-		PTR value = POP_PTR();
+		U64 value = POP_U64();
 		U32 ofs = GET_OP();
-		if (value == NULL) {
+		if (value == 0) {
 			pCurOp = pOps + ofs;
 		}
 	}
@@ -1893,9 +1893,9 @@ JIT_BRANCH_FALSE_PTR_end:
 JIT_BRANCH_TRUE_PTR_start:
 	OPCODE_USE(JIT_BRANCH_TRUE_PTR);
 	{
-		PTR value = POP_PTR();
+		U64 value = POP_U64();
 		U32 ofs = GET_OP();
-		if (value != NULL) {
+		if (value != 0) {
 			pCurOp = pOps + ofs;
 		}
 	}

@@ -2201,8 +2201,8 @@ cilBrFalseTrue:
 				// Put a temporary CIL offset value into the JITted code. This will be updated later
 				u32Value = cilOfs + (I32)u32Value;
 				MayCopyTypeStack();
-				if (sizeof(void*) > 4 && pStackType->stackSize == 8) {
-					// an 8-byte operand (a reference on a 64-bit target): test all of it, and pop all of it
+				if (pStackType->stackSize == 8) {
+					// an 8-byte operand (an int64, or a reference on a 64-bit target): test all of it, and pop all of it
 					PushOp(u32Value2 - JIT_BRANCH_FALSE + JIT_BRANCH_FALSE_PTR);
 				} else {
 					PushOp(u32Value2);
