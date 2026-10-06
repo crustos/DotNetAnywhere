@@ -3,17 +3,16 @@
 #if !defined(__HEAPENTRY_H)
 #define __HEAPENTRY_H
 
+#include <stddef.h>
+
 struct tMD_TypeDef_;
 struct tSync_;
 
+// A heap object is its memory, with this just before it (GET_HEAPENTRY in Heap.c): 12 bytes on a 32-bit target, 24 on a 64-bit one.
 typedef struct tHeapEntry_ tHeapEntry;
-
-// The memory is kept track of using a balanced binary search tree (ordered by
-// memory address). See HeapTree.h.
 struct tHeapEntry_ {
-	// Left/right links in the heap binary tree
-	tHeapEntry *pLink[2];
-	// The 'level' of this node. Leaf nodes have lowest level
+	// (for a large object: the 'level' of its node in the tree; unused for a small one. It is here so that the fields that follow are at the
+	// same distance from the object's memory whichever kind of object it is)
 	unsigned char level;
 	// Used to mark that this node is still in use.
 	// If this is set to 0xff, then this heap entry is undeletable.
@@ -27,7 +26,7 @@ struct tHeapEntry_ {
 	// unused
 	unsigned char padding;
 
-	// The type in this heap entry
+	// The type in this heap entry. NULL in a slot of a small-object chunk that is free.
 	struct tMD_TypeDef_ *pTypeDef;
 
 	// Used for locking sync, and tracking WeakReference that point to this object
@@ -36,5 +35,23 @@ struct tHeapEntry_ {
 	// The user memory
 	unsigned char memory[0];
 };
+
+// A large object (see Heap.c) is found through an address-ordered balanced tree (HeapTree.c), whose links are in a node that comes before the
+// entry: this is the entry's own layout with the two links in front, so the entry is at &node->level.
+typedef struct tHeapNode_ tHeapNode;
+struct tHeapNode_ {
+	// Left/right links in the heap binary tree
+	tHeapNode *pLink[2];
+	// The 'level' of this node. Leaf nodes have lowest level
+	unsigned char level;
+	unsigned char marked;
+	unsigned char needToFinalize;
+	unsigned char padding;
+	struct tMD_TypeDef_ *pTypeDef;
+	struct tSync_ *pSync;
+	unsigned char memory[0];
+};
+#define NODE_ENTRY(node) ((tHeapEntry*)&(node)->level)
+#define ENTRY_NODE(entry) ((tHeapNode*)((char*)(entry) - offsetof(tHeapNode, level)))
 
 #endif

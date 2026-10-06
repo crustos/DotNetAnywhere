@@ -1,7 +1,7 @@
 // The heap-tracking tree: an Andersson (AA) tree over heap entries, ordered by memory address.
 // See http://www.eternallyconfuzzled.com/tuts/datastructures/jsw_tut_andersson.aspx
 //
-// The entries are the heap objects' own headers (tHeapEntry), so the tree allocates nothing: a node is linked in
+// The entries are the heap objects' own headers (tHeapNode), so the tree allocates nothing: a node is linked in
 // when the object is allocated (HeapTree_Insert) and out when it is freed (HeapTree_Remove). A shared sentinel,
 // HeapTree_NilNode, ends every leaf, and has level 0 and links to itself, which is what lets skew and split look
 // two levels down without testing for the end of the tree.
@@ -16,22 +16,22 @@
 // (a tree of this many levels would be 2^40 objects)
 #define MAX_TREE_DEPTH 40
 
-tHeapEntry *HeapTree_NilNode;
-tHeapEntry *HeapTree_RootNode;
+tHeapNode *HeapTree_NilNode;
+tHeapNode *HeapTree_RootNode;
 
 #define nil HeapTree_NilNode
 
 void HeapTree_Init(void) {
-	nil = (tHeapEntry*)calloc(1, sizeof(tHeapEntry));
+	nil = (tHeapNode*)calloc(1, sizeof(tHeapNode));
 	nil->pLink[0] = nil;
 	nil->pLink[1] = nil;
 	HeapTree_RootNode = nil;
 }
 
 // Left rotation that removes a horizontal link going left: a node and its left child on the same level
-static tHeapEntry* Skew(tHeapEntry *pRoot) {
+static tHeapNode* Skew(tHeapNode *pRoot) {
 	if (pRoot->pLink[0]->level == pRoot->level && pRoot->level != 0) {
-		tHeapEntry *pSave = pRoot->pLink[0];
+		tHeapNode *pSave = pRoot->pLink[0];
 		pRoot->pLink[0] = pSave->pLink[1];
 		pSave->pLink[1] = pRoot;
 		pRoot = pSave;
@@ -41,9 +41,9 @@ static tHeapEntry* Skew(tHeapEntry *pRoot) {
 
 // Right rotation that removes two horizontal links going right in a row: a node, its right child and that
 // child's right child, all on the same level
-static tHeapEntry* Split(tHeapEntry *pRoot) {
+static tHeapNode* Split(tHeapNode *pRoot) {
 	if (pRoot->pLink[1]->pLink[1]->level == pRoot->level && pRoot->level != 0) {
-		tHeapEntry *pSave = pRoot->pLink[1];
+		tHeapNode *pSave = pRoot->pLink[1];
 		pRoot->pLink[1] = pSave->pLink[0];
 		pSave->pLink[0] = pRoot;
 		pRoot = pSave;
@@ -52,7 +52,7 @@ static tHeapEntry* Split(tHeapEntry *pRoot) {
 	return pRoot;
 }
 
-void HeapTree_Insert(tHeapEntry *pEntry) {
+void HeapTree_Insert(tHeapNode *pEntry) {
 	pEntry->level = 1;
 	pEntry->pLink[0] = nil;
 	pEntry->pLink[1] = nil;
@@ -61,8 +61,8 @@ void HeapTree_Insert(tHeapEntry *pEntry) {
 	if (HeapTree_RootNode == nil) {
 		HeapTree_RootNode = pEntry;
 	} else {
-		tHeapEntry *pNode = HeapTree_RootNode;
-		tHeapEntry *pUp[MAX_TREE_DEPTH];
+		tHeapNode *pNode = HeapTree_RootNode;
+		tHeapNode *pUp[MAX_TREE_DEPTH];
 		int top = 0, dir;
 
 		// Find the leaf position to insert at, remembering the path. This first step does not balance
@@ -93,15 +93,15 @@ void HeapTree_Insert(tHeapEntry *pEntry) {
 }
 
 // Remove pDelete from the subtree at pRoot (recursively, so no deeper than the tree is), returning the new root of it
-static tHeapEntry* RemoveAt(tHeapEntry *pRoot, tHeapEntry *pDelete) {
+static tHeapNode* RemoveAt(tHeapNode *pRoot, tHeapNode *pDelete) {
 	if (pRoot != nil) {
 		if (pRoot == pDelete) {
 			if (pRoot->pLink[0] != nil && pRoot->pLink[1] != nil) {
 				// Two children: the node is replaced by its heir, the greatest node of its left subtree, and removed from where
 				// that was, which has at most one child
-				tHeapEntry *pHeir = pRoot->pLink[0];
-				tHeapEntry **ppHeirLink = &pHeir->pLink[0];
-				tHeapEntry *pL0;
+				tHeapNode *pHeir = pRoot->pLink[0];
+				tHeapNode **ppHeirLink = &pHeir->pLink[0];
+				tHeapNode *pL0;
 				unsigned char l;
 				while (pHeir->pLink[1] != nil) {
 					ppHeirLink = &pHeir->pLink[1];
@@ -146,6 +146,6 @@ static tHeapEntry* RemoveAt(tHeapEntry *pRoot, tHeapEntry *pDelete) {
 	return pRoot;
 }
 
-void HeapTree_Remove(tHeapEntry *pEntry) {
+void HeapTree_Remove(tHeapNode *pEntry) {
 	HeapTree_RootNode = RemoveAt(HeapTree_RootNode, pEntry);
 }

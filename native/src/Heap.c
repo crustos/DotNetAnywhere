@@ -69,6 +69,8 @@ static void RemoveWeakRefTarget(tHeapEntry *pHeapEntry, U32 removeLongRefs);
 static U32 trackHeapSize;
 // The max heap size allowed before a garbage collection is triggered
 static U32 heapSizeMax;
+// Greater than 0 while compiled code runs: no collection (see Heap_SuspendGC)
+static U32 gcSuspended;
 // The number of allocated memory nodes
 static U32 numNodes = 0;
 // The number of collections done
@@ -94,10 +96,152 @@ U64 gcTotalTime = 0;
 #define MAX_HEAP_EXCESS (64U * 1024 * 1024)
 #endif
 
+// ================= the allocator =================
+// Small objects (the header and memory together up to MAX_SMALL_SLOT bytes: nearly all of them) live in 64 KB chunks that each hold slots of one
+// size class. An object is made by taking a slot off its class's free list, or by carving the next one out of the class's current chunk
+// (nothing to search, nothing to balance); a pointer into an object finds its slot by one hash lookup of the chunk it is in, and a division.
+// A chunk with no live object is given back to a pool, from which any class takes chunks. Large objects are malloc'ed one by one and found through
+// the address-ordered tree (HeapTree.c), as every object used to be. DNA_HEAP_MALLOC=1 makes every object large, which is that old behaviour
+// (for comparison and for testing the large path).
+#define CHUNK_SHIFT 16
+#define CHUNK_SIZE ((size_t)1 << CHUNK_SHIFT)
+#define MAX_SMALL_SLOT 4096
+#define MAX_CLASSES 40
+
+typedef struct tChunk_ tChunk;
+struct tChunk_ {
+	char *base;                       // CHUNK_SIZE bytes, aligned to CHUNK_SIZE
+	U32 slotSize, nSlots;
+	U32 carved;                       // how many slots, from the start, have been handed out at least once
+	tChunk *next;                     // the next chunk of the same size class
+	tChunk *nextPooled;
+};
+typedef struct {
+	U32 slotSize;
+	tChunk *first, *last, *cur;       // the chunks of this class; the one that has uncarved slots left
+	tHeapEntry *freeHead, *freeTail;  // free slots, linked through the first word of their memory
+} tSizeClass;
+
+static tSizeClass classes[MAX_CLASSES];
+static U32 numClasses;
+static U8 classOf[MAX_SMALL_SLOT / 8 + 1];
+static tChunk *chunkPool;
+static tChunk **chunkTable;           // chunks by address >> CHUNK_SHIFT: open addressing
+static U32 chunkTableSize, chunkCount;
+static int allLarge;
+
+static void InitClasses(void) {
+	static const U32 sizes[] = { 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512, 640, 768, 896, 1024,
+		1280, 1536, 1792, 2048, 2560, 3072, 3584, 4096 };
+	U32 minSlot = ((U32)sizeof(tHeapEntry) + (U32)sizeof(void*) + 7) & ~7u, i, t, c = 0;
+	numClasses = 0;
+	for (i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+		if (sizes[i] < minSlot) continue;
+		classes[numClasses].slotSize = sizes[i];
+		numClasses++;
+	}
+	for (t = 0; t <= MAX_SMALL_SLOT / 8; t++) {
+		while (classes[c].slotSize < t * 8) c++;
+		classOf[t] = (U8)c;
+	}
+}
+
+static U32 ChunkHash(uintptr_t key) { return (U32)((key ^ (key >> 17)) * 0x9E3779B1u); }
+static void ChunkTableInsert(tChunk *pChunk) {
+	U32 i;
+	if (chunkCount * 2 >= chunkTableSize) {                       // (grow, and put the chunks in again)
+		U32 oldSize = chunkTableSize, k;
+		tChunk **old = chunkTable;
+		chunkTableSize = oldSize ? oldSize * 2 : 256;
+		chunkTable = (tChunk**)calloc(chunkTableSize, sizeof(tChunk*));
+		for (k = 0; k < oldSize; k++) {
+			if (old[k] != NULL) {
+				i = ChunkHash((uintptr_t)old[k]->base >> CHUNK_SHIFT) & (chunkTableSize - 1);
+				while (chunkTable[i] != NULL) i = (i + 1) & (chunkTableSize - 1);
+				chunkTable[i] = old[k];
+			}
+		}
+		free(old);
+	}
+	i = ChunkHash((uintptr_t)pChunk->base >> CHUNK_SHIFT) & (chunkTableSize - 1);
+	while (chunkTable[i] != NULL) i = (i + 1) & (chunkTableSize - 1);
+	chunkTable[i] = pChunk;
+	chunkCount++;
+}
+static tChunk* ChunkFind(const void *p) {
+	uintptr_t key = (uintptr_t)p >> CHUNK_SHIFT;
+	U32 i;
+	if (chunkTableSize == 0) return NULL;
+	i = ChunkHash(key) & (chunkTableSize - 1);
+	while (chunkTable[i] != NULL) {
+		if (((uintptr_t)chunkTable[i]->base >> CHUNK_SHIFT) == key) return chunkTable[i];
+		i = (i + 1) & (chunkTableSize - 1);
+	}
+	return NULL;
+}
+
+// A chunk for a size class, from the pool or from new memory (NULL if there is none).
+static tChunk* AcquireChunk(tSizeClass *k) {
+	tChunk *c = chunkPool;
+	if (c != NULL) {
+		chunkPool = c->nextPooled;
+	} else {
+		char *base;
+#ifdef _WIN32
+		base = (char*)_aligned_malloc(CHUNK_SIZE, CHUNK_SIZE);
+#else
+		base = (char*)aligned_alloc(CHUNK_SIZE, CHUNK_SIZE);
+#endif
+		if (base == NULL) return NULL;
+		c = (tChunk*)calloc(1, sizeof(tChunk));
+		c->base = base;
+		ChunkTableInsert(c);
+		if (heapLow == NULL || base < heapLow) heapLow = base;
+		if (base + CHUNK_SIZE > heapHigh) heapHigh = base + CHUNK_SIZE;
+	}
+	c->slotSize = k->slotSize; c->nSlots = (U32)(CHUNK_SIZE / k->slotSize); c->carved = 0; c->next = NULL; c->nextPooled = NULL;
+	if (k->last != NULL) k->last->next = c; else k->first = c;
+	k->last = c;
+	return c;
+}
+
+// A slot for an object of this many bytes in all (header included), or NULL if memory is out.
+static tHeapEntry* AllocSmall(U32 total) {
+	tSizeClass *k = &classes[classOf[(total + 7) >> 3]];
+	tHeapEntry *e;
+	if (k->freeHead != NULL) {
+		e = k->freeHead;
+		k->freeHead = *(tHeapEntry**)e->memory;
+		if (k->freeHead == NULL) k->freeTail = NULL;
+		return e;
+	}
+	if (k->cur == NULL || k->cur->carved == k->cur->nSlots) {
+		k->cur = AcquireChunk(k);
+		if (k->cur == NULL) return NULL;
+	}
+	e = (tHeapEntry*)(k->cur->base + (size_t)k->cur->carved * k->slotSize);
+	k->cur->carved++;
+	return e;
+}
+
+// The small object whose slot contains the address p, or NULL (not in a chunk, in a slot that was never used, or one that is free).
+static tHeapEntry* FindSmall(const void *p) {
+	tChunk *c = ChunkFind(p);
+	U32 idx;
+	tHeapEntry *e;
+	if (c == NULL) return NULL;
+	idx = (U32)((size_t)((const char*)p - c->base) / c->slotSize);
+	if (idx >= c->carved) return NULL;
+	e = (tHeapEntry*)(c->base + (size_t)idx * c->slotSize);
+	return e->pTypeDef == NULL ? NULL : e;
+}
+
 void Heap_Init() {
 	// Initialise vars
 	trackHeapSize = 0;
 	heapSizeMax = MIN_HEAP_SIZE;
+	allLarge = getenv("DNA_HEAP_MALLOC") != NULL;
+	InitClasses();
 	// Create the (empty) tracking tree and its nil sentinel
 	HeapTree_Init();
 }
@@ -120,14 +264,19 @@ static U32 GetSize(tHeapEntry *pHeapEntry) {
 }
 
 // The type of the heap object whose memory contains `addr`, or NULL if addr is not inside
-// any heap object. Read-only; the same address search the collector uses to find a node.
+// any heap object. Read-only; the same address search the collector uses to find an object.
 // Used to tell a pointer into a packed array element from a pointer to a 4-byte field slot.
 tMD_TypeDef* Heap_GetObjectTypeContaining(void *addr) {
-	tHeapEntry *pNode = pHeapTreeRoot;
+	tHeapEntry *pEntry = FindSmall(addr);
+	tHeapNode *pNode;
+	if (pEntry != NULL) {
+		return (char*)addr < (char*)pEntry->memory + GetSize(pEntry) ? pEntry->pTypeDef : NULL;
+	}
+	pNode = pHeapTreeRoot;
 	while (pNode != nil) {
 		if (addr < (void*)pNode) {
 			pNode = pNode->pLink[0];
-		} else if ((char*)addr >= ((char*)pNode) + GetSize(pNode) + sizeof(tHeapEntry)) {
+		} else if ((char*)addr >= ((char*)pNode) + GetSize(NODE_ENTRY(pNode)) + sizeof(tHeapNode)) {
 			pNode = pNode->pLink[1];
 		} else {
 			return pNode->pTypeDef;
@@ -136,14 +285,50 @@ tMD_TypeDef* Heap_GetObjectTypeContaining(void *addr) {
 	return NULL;
 }
 
+// What the sweep makes of an object that the mark phase did not reach: 0 in use (it is unmarked, ready for the next collection),
+// 1 not collected yet (it has a finalizer that must run first), 2 dead.
+static int Classify(tHeapEntry *e) {
+	if (e->marked) {
+		if (e->marked != 0xff) {
+			// Still in use (but not marked undeletable), so unmark
+			e->marked = 0;
+		}
+		return 0;
+	}
+	// Not in use any more. If it needs Finalizing, then don't garbage collect, and put in Finalization queue.
+	if (e->needToFinalize) {
+		if (e->needToFinalize == 1) {
+			AddFinalizer((HEAP_PTR)e->memory);
+			// Mark it has having been placed in the finalization queue.
+			// When it has been finalized, then this will be set to 0
+			e->needToFinalize = 2;
+			// If this object is being targetted by weak-ref(s), handle it
+			if (e->pSync != NULL) {
+				RemoveWeakRefTarget(e, 0);
+				free(e->pSync);
+				e->pSync = NULL;           // (it was left pointing at what was freed, and freed again when the object was finally collected)
+			}
+		}
+		return 1;
+	}
+	// If this object is being targetted by weak-ref(s), handle it
+	if (e->pSync != NULL) {
+		RemoveWeakRefTarget(e, 1);
+		free(e->pSync);
+		e->pSync = NULL;
+	}
+	return 2;
+}
+
 static void GarbageCollect() {
 	tHeapRoots heapRoots;
-	tHeapEntry *pNode;
-	tHeapEntry *pUp[MAX_TREE_DEPTH * 2];
+	tHeapNode *pNode;
+	tHeapNode *pUp[MAX_TREE_DEPTH * 2];
 	I32 top;
-	tHeapEntry *pToDelete = NULL;
+	tHeapNode *pToDelete = NULL;
 	U32 orgHeapSize = trackHeapSize;
 	U32 orgNumNodes = numNodes;
+	U32 c;
 #ifdef DIAG_GC
 	U64 startTime;
 #endif
@@ -180,19 +365,19 @@ static void GarbageCollect() {
 		// Iterate through all pointers in it
 		for (i=0; i<rootsEntryNumPointers; i++) {
 			void *pMemRef;
+			tHeapEntry *pEntry;
 			memcpy(&pMemRef, pRootsEntryMem + ((size_t)i << 2), sizeof(void*));   // 4-byte steps, maybe unaligned
 			// Quick escape for known non-memory (nothing, or outside the addresses of every heap entry: most integers)
 			if (pMemRef == NULL || (char*)pMemRef < heapLow || (char*)pMemRef > heapHigh) {
 				continue;
 			}
-			// Find this piece of heap memory in the tracking tree.
-			// Note that the 2nd memory address comparison MUST be >, not >= as might be expected,
-			// to allow for a zero-sized memory to be detected (and not garbage collected) properly.
-			// E.g. The object class has zero memory.
-			// The entry containing pMemRef is the last one that starts at or before it: descend comparing start addresses only, and
-			// work out the size of that one entry, not of every one on the way down (that was most of the cost of a collection).
-			{
-				tHeapEntry *pCandidate = NULL;
+			// Find the object that this points into. For a small one: the slot of the byte before it (so that a pointer to just past the end of
+			// an object, as an iterator may hold, still holds it up, and the pointer to its memory is in its own slot, after its header).
+			// For a large one: the last node that starts at or before it, and the second comparison is <=, not <, to allow for a pointer to the
+			// end, and for a zero-sized object (the object class has no memory) to be detected (and not garbage collected) properly.
+			pEntry = FindSmall((char*)pMemRef - 1);
+			if (pEntry == NULL) {
+				tHeapNode *pCandidate = NULL;
 				pNode = pHeapTreeRoot;
 				while (pNode != nil) {
 					if (pMemRef < (void*)pNode) {
@@ -202,34 +387,34 @@ static void GarbageCollect() {
 						pNode = pNode->pLink[1];
 					}
 				}
-				pNode = pCandidate;
+				if (pCandidate != NULL && (char*)pMemRef <= ((char*)pCandidate) + GetSize(NODE_ENTRY(pCandidate)) + sizeof(tHeapNode)) {
+					pEntry = NODE_ENTRY(pCandidate);
+				}
 			}
-			if (pNode != NULL && (char*)pMemRef <= ((char*)pNode) + GetSize(pNode) + sizeof(tHeapEntry)) {
-				{
-					// Found memory. See if it's already been marked.
-					// If it's already marked, then don't do anything.
-					// It it's not marked, then add all of its memory to the roots, and mark it.
-					if (pNode->marked == 0) {
-						tMD_TypeDef *pType = pNode->pTypeDef;
+			if (pEntry != NULL) {
+				// Found memory. See if it's already been marked.
+				// If it's already marked, then don't do anything.
+				// It it's not marked, then add all of its memory to the roots, and mark it.
+				if (pEntry->marked == 0) {
+					tMD_TypeDef *pType = pEntry->pTypeDef;
 
-						// Not yet marked, so mark it, and add it to heap roots.
-						pNode->marked = 1;
-	
-						// Don't look at the contents of strings, arrays of primitive types, or WeakReferences
-						if (pType->stackType == EVALSTACK_O ||
-							pType->stackType == EVALSTACK_VALUETYPE ||
-							pType->stackType == EVALSTACK_PTR) {
+					// Not yet marked, so mark it, and add it to heap roots.
+					pEntry->marked = 1;
 
-							if (pType != types[TYPE_SYSTEM_STRING] &&
-								(!TYPE_ISARRAY(pType) ||
-								pType->pArrayElementType->stackType == EVALSTACK_O ||
-								pType->pArrayElementType->stackType == EVALSTACK_VALUETYPE ||
-								pType->pArrayElementType->stackType == EVALSTACK_PTR)) {
+					// Don't look at the contents of strings, arrays of primitive types, or WeakReferences
+					if (pType->stackType == EVALSTACK_O ||
+						pType->stackType == EVALSTACK_VALUETYPE ||
+						pType->stackType == EVALSTACK_PTR) {
 
-								if (pType != types[TYPE_SYSTEM_WEAKREFERENCE]) {
-									Heap_SetRoots(&heapRoots,pNode->memory, GetSize(pNode));
-									moreRootsAdded = 1;
-								}
+						if (pType != types[TYPE_SYSTEM_STRING] &&
+							(!TYPE_ISARRAY(pType) ||
+							pType->pArrayElementType->stackType == EVALSTACK_O ||
+							pType->pArrayElementType->stackType == EVALSTACK_VALUETYPE ||
+							pType->pArrayElementType->stackType == EVALSTACK_PTR)) {
+
+							if (pType != types[TYPE_SYSTEM_WEAKREFERENCE]) {
+								Heap_SetRoots(&heapRoots, pEntry->memory, GetSize(pEntry));
+								moreRootsAdded = 1;
 							}
 						}
 					}
@@ -243,62 +428,90 @@ static void GarbageCollect() {
 
 	free(heapRoots.pHeapEntries);
 
-	// Sweep phase
-	// Traverse nodes
-	pUp[0] = pHeapTreeRoot;
-	top = 1;
-	while (top != 0) {
-		// Get this node
-		pNode = pUp[--top];
-		// Act on this node
-		if (pNode->marked) {
-			if (pNode->marked != 0xff) {
-				// Still in use (but not marked undeletable), so unmark
-				pNode->marked = 0;
+	// Sweep phase. First every object is sorted into live, to be finalized, or dead; then the dead ones are freed. (They are all still whole
+	// while the others are looked at: a weak reference's handling reads the objects it names.)
+	// Small objects: slot by slot, in the order of memory
+	for (c = 0; c < numClasses; c++) {
+		tChunk *pChunk;
+		for (pChunk = classes[c].first; pChunk != NULL; pChunk = pChunk->next) {
+			U32 idx;
+			for (idx = 0; idx < pChunk->carved; idx++) {
+				tHeapEntry *e = (tHeapEntry*)(pChunk->base + (size_t)idx * pChunk->slotSize);
+				if (e->pTypeDef != NULL && Classify(e) == 2) {
+					e->marked = 0xfe;                          // dead
+				}
 			}
-		} else {
-			// Not in use any more, so put in deletion queue if it does not need Finalizing
-			// If it does need Finalizing, then don't garbage collect, and put in Finalization queue.
-			if (pNode->needToFinalize) {
-				if (pNode->needToFinalize == 1) {
-					AddFinalizer((HEAP_PTR)pNode + sizeof(tHeapEntry));
-					// Mark it has having been placed in the finalization queue.
-					// When it has been finalized, then this will be set to 0
-					pNode->needToFinalize = 2;
-					// If this object is being targetted by weak-ref(s), handle it
-					if (pNode->pSync != NULL) {
-						RemoveWeakRefTarget(pNode, 0);
-						free(pNode->pSync);
-					}
-				}
-			} else {
-				// If this object is being targetted by weak-ref(s), handle it
-				if (pNode->pSync != NULL) {
-					RemoveWeakRefTarget(pNode, 1);
-					free(pNode->pSync);
-				}
+		}
+	}
+	// Large objects: the nodes of the tree
+	if (pHeapTreeRoot != nil) {
+		pUp[0] = pHeapTreeRoot;
+		top = 1;
+		while (top != 0) {
+			// Get this node
+			pNode = pUp[--top];
+			// Act on this node
+			if (Classify(NODE_ENTRY(pNode)) == 2) {
 				// Use pSync to point to next entry in this linked-list.
-				//(tHeapEntry*)(pNode->pSync) = pToDelete;
 				pNode->pSync = (tSync*)pToDelete;
 				pToDelete = pNode;
 			}
-		}
-		// Get next node(s)
-		if (pNode->pLink[1] != nil) {
-			pUp[top++] = pNode->pLink[1];
-		}
-		if (pNode->pLink[0] != nil) {
-			pUp[top++] = pNode->pLink[0];
+			// Get next node(s)
+			if (pNode->pLink[1] != nil) {
+				pUp[top++] = pNode->pLink[1];
+			}
+			if (pNode->pLink[0] != nil) {
+				pUp[top++] = pNode->pLink[0];
+			}
 		}
 	}
 
-	// Delete all unused memory nodes.
+	// Free what is dead. Small objects: each class's free list is made again from the free slots of the chunks that are still in use, and a
+	// chunk that has nothing live in it goes to the pool.
+	for (c = 0; c < numClasses; c++) {
+		tSizeClass *k = &classes[c];
+		tChunk *pChunk = k->first, *pPrev = NULL, *pNext;
+		k->freeHead = k->freeTail = NULL;
+		while (pChunk != NULL) {
+			U32 idx, live = 0;
+			pNext = pChunk->next;
+			for (idx = 0; idx < pChunk->carved; idx++) {
+				tHeapEntry *e = (tHeapEntry*)(pChunk->base + (size_t)idx * pChunk->slotSize);
+				if (e->pTypeDef != NULL && e->marked == 0xfe) {
+					trackHeapSize -= GetSize(e) + sizeof(tHeapEntry);
+					numNodes--;
+					e->pTypeDef = NULL; e->marked = 0; e->needToFinalize = 0; e->pSync = NULL;
+				}
+				if (e->pTypeDef != NULL) live++;
+			}
+			if (live == 0) {
+				if (pPrev != NULL) pPrev->next = pNext; else k->first = pNext;
+				if (k->last == pChunk) k->last = pPrev;
+				pChunk->carved = 0;
+				pChunk->nextPooled = chunkPool;
+				chunkPool = pChunk;
+			} else {
+				for (idx = 0; idx < pChunk->carved; idx++) {
+					tHeapEntry *e = (tHeapEntry*)(pChunk->base + (size_t)idx * pChunk->slotSize);
+					if (e->pTypeDef == NULL) {
+						*(tHeapEntry**)e->memory = NULL;
+						if (k->freeTail != NULL) *(tHeapEntry**)k->freeTail->memory = e; else k->freeHead = e;
+						k->freeTail = e;
+					}
+				}
+				pPrev = pChunk;
+			}
+			pChunk = pNext;
+		}
+		k->cur = (k->last != NULL && k->last->carved < k->last->nSlots) ? k->last : NULL;
+	}
+	// Large objects
 	while (pToDelete != NULL) {
-		tHeapEntry *pThis = pToDelete;
-		pToDelete = (tHeapEntry*)(pToDelete->pSync);
+		tHeapNode *pThis = pToDelete;
+		pToDelete = (tHeapNode*)(pToDelete->pSync);
 		HeapTree_Remove(pThis);
 		numNodes--;
-		trackHeapSize -= GetSize(pThis) + sizeof(tHeapEntry);
+		trackHeapSize -= GetSize(NODE_ENTRY(pThis)) + sizeof(tHeapEntry);
 		free(pThis);
 	}
 
@@ -344,14 +557,34 @@ void Heap_SetRoots(tHeapRoots *pHeapRoots, void *pRoots, U32 sizeInBytes) {
 	pRootEntry->pMem = pRoots;
 }
 
+void Heap_SuspendGC(void) {
+	// DNA_UNSAFE_GC=1 does not suspend: a control for the tests, which must then fail (compiled code's references are invisible to a collection)
+	static int unsafe = -1;
+	if (unsafe < 0) unsafe = getenv("DNA_UNSAFE_GC") != NULL;
+	if (!unsafe) gcSuspended++;
+}
+
+void Heap_ResumeGC(void) {
+	static int stress = -1;
+	if (stress < 0) stress = getenv("DNA_GC_STRESS") != NULL;
+	if (gcSuspended > 0) gcSuspended--;
+	if (gcSuspended == 0 && (trackHeapSize >= heapSizeMax || stress)) {
+		// the collection that the allocations made meanwhile would have done, with the same limits Heap_Alloc then sets
+		GarbageCollect();
+		heapSizeMax = trackHeapSize << 1;
+		if (heapSizeMax < trackHeapSize + MIN_HEAP_SIZE) heapSizeMax = trackHeapSize + MIN_HEAP_SIZE;
+		if (heapSizeMax > trackHeapSize + MAX_HEAP_EXCESS) heapSizeMax = trackHeapSize + MAX_HEAP_EXCESS;
+	}
+}
+
 HEAP_PTR Heap_Alloc(tMD_TypeDef *pTypeDef, U32 size) {
-	tHeapEntry *pHeapEntry;
+	tHeapEntry *pEntry;
 	U32 totalSize;
 
 	totalSize = sizeof(tHeapEntry) + size;
 
 	// Trigger garbage collection if required.
-	if (trackHeapSize >= heapSizeMax) {
+	if (trackHeapSize >= heapSizeMax && gcSuspended == 0) {
 		GarbageCollect();
 		heapSizeMax = (trackHeapSize + totalSize) << 1;
 		if (heapSizeMax < trackHeapSize + totalSize + MIN_HEAP_SIZE) {
@@ -364,19 +597,40 @@ HEAP_PTR Heap_Alloc(tMD_TypeDef *pTypeDef, U32 size) {
 		}
 	}
 
-	pHeapEntry = (tHeapEntry*)malloc(totalSize);
-	pHeapEntry->pTypeDef = pTypeDef;
-	pHeapEntry->pSync = NULL;
-	pHeapEntry->needToFinalize = (pTypeDef->pFinalizer != NULL);
-	memset(pHeapEntry->memory, 0, size);
+	if (totalSize <= MAX_SMALL_SLOT && !allLarge) {
+		pEntry = AllocSmall(totalSize);
+		if (pEntry == NULL && gcSuspended == 0) {                // out of memory: collect and try again
+			GarbageCollect();
+			pEntry = AllocSmall(totalSize);
+		}
+		if (pEntry == NULL) {
+			Crash("Out of memory: could not allocate %u bytes on the managed heap", (unsigned)size);
+		}
+		pEntry->level = 0;                                       // (unused in a small object)
+	} else {
+		tHeapNode *pNode = (tHeapNode*)malloc(sizeof(tHeapNode) + size);
+		if (pNode == NULL && gcSuspended == 0) {
+			GarbageCollect();
+			pNode = (tHeapNode*)malloc(sizeof(tHeapNode) + size);
+		}
+		if (pNode == NULL) {
+			Crash("Out of memory: could not allocate %u bytes on the managed heap", (unsigned)size);
+		}
+		pEntry = NODE_ENTRY(pNode);
+		if (heapLow == NULL || (char*)pNode < heapLow) { heapLow = (char*)pNode; }
+		if ((char*)pNode + sizeof(tHeapNode) + size > heapHigh) { heapHigh = (char*)pNode + sizeof(tHeapNode) + size; }
+		HeapTree_Insert(pNode);
+	}
+	pEntry->marked = 0;
+	pEntry->padding = 0;
+	pEntry->pTypeDef = pTypeDef;
+	pEntry->pSync = NULL;
+	pEntry->needToFinalize = (pTypeDef->pFinalizer != NULL);
+	memset(pEntry->memory, 0, size);
 	trackHeapSize += totalSize;
-	if (heapLow == NULL || (char*)pHeapEntry < heapLow) { heapLow = (char*)pHeapEntry; }
-	if ((char*)pHeapEntry + totalSize > heapHigh) { heapHigh = (char*)pHeapEntry + totalSize; }
-
-	HeapTree_Insert(pHeapEntry);
 	numNodes++;
 
-	return pHeapEntry->memory;
+	return pEntry->memory;
 }
 
 HEAP_PTR Heap_AllocType(tMD_TypeDef *pTypeDef) {

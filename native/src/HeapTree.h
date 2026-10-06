@@ -9,11 +9,11 @@
 void HeapTree_Init(void);
 // The sentinel that terminates every leaf. A plain global (set by HeapTree_Init) because the GC
 // compares against it in its inner loops.
-extern tHeapEntry *HeapTree_NilNode;
+extern tHeapNode *HeapTree_NilNode;
 // The root of the tree (HeapTree_NilNode if it is empty). Read it, do not set it: Insert and Remove do.
-extern tHeapEntry *HeapTree_RootNode;
+extern tHeapNode *HeapTree_RootNode;
 // Add / remove a node (ordered by address). An entry is initialised (level, links, mark) as it is added.
-void HeapTree_Insert(tHeapEntry *pEntry);
-void HeapTree_Remove(tHeapEntry *pEntry);
+void HeapTree_Insert(tHeapNode *pEntry);
+void HeapTree_Remove(tHeapNode *pEntry);
 
 #endif

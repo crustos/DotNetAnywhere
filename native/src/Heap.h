@@ -57,6 +57,12 @@ void Heap_GarbageCollect();
 U32 Heap_NumCollections();
 U32 Heap_GetTotalMemory();
 
+// While wasm-compiled code runs (WasmJIT.c) it holds references in wasm locals, which the collector cannot see, so it must not collect in
+// the middle of it: Heap_SuspendGC makes allocation skip the collection it would do, and Heap_ResumeGC (called when the compiled code has
+// returned, or has given up the processor and saved its state in the frame) makes up for it. DNA_GC_STRESS=1 collects at every resume.
+void Heap_SuspendGC(void);
+void Heap_ResumeGC(void);
+
 HEAP_PTR Heap_Alloc(tMD_TypeDef *pTypeDef, U32 size);
 HEAP_PTR Heap_AllocType(tMD_TypeDef *pTypeDef);
 void Heap_MakeUndeletable(HEAP_PTR heapEntry);
