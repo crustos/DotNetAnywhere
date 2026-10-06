@@ -187,7 +187,18 @@ namespace System {
 		extern private static bool Internal_Copy(Array src, int srcIndex, Array dst, int dstIndex, int length);
 
 		[MethodImpl(MethodImplOptions.InternalCall)]
-		extern public static void Resize<T>(ref T[] array, int newSize);
+		extern private static void ResizeInternal<T>(ref T[] array, int newSize);
+
+		public static void Resize<T>(ref T[] array, int newSize) {
+			if (newSize < 0) {
+				throw new ArgumentOutOfRangeException("newSize");
+			}
+			if (array == null) {
+				array = new T[newSize];
+				return;
+			}
+			ResizeInternal<T>(ref array, newSize);
+		}
 
 		[MethodImpl(MethodImplOptions.InternalCall)]
 		extern public static void Reverse(Array array, int index, int length);
@@ -334,7 +345,17 @@ namespace System {
         }
 
         [MethodImpl(MethodImplOptions.InternalCall)]
-        extern public static Array CreateInstance(Type elementType, int length);
+        extern private static Array CreateInstanceInternal(Type elementType, int length);
+
+        public static Array CreateInstance(Type elementType, int length) {
+            if (elementType == null) {
+                throw new ArgumentNullException("elementType");
+            }
+            if (length < 0) {
+                throw new ArgumentOutOfRangeException("length");
+            }
+            return CreateInstanceInternal(elementType, length);
+        }
 
 		#region Interface Members
 

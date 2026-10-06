@@ -171,7 +171,8 @@ namespace System {
 		public static float Max(float v1, float v2) {
 			if (v1 != v2) {
 				if (!float.IsNaN(v1)) {
-					return v1 < v2 ? v2 : v1;
+					// (a NaN second operand gives NaN: v1 < NaN is false, which alone would return v1)
+					return (float.IsNaN(v2) || v1 < v2) ? v2 : v1;
 				}
 				return v1;
 			}
@@ -181,7 +182,8 @@ namespace System {
 		public static double Max(double v1, double v2) {
 			if (v1 != v2) {
 				if (!double.IsNaN(v1)) {
-					return v1 < v2 ? v2 : v1;
+					// (a NaN second operand gives NaN: v1 < NaN is false, which alone would return v1)
+					return (double.IsNaN(v2) || v1 < v2) ? v2 : v1;
 				}
 				return v1;
 			}
