@@ -22,6 +22,7 @@
 #include "Sys.h"
 
 #include "JIT.h"
+#include "WasmJIT.h"
 
 #include "JIT_OpCodes.h"
 #include "MetaData.h"
@@ -719,6 +720,8 @@ U32 JIT_Execute(tThread *pThread, U32 numInst) {
 #undef FUSED_LABELS
 		GET_LABELS(JIT_NATIVE_BLOCK);
 		GET_LABELS(JIT_NATIVE_LOOP);
+		GET_LABELS(JIT_WASM_METHOD);
+		GET_LABELS(JIT_WASM_OSR);
 		GET_LABELS(JIT_NATIVE_RESUME);
 		GET_LABELS(JIT_STORE_ELEMENT_I1);
 		GET_LABELS(JIT_STORE_ELEMENT_I2);
@@ -3734,6 +3737,10 @@ JIT_NEW_VECTOR_start: // Array with 1 dimension, zero-based
 
 		pArrayTypeDef = (tMD_TypeDef*)GET_OP();
 		numElements = POP_U32();
+		if (numElements > SystemArray_MaxLength(pArrayTypeDef)) {
+			// (a negative length, as an unsigned number, is above the maximum too: .NET throws OverflowException for it)
+			THROW(types[TYPE_SYSTEM_OVERFLOWEXCEPTION]);
+		}
 		heapPtr = SystemArray_NewVector(pArrayTypeDef, numElements);
 		PUSH_O(heapPtr);
 		// Run any pending Finalizers
@@ -4783,6 +4790,137 @@ JIT_NATIVE_LOOP_start:
 JIT_NATIVE_LOOP_end:
 	GO_NEXT();
 
+
+JIT_WASM_METHOD_start:
+	OPCODE_USE(JIT_WASM_METHOD);
+	{
+#if WASM_JIT
+		// The method body is a function that the host compiled from the method's CIL (WasmJIT.c). It reads its arguments from the frame
+		// and writes its result where the evaluation stack ends, as the CIL would have left it.
+		tOpWord *wasmBlockOp = pCurOp - 1;               // this instruction, for running it again
+		tWasmFn wasmFn = (tWasmFn)(uintptr_t)GET_OP();
+		U32 retSize = (U32)GET_OP();
+		tWasmDeopt *wasmDeopt = (tWasmDeopt*)(uintptr_t)GET_OP();
+		U32 wasmEntry = pCurrentMethodState->nativeEntry;      // 0, unless the function gave up the processor in a loop
+		U32 wasmStatus;
+		pCurrentMethodState->nativeEntry = 0;
+		// (collection is held off while it runs: its references are in wasm locals; whatever it allocated is collected now, when everything it
+		// still needs is in the frame or at the top of the evaluation stack, which the collector scans in full)
+		Heap_SuspendGC();
+		wasmStatus = wasmFn(pParamsLocals, pCurEvalStack, wasmEntry, WasmJIT_Slice());
+		Heap_ResumeGC();
+		if (wasmStatus >= WJ_DEOPT) {
+			// a guard failed: the state is in the interpreter's layout (see WasmJIT.h); this frame goes on in the interpreter's version of the method,
+			// at the instruction that was about to run
+			tWasmDeoptSite *pSite = &wasmDeopt->sites[wasmStatus - WJ_DEOPT];
+			tMD_MethodDef *pEntryMethod = pCurrentMethodState->pMethod;
+			const tWasmFrameDesc *pChainDesc[WJ_MAX_CHAIN];
+			PTR pChainImage[WJ_MAX_CHAIN];
+			U32 chainLen = WasmJIT_ChainLen, ci;
+			// Callees that were called from the compiled code (and their callees) gave up their frames too, innermost first: their images
+			for (ci = 0; ci < chainLen; ci++) { pChainDesc[ci] = WasmJIT_ChainDesc[ci]; pChainImage[ci] = WasmJIT_ChainImage[ci]; }
+			WasmJIT_ChainLen = 0;
+			if (getenv("DNA_WASM_JIT_DEBUG") != NULL) {
+				fprintf(stderr, "wasm-jit: DEOPT %s (site %u%s)", Sys_GetMethodDesc(pEntryMethod), wasmStatus - WJ_DEOPT, chainLen > 0 ? ", with" : "");
+				for (ci = 0; ci < chainLen; ci++) { fprintf(stderr, " %s", Sys_GetMethodDesc(pChainDesc[chainLen - 1 - ci]->method)); }
+				fprintf(stderr, "\n");
+			}
+			{
+				// a receiver that was not expected: have the method compiled again with its type (this frame goes on in the interpreter, and goes back into the new version at its next loop)
+				tMD_MethodDef *pMissCallee = chainLen > 0 ? pChainDesc[0]->callee : pSite->callee;
+				PTR pMissAt = chainLen > 0 ? pChainImage[0] + pChainDesc[0]->plBytes + pChainDesc[0]->recvOfs : pCurEvalStack + pSite->recvOfs;
+				HEAP_PTR pMissed = pMissCallee == NULL ? NULL : *(HEAP_PTR*)pMissAt;
+				if (pMissed != NULL && WasmJIT_NoteMiss(pEntryMethod, pMissCallee, Heap_GetType(pMissed)) && JIT_RecompileWasm(pEntryMethod) && getenv("DNA_WASM_JIT_DEBUG") != NULL) {
+					fprintf(stderr, "wasm-jit: recompiled %s\n", Sys_GetMethodDesc(pEntryMethod));
+				}
+			}
+			pCurEvalStack += pSite->stackBytes;
+			pCurrentMethodState->pJIT = wasmDeopt->interp;
+			pCurrentMethodState->stackOfs = (U32)(pCurEvalStack - pCurrentMethodState->pEvalStack);
+			pCurrentMethodState->ipOffset = pSite->ip;
+			if (chainLen > 0) {
+				// the frames of the methods that the compiled code called, outermost first, each in the interpreter's version of its method at the place that its image says; the
+				// innermost goes on there, and the others when it returns, as they would have. (The methods are prepared first: that can allocate.)
+				tMethodState *pFrame = pCurrentMethodState;
+				I32 fk;
+				for (ci = 0; ci < chainLen; ci++) {
+					tMD_MethodDef *pm = pChainDesc[ci]->method;
+					if (!pm->isFilled) { MetaData_Fill_TypeDef(MetaData_GetTypeDefFromMethodDef(pm), NULL, NULL); }
+					if (pm->pJITted == NULL) { JIT_Prepare(pm, 0); }
+				}
+				for (fk = (I32)chainLen - 1; fk >= 0; fk--) {
+					const tWasmFrameDesc *pD = pChainDesc[fk];
+					tMethodState *pNew = MethodState_Direct(pThread, pD->method, pFrame, 0);
+					tJITted *pj = pD->method->pJITted;
+					if (pD->interp->maxStack > pj->maxStack || pD->plBytes > pD->method->parameterStackSize + pj->localsStackSize) {
+						Crash("a frame that was given to the interpreter does not fit the frame that its method has");
+					}
+					memcpy(pNew->pParamsLocals, pChainImage[fk], pD->plBytes);
+					memcpy(pNew->pEvalStack, pChainImage[fk] + pD->plBytes, pD->stackBytes);
+					for (ci = 0; ci < pD->numReloc; ci++) {            // a pointer to a struct in the locals is an address in this frame
+						*(PTR*)(pNew->pEvalStack + pD->reloc[2 * ci]) = pNew->pParamsLocals + pD->reloc[2 * ci + 1];
+					}
+					pNew->pJIT = pD->interp;
+					pNew->ipOffset = pD->ip;
+					pNew->stackOfs = pD->stackBytes;
+					pFrame = pNew;
+				}
+				pThread->pCurrentMethodState = pFrame;
+			}
+			LOAD_METHOD_STATE();
+			GO_NEXT();
+		}
+		if (wasmStatus >= WJ_RESTART) {
+			// out of budget at a loop: yield (the thread's time slice is over), then call it again to carry on from there
+			pCurrentMethodState->nativeEntry = wasmStatus - WJ_RESTART;
+			pCurOp = wasmBlockOp;
+			numInst = 1;
+			GO_NEXT_CHECK();
+		}
+		if (wasmStatus != WJ_OK) {
+			if (wasmStatus == WJ_NULLREF) {
+				THROW_NULLREF();
+			}
+			if (wasmStatus == WJ_DIVZERO) {
+				THROW(types[TYPE_SYSTEM_DIVIDEBYZEROEXCEPTION]);
+			}
+			if (wasmStatus == WJ_OVERFLOW) {
+				THROW(types[TYPE_SYSTEM_OVERFLOWEXCEPTION]);
+			}
+			THROW(types[TYPE_SYSTEM_INDEXOUTOFRANGEEXCEPTION]);
+		}
+		pCurEvalStack += retSize;
+		RUN_FINALIZER();                      // (it may have allocated)
+#else
+		Crash("a wasm method was run on a target without the wasm JIT");
+#endif
+	}
+JIT_WASM_METHOD_end:
+	GO_NEXT();
+
+JIT_WASM_OSR_start:
+	OPCODE_USE(JIT_WASM_OSR);
+	{
+#if WASM_JIT
+		// The header of a loop, in the interpreter's version of a method that was compiled: if its compiled version (the latest one) can be entered
+		// here, with nothing on the evaluation stack, the frame goes back into it. The locals are in the frame, where it expects them.
+		U32 osrOfs = (U32)GET_OP();
+		tJITted *pCompiled = pCurrentMethodState->pMethod->pJITted;
+		U32 osrEntry;
+		if (pCompiled != NULL && pCompiled != pCurrentMethodState->pJIT && pCurEvalStack == pCurrentMethodState->pEvalStack && WasmJIT_OsrEntry(pCompiled, osrOfs, &osrEntry)) {
+			pCurrentMethodState->pJIT = pCompiled;
+			pCurrentMethodState->stackOfs = 0;
+			pCurrentMethodState->ipOffset = 0;
+			pCurrentMethodState->nativeEntry = osrEntry;
+			LOAD_METHOD_STATE();
+			GO_NEXT();
+		}
+#else
+		pCurOp++;
+#endif
+	}
+JIT_WASM_OSR_end:
+	GO_NEXT();
 
 JIT_NATIVE_RESUME_start:
 	OPCODE_USE(JIT_NATIVE_RESUME);

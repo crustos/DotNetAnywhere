@@ -61,6 +61,8 @@ struct tCombinedOpcodesMem_ {
 struct tJITted_ {
 	// The JITted opcodes
 	tOpWord *pOps;
+	// For a method that was compiled to WebAssembly: how a frame goes back and forth between the compiled code and the interpreter (WasmJIT.h tWasmDeopt), else NULL
+	void *pWasmDeopt;
 	// The corresponding sequence points in the original CIL
 	U32 *pOpSequencePoints;
 	// The maximum size of the evaluation stack

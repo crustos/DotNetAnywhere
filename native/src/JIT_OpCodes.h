@@ -525,6 +525,11 @@
 // A pointer-wide array index (C# emits `conv.u` / `conv.i` before the element opcode for a uint, long or ulong index, and on a 64-bit target that is
 // 8 bytes on the evaluation stack, where the element operations take 4) that sits UNDER a value (stelem): narrow it to 32 bits and move the value
 // down over the four bytes that leaves.  operand: the size of the value in bytes.  (An index on top is narrowed by an ordinary conversion.)
+// A method that was compiled to WebAssembly (WasmJIT.h): [the table index of the function][the size of its return value]
+#define JIT_WASM_METHOD                                  0x1cc
+// In the interpreter's version of a method that was compiled to WebAssembly, at the header of a loop that the compiled version can be entered at:
+// [the CIL offset of the header]. A frame that had to leave the compiled code (WasmJIT.h: deoptimization) goes back into it here.
+#define JIT_WASM_OSR                                     0x1cd
 #define JIT_NARROW_INDEX_BELOW                           0x1cb   // (the opcodes are not numbered in the order they are listed: the highest in use is JIT_FFI_CALL, 0x1ca)
 
 #endif

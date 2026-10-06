@@ -22,6 +22,7 @@
 #include "Sys.h"
 
 #include "JIT.h"
+#include "WasmJIT.h"
 #include "NativeBlocks.h"
 
 #include "JIT_OpCodes.h"
@@ -277,7 +278,7 @@ static U32 GenCombined(tOps *pOps, tOps *pIsDynamic, U32 startOfs, U32 count, U3
 }
 #endif
 
-static SetBreakPoint(tMD_MethodDef *pMethodDef, U32 cilOfs, tOps ops)
+static void SetBreakPoint(tMD_MethodDef *pMethodDef, U32 cilOfs, tOps ops)
 {
     
 }
@@ -1152,6 +1153,11 @@ static int EmitBlock(const tBlockCtx *c, U32 k, U32 n, tOpWord *newP, U32 *pNewO
 }
 #endif
 
+// Set while the interpreter's version of a method that was compiled to wasm is made (see JIT_BuildInterpreterVersion): the CIL offsets that the interpreter
+// takes over at (they must start an op, so fusion treats them as branch targets), and those of the loop headers where it goes back into compiled code.
+static const U32 *jitKeep = NULL; static U32 jitNumKeep = 0;
+static const U32 *jitOsr = NULL; static U32 jitNumOsr = 0;
+
 static void FuseOps(tOps *pOps, tOps *pBranches, U32 *pJITOffsets, const U32 *instrList, U32 numInstr,
 		tJITted *pJITted, U32 codeSize, tMD_MethodDef *pMethodDef) {
 	static int enabled = -1;
@@ -1186,6 +1192,9 @@ static void FuseOps(tOps *pOps, tOps *pBranches, U32 *pJITOffsets, const U32 *in
 	for (i = 0; i < pBranches->ofs; i++) {
 		U32 t = (U32)pOps->p[pBranches->p[i]];
 		if (t <= codeSize) { isTarget[t] = 1; }
+	}
+	for (i = 0; i < jitNumKeep; i++) {
+		if (jitKeep[i] <= codeSize) { isTarget[jitKeep[i]] = 1; }
 	}
 	for (i = 0; i < pJITted->numExceptionHandlers; i++) {
 		tExceptionHeader *pEx = &pJITted->pExceptionHeaders[i];
@@ -1449,7 +1458,7 @@ static void FuseOps(tOps *pOps, tOps *pBranches, U32 *pJITOffsets, const U32 *in
 	free(isTarget); free(start); free(end); free(val); free(idx); free(kind); free(newJIT); free(remap);
 }
 
-static tOpWord* JITit(tMD_MethodDef *pMethodDef, U8 *pCIL, U32 codeSize, tParameter *pLocals, tJITted *pJITted, U32 genCombinedOpcodes, I32 **ppSequencePoints) {
+static tOpWord* JITit(tMD_MethodDef *pMethodDef, U8 *pCIL, U32 codeSize, tParameter *pLocals, tJITted *pJITted, U32 genCombinedOpcodes, I32 **ppSequencePoints, U32 **ppCilToOp) {
 	U32 maxStack = pJITted->maxStack;
 	U32 i;
 	U32 cilOfs;
@@ -1580,6 +1589,18 @@ static tOpWord* JITit(tMD_MethodDef *pMethodDef, U8 *pCIL, U32 codeSize, tParame
 		// Set the JIT offset for this CIL opcode
 		pJITOffsets[cilOfs] = ops.ofs;
 		instrList[numInstr++] = cilOfs;
+		{
+			U32 oi;
+			for (oi = 0; oi < jitNumOsr; oi++) {
+				if (jitOsr[oi] == cilOfs) {
+					int savedSeq = nextOpSequencePoint;
+					nextOpSequencePoint = -1;
+					PushOpParam(JIT_WASM_OSR, cilOfs);
+					nextOpSequencePoint = savedSeq;
+					break;
+				}
+			}
+		}
 
         U32 pcilOfs = cilOfs;
 
@@ -3299,6 +3320,10 @@ combineDone:
 	free(ppTypeStacks);
 
 	DeleteOps(branchOffsets);
+	if (ppCilToOp != NULL) {                                   // (the op that each CIL instruction starts at; meaningful for the first byte of an instruction)
+		*ppCilToOp = (U32*)malloc(codeSize * sizeof(U32));
+		memcpy(*ppCilToOp, pJITOffsets, codeSize * sizeof(U32));
+	}
 	free(pJITOffsets);
 	free(instrList);
 
@@ -3522,10 +3547,82 @@ void JIT_Prepare(tMD_MethodDef *pMethodDef, U32 genCombinedOpcodes) {
 		pJITted->localsStackSize = totalSize;
 	}
 
+#if WASM_JIT
+	// A method in the subset that WasmJIT.c can compile becomes a WebAssembly function: its instruction stream is only the call of it.
+	// (Not one with exception clauses; those stay with the interpreter.)
+	if (!(flags & CorILMethod_MoreSects)) {
+		tWasmResult wasmRes; U32 wasmFn = WasmJIT_Compile(pMethodDef, pCIL, codeSize, pLocals, localsToken == 0 ? 0 : numLocals, pJITted->localsStackSize, &wasmRes);
+		if (wasmFn != 0) {
+			U32 retSize = pMethodDef->pReturnType == NULL ? 0 : pMethodDef->pReturnType->stackSize;
+			tOpWord *stub = (tOpWord*)mallocForever(5 * sizeof(tOpWord));
+			stub[0] = Translate(JIT_WASM_METHOD, 0);
+			stub[1] = (tOpWord)wasmFn;
+			stub[2] = (tOpWord)retSize;
+			stub[3] = (tOpWord)(uintptr_t)wasmRes.deopt;
+			pJITted->pWasmDeopt = wasmRes.deopt;
+			stub[4] = Translate(JIT_RETURN, 0);
+			pJITted->maxStack = wasmRes.maxStack > retSize ? wasmRes.maxStack : retSize;       // (the interpreter's version, after a deoptimization, uses the same evaluation stack)
+			pJITted->localsStackSize += wasmRes.extraFrame + (wasmRes.deopt != NULL ? WJ_DEOPT_SLACK : 0);       // (the scratch area for struct values and for the functions it calls)
+			pJITted->pOps = stub;
+			pJITted->pOpSequencePoints = NULL;
+			free(pLocals);
+			return;
+		}
+	}
+#endif
+
 	// JIT the CIL code
 	I32 *pSequencePoints;
-	pJITted->pOps = JITit(pMethodDef, pCIL, codeSize, pLocals, pJITted, genCombinedOpcodes, &pSequencePoints);
+	pJITted->pOps = JITit(pMethodDef, pCIL, codeSize, pLocals, pJITted, genCombinedOpcodes, &pSequencePoints, NULL);
 	pJITted->pOpSequencePoints = pSequencePoints;
 
 	free(pLocals);
 }
+
+#if WASM_JIT
+// The interpreter's version of a method, for a frame that was running compiled code and has to go on in the interpreter (WasmJIT.h: deoptimization).
+// It has the same frame (parameters, then locals) as the compiled version, and its own evaluation stack size: the compiled version's must be at
+// least that. *ppCilToOp is the op at which each CIL instruction starts.
+void JIT_BuildInterpreterVersion(tMD_MethodDef *pMethodDef, U8 *pCIL, U32 codeSize, tParameter *pLocals, U32 headerMaxStack, U32 localsStackSize,
+		const U32 *keep, U32 numKeep, const U32 *osr, U32 numOsr, tJITted **ppOut, U32 **ppCilToOp) {
+	tJITted *pJ = (tJITted*)mallocForever(sizeof(tJITted));
+	I32 *pSeq = NULL;
+	memset(pJ, 0, sizeof(tJITted));
+	pJ->maxStack = headerMaxStack;
+	pJ->localsStackSize = localsStackSize;
+	jitKeep = keep; jitNumKeep = numKeep; jitOsr = osr; jitNumOsr = numOsr;
+	pJ->pOps = JITit(pMethodDef, pCIL, codeSize, pLocals, pJ, 0, &pSeq, ppCilToOp);
+	jitKeep = NULL; jitNumKeep = 0; jitOsr = NULL; jitNumOsr = 0;
+	pJ->pOpSequencePoints = pSeq;
+	*ppOut = pJ;
+}
+
+// A receiver whose type was not expected failed the guards of a call in this method (WasmJIT_NoteMiss): compile the method again, with that type among the targets,
+// and make that its compiled version. Frames of the version before it can still be live (one that gave up the processor, or that is going on in the interpreter), and
+// they are sized from the method's current version: so the new one must fit them and takes their sizes, or else the old one stays.
+int JIT_RecompileWasm(tMD_MethodDef *pMethodDef) {
+	tJITted *pOld = pMethodDef->pJITted, *pNew;
+	tWasmDeopt *pOldDeopt = pOld == NULL ? NULL : (tWasmDeopt*)pOld->pWasmDeopt;
+	tWasmResult res;
+	U32 fn, retSize;
+	tOpWord *stub;
+	if (pOldDeopt == NULL || pOldDeopt->recompiles >= 4) { return 0; }
+	fn = WasmJIT_Compile(pMethodDef, pOldDeopt->cil, pOldDeopt->codeSize, pOldDeopt->locals, pOldDeopt->numLocals, pOldDeopt->origLocalsSize, &res);
+	if (fn == 0) { return 0; }
+	retSize = pMethodDef->pReturnType == NULL ? 0 : pMethodDef->pReturnType->stackSize;
+	if (res.deopt == NULL || (res.maxStack > retSize ? res.maxStack : retSize) > pOld->maxStack || pOldDeopt->origLocalsSize + res.extraFrame > pOld->localsStackSize) { return 0; }
+	pNew = (tJITted*)mallocForever(sizeof(tJITted));
+	*pNew = *pOld;
+	stub = (tOpWord*)mallocForever(5 * sizeof(tOpWord));
+	stub[0] = Translate(JIT_WASM_METHOD, 0);
+	stub[1] = (tOpWord)fn;
+	stub[2] = (tOpWord)retSize;
+	stub[3] = (tOpWord)(uintptr_t)res.deopt;
+	stub[4] = Translate(JIT_RETURN, 0);
+	pNew->pOps = stub;
+	pNew->pWasmDeopt = res.deopt;
+	res.deopt->recompiles = pOldDeopt->recompiles + 1;
+	pMethodDef->pJITted = pNew;
+	return 1;
+}
+#endif
