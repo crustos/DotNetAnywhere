@@ -11,6 +11,15 @@ namespace System.IO {
 		extern public static int Read(IntPtr handle, byte[] dst, int dstOfs, int count, out int error);
 
 		[MethodImpl(MethodImplOptions.InternalCall)]
+		extern public static int Write(IntPtr handle, byte[] src, int srcOfs, int count, out int error);
+
+		[MethodImpl(MethodImplOptions.InternalCall)]
+		extern public static void CreateDirectory(string path, out int error);
+
+		[MethodImpl(MethodImplOptions.InternalCall)]
+		extern public static void Delete(string path, bool directory, out int error);
+
+		[MethodImpl(MethodImplOptions.InternalCall)]
 		extern public static void Close(IntPtr handle, out int error);
 
 		[MethodImpl(MethodImplOptions.InternalCall)]

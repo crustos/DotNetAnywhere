@@ -27,6 +27,9 @@
 tAsyncCall* System_IO_FileInternal_Open(PTR pThis_, PTR pParams, PTR pReturnValue);
 tAsyncCall* System_IO_FileInternal_Read(PTR pThis_, PTR pParams, PTR pReturnValue);
 tAsyncCall* System_IO_FileInternal_Close(PTR pThis_, PTR pParams, PTR pReturnValue);
+tAsyncCall* System_IO_FileInternal_Write(PTR pThis_, PTR pParams, PTR pReturnValue);
+tAsyncCall* System_IO_FileInternal_CreateDirectory(PTR pThis_, PTR pParams, PTR pReturnValue);
+tAsyncCall* System_IO_FileInternal_Delete(PTR pThis_, PTR pParams, PTR pReturnValue);
 tAsyncCall* System_IO_FileInternal_GetCurrentDirectory(PTR pThis_, PTR pParams, PTR pReturnValue);
 tAsyncCall* System_IO_FileInternal_GetFileAttributes(PTR pThis_, PTR pParams, PTR pReturnValue);
 tAsyncCall* System_IO_FileInternal_GetFileSystemEntries(PTR pThis_, PTR pParams, PTR pReturnValue);

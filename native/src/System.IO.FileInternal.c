@@ -63,16 +63,20 @@ tAsyncCall* System_IO_FileInternal_Open(PTR pThis_, PTR pParams, PTR pReturnValu
 	}
 	filename[i] = 0;
 
-	flags = O_BINARY;
+	// FileAccess: 1 Read, 2 Write, 3 ReadWrite
+	flags = O_BINARY | (access == 1 ? O_RDONLY : access == 2 ? O_WRONLY : O_RDWR);
 	switch (mode) {
-	case FILEMODE_OPEN:
-		flags |= O_RDWR;
-		break;
+	case 1: flags |= O_CREAT | O_EXCL; break;                 // CreateNew
+	case 2: flags |= O_CREAT | O_TRUNC; break;                // Create
+	case FILEMODE_OPEN: break;
+	case FILEMODE_OPENORCREATE: flags |= O_CREAT; break;
+	case 5: flags |= O_TRUNC; break;                          // Truncate
+	case 6: flags |= O_CREAT | O_APPEND; break;               // Append
 	default:
 		error = ERROR_UNKNOWNMODE;
 		goto done;
 	}
-	f = open(filename, flags);
+	f = open(filename, flags, 0666);
 	if (f < 0) {
 		// Failed to open
 		error = errno;
@@ -274,5 +278,78 @@ tAsyncCall* System_IO_FileInternal_GetFileSystemEntries(PTR pThis_, PTR pParams,
 	for (i=0; i<tempStoreOfs; i++) {
 		Heap_MakeDeletable(((HEAP_PTR*)arrayElements)[i]);
 	}
+	return NULL;
+}
+
+
+tAsyncCall* System_IO_FileInternal_Write(PTR pThis_, PTR pParams, PTR pReturnValue) {
+	U32 f;
+	HEAP_PTR src;
+	U32 startOfs, count;
+	U32 *pError;
+	PTR pFirstElement;
+	I32 ret = 0, error = 0;
+
+	f = ((U32*)pParams)[0];
+	src = ((HEAP_PTR*)pParams)[1];
+	startOfs = INTERNALCALL_PARAM(2*PSZ, U32);
+	count = INTERNALCALL_PARAM(2*PSZ+4, U32);
+	pError = INTERNALCALL_PARAM(2*PSZ+8, U32*);
+	pFirstElement = SystemArray_LoadElementAddress(src, startOfs);
+
+	ret = write(f, pFirstElement, count);
+	if (ret < 0) {
+		error = errno;
+	}
+
+	*pError = error;
+	*(U32*)pReturnValue = ret;
+	return NULL;
+}
+
+// A .NET path as a C string; 0 when it does not fit
+static int CPath(HEAP_PTR str, unsigned char *path, U32 size) {
+	U32 len, i;
+	STRING2 path2 = SystemString_GetString(str, &len);
+	if (len >= size) return 0;
+	for (i = 0; i < len; i++) path[i] = (unsigned char)path2[i];
+	path[i] = 0;
+	return 1;
+}
+
+// CreateDirectory(path, out error): one directory (the C# side makes the parents); an existing one is not an error
+tAsyncCall* System_IO_FileInternal_CreateDirectory(PTR pThis_, PTR pParams, PTR pReturnValue) {
+	unsigned char path[256];
+	U32 *pError = INTERNALCALL_PARAM(PSZ, U32*);
+	int error = 0;
+
+	if (!CPath(((HEAP_PTR*)pParams)[0], path, sizeof(path))) {
+		*pError = ENAMETOOLONG;
+		return NULL;
+	}
+#ifdef _WIN32
+	if (_mkdir((char*)path) != 0 && errno != EEXIST) error = errno;
+#else
+	if (mkdir((char*)path, 0777) != 0 && errno != EEXIST) error = errno;
+#endif
+	*pError = error;
+	return NULL;
+}
+
+// Delete(path, directory, out error): a file, or an empty directory (the C# side empties it first)
+tAsyncCall* System_IO_FileInternal_Delete(PTR pThis_, PTR pParams, PTR pReturnValue) {
+	unsigned char path[256];
+	U32 directory = INTERNALCALL_PARAM(PSZ, U32);
+	U32 *pError = INTERNALCALL_PARAM(PSZ + 4, U32*);
+
+	if (!CPath(((HEAP_PTR*)pParams)[0], path, sizeof(path))) {
+		*pError = ENAMETOOLONG;
+		return NULL;
+	}
+#ifdef _WIN32
+	*pError = (directory ? _rmdir((char*)path) : _unlink((char*)path)) != 0 ? errno : 0;
+#else
+	*pError = (directory ? rmdir((char*)path) : unlink((char*)path)) != 0 ? errno : 0;
+#endif
 	return NULL;
 }

@@ -52,6 +52,12 @@ namespace System {
 		[MethodImplAttribute(MethodImplOptions.InternalCall)]
 		internal static extern string GetOSVersionString();
 
+		[MethodImpl(MethodImplOptions.InternalCall)]
+		public static extern string GetEnvironmentVariable(string variable);
+
+		[MethodImpl(MethodImplOptions.InternalCall)]
+		public static extern void SetEnvironmentVariable(string variable, string value);
+
 		public static OperatingSystem OSVersion {
 			get {
 				if (os == null) {

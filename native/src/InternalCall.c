@@ -103,6 +103,8 @@ static tInternalCall internalCalls[] = {
 	{NULL, "Environment", "get_TickCount", System_Environment_get_TickCount, TYPE_SYSTEM_INT32, 0},
 	{NULL, NULL         , "GetOSVersionString", System_Environment_GetOSVersionString, TYPE_SYSTEM_STRING, 0},
 	{NULL, NULL         , "get_Platform", System_Environment_get_Platform, TYPE_SYSTEM_PLATFORMID, 0},
+	{NULL, NULL         , "GetEnvironmentVariable", System_Environment_GetEnvironmentVariable, TYPE_SYSTEM_STRING, 1, {TYPE_SYSTEM_STRING}},
+	{NULL, NULL         , "SetEnvironmentVariable", System_Environment_SetEnvironmentVariable, TYPE_SYSTEM_VOID, 2, {TYPE_SYSTEM_STRING, TYPE_SYSTEM_STRING}},
 
 	{NULL, "Type", "GetTypeFromHandle", System_Type_GetTypeFromHandle, TYPE_SYSTEM_TYPE, 1, {TYPE_SYSTEM_RUNTIMETYPEHANDLE}},
 	{NULL, NULL,   "EnsureAssemblyLoaded", System_Type_EnsureAssemblyLoaded, TYPE_SYSTEM_VOID, 1, {TYPE_SYSTEM_STRING}},
@@ -206,6 +208,9 @@ static tInternalCall internalCalls[] = {
 	{"System.IO", "FileInternal", "Open", System_IO_FileInternal_Open, TYPE_SYSTEM_INTPTR, 5, {TYPE_SYSTEM_STRING, TYPE_SYSTEM_IO_FILEMODE, TYPE_SYSTEM_IO_FILEACCESS, TYPE_SYSTEM_IO_FILESHARE, TYPE_SYSTEM_INTPTR}},
 	{NULL,        NULL,           "Read", System_IO_FileInternal_Read, TYPE_SYSTEM_INT32, 5, {TYPE_SYSTEM_INTPTR, TYPE_SYSTEM_ARRAY_BYTE, TYPE_SYSTEM_INT32, TYPE_SYSTEM_INT32, TYPE_SYSTEM_INTPTR}},
 	{NULL,        NULL,           "Close", System_IO_FileInternal_Close, TYPE_SYSTEM_VOID, 2, {TYPE_SYSTEM_INTPTR, TYPE_SYSTEM_INTPTR}},
+	{NULL,        NULL,           "Write", System_IO_FileInternal_Write, TYPE_SYSTEM_INT32, 5, {TYPE_SYSTEM_INTPTR, TYPE_SYSTEM_ARRAY_BYTE, TYPE_SYSTEM_INT32, TYPE_SYSTEM_INT32, TYPE_SYSTEM_INTPTR}},
+	{NULL,        NULL,           "CreateDirectory", System_IO_FileInternal_CreateDirectory, TYPE_SYSTEM_VOID, 2, {TYPE_SYSTEM_STRING, TYPE_SYSTEM_INTPTR}},
+	{NULL,        NULL,           "Delete", System_IO_FileInternal_Delete, TYPE_SYSTEM_VOID, 3, {TYPE_SYSTEM_STRING, TYPE_SYSTEM_BOOLEAN, TYPE_SYSTEM_INTPTR}},
 	{NULL,        NULL,           "GetCurrentDirectory", System_IO_FileInternal_GetCurrentDirectory, TYPE_SYSTEM_STRING, 1, {TYPE_SYSTEM_INTPTR}},
 	{NULL,        NULL,           "GetFileAttributes", System_IO_FileInternal_GetFileAttributes, TYPE_SYSTEM_IO_FILESYSTEMATTRIBUTES, 2, {TYPE_SYSTEM_STRING, TYPE_SYSTEM_INTPTR}},
 	{NULL,        NULL,           "GetFileSystemEntries", System_IO_FileInternal_GetFileSystemEntries, TYPE_SYSTEM_ARRAY_STRING, 5, {TYPE_SYSTEM_STRING, TYPE_SYSTEM_STRING, TYPE_SYSTEM_IO_FILESYSTEMATTRIBUTES, TYPE_SYSTEM_IO_FILESYSTEMATTRIBUTES, TYPE_SYSTEM_INTPTR}},

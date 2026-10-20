@@ -27,5 +27,7 @@
 tAsyncCall* System_Environment_get_TickCount(PTR pThis_, PTR pParams, PTR pReturnValue);
 tAsyncCall* System_Environment_GetOSVersionString(PTR pThis_, PTR pParams, PTR pReturnValue);
 tAsyncCall* System_Environment_get_Platform(PTR pThis_, PTR pParams, PTR pReturnValue);
+tAsyncCall* System_Environment_GetEnvironmentVariable(PTR pThis_, PTR pParams, PTR pReturnValue);
+tAsyncCall* System_Environment_SetEnvironmentVariable(PTR pThis_, PTR pParams, PTR pReturnValue);
 
 #endif

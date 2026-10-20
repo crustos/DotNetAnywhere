@@ -28,6 +28,9 @@
 #include "Heap.h"
 
 #include <time.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
 
 tAsyncCall* System_Environment_get_TickCount(PTR pThis_, PTR pParams, PTR pReturnValue) {
 	I32 t;
@@ -66,5 +69,52 @@ tAsyncCall* System_Environment_get_Platform(PTR pThis_, PTR pParams, PTR pReturn
 #else
 	*(U32*)pReturnValue = 4; // UNIX
 #endif
+	return NULL;
+}
+
+// Environment.GetEnvironmentVariable(name): the variable's value, or null (ASCII: a value is read byte by byte)
+tAsyncCall* System_Environment_GetEnvironmentVariable(PTR pThis_, PTR pParams, PTR pReturnValue) {
+	HEAP_PTR name = ((HEAP_PTR*)pParams)[0];
+	char buf[256];
+	U32 len, i;
+	STRING2 s;
+	const char *v;
+	*(HEAP_PTR*)pReturnValue = NULL;
+	if (name == NULL) return NULL;
+	s = SystemString_GetString(name, &len);
+	if (len >= sizeof(buf)) return NULL;
+	for (i = 0; i < len; i++) buf[i] = (char)s[i];
+	buf[len] = 0;
+	v = getenv(buf);
+	if (v != NULL) *(HEAP_PTR*)pReturnValue = SystemString_FromCharPtrASCII((U8*)v);
+	return NULL;
+}
+
+// Environment.SetEnvironmentVariable(name, value): a null or empty value removes the variable (ASCII, as GetEnvironmentVariable)
+static char* Environment_CString(HEAP_PTR str) {
+	U32 len, i;
+	STRING2 s = SystemString_GetString(str, &len);
+	char *c = (char*)malloc(len + 1);
+	for (i = 0; i < len; i++) c[i] = (char)s[i];
+	c[len] = 0;
+	return c;
+}
+
+tAsyncCall* System_Environment_SetEnvironmentVariable(PTR pThis_, PTR pParams, PTR pReturnValue) {
+	HEAP_PTR name = ((HEAP_PTR*)pParams)[0], value = ((HEAP_PTR*)pParams)[1];
+	if (name == NULL) return NULL;
+	char *n = Environment_CString(name);
+	char *v = value == NULL ? NULL : Environment_CString(value);
+#ifdef _WIN32
+	char *kv = (char*)malloc(strlen(n) + (v ? strlen(v) : 0) + 2);
+	sprintf(kv, "%s=%s", n, v ? v : "");
+	_putenv(kv);
+	free(kv);
+#else
+	if (v == NULL || v[0] == 0) unsetenv(n);
+	else setenv(n, v, 1);
+#endif
+	free(n);
+	free(v);
 	return NULL;
 }
