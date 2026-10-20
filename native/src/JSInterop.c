@@ -8,6 +8,7 @@
 #include "System.Array.h"
 #include "System.RuntimeType.h"
 #include "System.String.h"
+#include "System.Reflection.MethodBase.h"
 
 int JSInterop_CallDotNet(char* assemblyName, char* namespace, char* className, char* methodName, char* stringArg) {
 	// TODO: Can't we reuse threads? Need to reset their state somehow.
@@ -56,5 +57,24 @@ tAsyncCall* Framework_JSInterop_FromHeapRefImpl(PTR pThis_, PTR pParams, PTR pRe
 tAsyncCall* Framework_JSInterop_Activator_CreateInstance(PTR pThis_, PTR pParams, PTR pReturnValue) {
 	tMD_TypeDef *pTypeDef = RuntimeType_DeRef((PTR)((tMD_TypeDef**)pParams)[0]);
 	*(HEAP_PTR*)pReturnValue = (HEAP_PTR)Heap_AllocType(pTypeDef);
+	return NULL;
+}
+
+// Activator.DefaultConstructor(Type): the type's parameterless .ctor as a MethodBase (so CreateInstance<T> can Invoke it), or null
+tAsyncCall* System_Activator_DefaultConstructor(PTR pThis_, PTR pParams, PTR pReturnValue) {
+	tMD_TypeDef *pTypeDef = RuntimeType_DeRef((PTR)((tMD_TypeDef**)pParams)[0]);
+	*(HEAP_PTR*)pReturnValue = NULL;
+	MetaData_Fill_TypeDef(pTypeDef, NULL, NULL);
+	for (U32 i = 0; i < pTypeDef->numMethods; i++) {
+		tMD_MethodDef *pM = pTypeDef->ppMethods[i];
+		if (pM != NULL && !METHOD_ISSTATIC(pM) && pM->numberOfParameters == 1 && strcmp((const char*)pM->name, ".ctor") == 0) {
+			HEAP_PTR mb = Heap_AllocType(types[TYPE_SYSTEM_REFLECTION_METHODBASE]);
+			*(HEAP_PTR*)pReturnValue = mb;     // (held by the return value before the next allocation, so it is not GCed)
+			((tMethodBase*)mb)->methodDef = pM;
+			((tMethodBase*)mb)->ownerType = Type_GetTypeObject(pTypeDef);
+			((tMethodBase*)mb)->name = SystemString_FromCharPtrASCII(pM->name);
+			break;
+		}
+	}
 	return NULL;
 }
