@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Run DotNetAnywhere tests. Requires a prior `python build.py`."""
-import glob, os, subprocess, sys
+import glob, os, shutil, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build")
@@ -134,10 +134,13 @@ WASM_LIBM_EXTRA = {"MathF.Sin", "MathF.Cos", "MathF.Acos", "MathF.Cosh", "Math.S
 def dotnet_programs():
     """Compile tests/dotnet/*.cs against corlib.dll and run them on the runtime under test (build/dna32 or build/dna)."""
     import shutil
+    sys.path.insert(0, ROOT)
+    from build import csharp_compiler
     dna = DNA_BIN
-    if not shutil.which("mcs") or not os.path.exists(dna) \
+    csc = csharp_compiler()
+    if not csc or not os.path.exists(dna) \
             or not os.path.exists(os.path.join(BUILD, "corlib.dll")):
-        print("  SKIP (needs: mcs, %s and build/corlib.dll)" % os.path.basename(DNA_BIN))
+        print("  SKIP (needs: mcs or a .NET SDK, %s and build/corlib.dll)" % os.path.basename(DNA_BIN))
         return True
     expected = {"GcStress": "live nodes: 5000\nchecksum: 91323100"}
     # Programs whose expectations must also hold on the reference runtime. Run under Mono
@@ -157,7 +160,7 @@ def dotnet_programs():
             continue        # needs the runtime built with an FFI manifest and the C library: ffi_calls() below
         dna_only_cs = name.endswith(".dnaonly")   # self-checking; the reference runtime cannot run it
         exe = os.path.join(out, name + ".exe")
-        r = subprocess.run(["mcs", "-nostdlib", "-unsafe", "-r:" + os.path.join(out, "corlib.dll"),
+        r = subprocess.run(csc + ["-nostdlib", "-unsafe", "-r:" + os.path.join(out, "corlib.dll"),
                             "-nowarn:0219", "-out:" + exe, cs], capture_output=True, text=True)
         if r.returncode:
             print("  compile failed:", name, r.stdout + r.stderr); ok = False; continue
@@ -288,6 +291,9 @@ def stencil_coverage():
     answer, only slower, so no comparison with Mono can notice: (it is how every ldelem.r4 went unrecognised for a while, because
     its handler's address was not the one that was compared). Counted with DNA_STENCIL_STATS=1."""
     import re
+    if not shutil.which("mcs"):
+        print("  SKIP (the counts assume the IL mcs emits; these programs were compiled by Roslyn)")
+        return True
     if os.path.basename(DNA_BIN) != "dna" or os.environ.get("DNA_NO_STENCILS") or os.environ.get("DNA_NO_FUSION") or os.environ.get("DNA_NO_INLINE") \
             or os.environ.get("DNA_NO_VSTACK"):
         print("  SKIP (native blocks are only used by build/dna, and not with DNA_NO_STENCILS / DNA_NO_FUSION / DNA_NO_VSTACK; some stencils exist only for inlining, DNA_NO_INLINE)")
@@ -340,6 +346,9 @@ def inlining_happens():
     call that is not is only slower. So count them (DNA_STENCIL_STATS=1 prints how many calls were put into blocks), and check that
     DNA_NO_INLINE=1 turns it off."""
     import re
+    if not shutil.which("mcs"):
+        print("  SKIP (the counts assume the IL mcs emits; these programs were compiled by Roslyn)")
+        return True
     if os.path.basename(DNA_BIN) != "dna" or os.environ.get("DNA_NO_STENCILS") or os.environ.get("DNA_NO_FUSION") or os.environ.get("DNA_NO_INLINE"):
         print("  SKIP (native blocks are only used by build/dna, and not with DNA_NO_STENCILS / DNA_NO_FUSION / DNA_NO_INLINE)")
         return True
@@ -373,6 +382,9 @@ def islands_happen():
     """StencilIslands compares equal with and without islands, which says nothing about whether any instruction was run as an island (one
     that is not is only slower), so count them with DNA_STENCIL_STATS=1 and check that DNA_NO_ISLANDS=1 turns them off."""
     import re
+    if not shutil.which("mcs"):
+        print("  SKIP (the counts assume the IL mcs emits; these programs were compiled by Roslyn)")
+        return True
     if os.path.basename(DNA_BIN) != "dna" or os.environ.get("DNA_NO_STENCILS") or os.environ.get("DNA_NO_FUSION") or os.environ.get("DNA_NO_ISLANDS"):
         print("  SKIP (native blocks are only used by build/dna, and not with DNA_NO_STENCILS / DNA_NO_FUSION / DNA_NO_ISLANDS)")
         return True

@@ -60,11 +60,31 @@ def compile_one(cc, cflags, name):
     return name, cmd, r
 
 
+def csharp_compiler():
+    """The command that compiles corlib: mcs, else the Roslyn csc inside the newest .NET SDK (`dotnet csc.dll -noconfig`), else None."""
+    mcs = shutil.which("mcs")
+    if mcs:
+        return [mcs]
+    dotnet = shutil.which("dotnet")
+    if not dotnet:
+        return None
+    try:
+        sdks = subprocess.run([dotnet, "--list-sdks"], capture_output=True, text=True).stdout.split("\n")
+    except OSError:
+        return None
+    for line in reversed([l for l in sdks if l.strip()]):
+        version, _, base = line.partition(" [")
+        csc = os.path.join(base.rstrip("]"), version.strip(), "Roslyn", "bincore", "csc.dll")
+        if os.path.isfile(csc):
+            return [dotnet, csc, "-noconfig"]
+    return None
+
+
 def build_corlib():
     """corlib/*.cs -> build/corlib.dll. DNA loads its runtime library by this name."""
-    mcs = shutil.which("mcs")
+    mcs = csharp_compiler()
     if not mcs:
-        print("error: mcs not found (apt install mono-mcs)", file=sys.stderr)
+        print("error: no C# compiler for corlib: neither mcs (apt install mono-mcs) nor a .NET SDK", file=sys.stderr)
         return 1
     srcs = sorted(os.path.join(dp, f) for dp, _, fs in os.walk(os.path.join(ROOT, "corlib"))
                   for f in fs if f.endswith(".cs") and "/obj/" not in dp and "/bin/" not in dp)
@@ -73,7 +93,7 @@ def build_corlib():
         print("build/corlib.dll is up to date")
         return 0
     os.makedirs(BUILD, exist_ok=True)
-    r = subprocess.run([mcs, "-nostdlib", "-unsafe", "-target:library", "-nowarn:0219,0414,0649",
+    r = subprocess.run(mcs + ["-nostdlib", "-unsafe", "-target:library", "-nowarn:0219,0414,0649",
                         "-out:" + out] + srcs, capture_output=True, text=True)
     if r.returncode:
         print(r.stdout + r.stderr)
@@ -215,7 +235,7 @@ def main():
             os.remove(hdr)
         ffi_extra = list(manifest.get("cflags", [])) + sum([["-I", os.path.dirname(p)] for p in ffi_files], [])
         FFI_INPUTS[:] = [os.path.abspath(args.ffi)] + ffi_files
-    cflags = ["-std=gnu99", "-Wno-pointer-sign", "-Wno-unused-result",
+    cflags = ["-std=gnu11", "-Wno-pointer-sign", "-Wno-unused-result",
               "-fno-strict-aliasing", "-I", SRC]
     if args.ffi and os.path.exists(os.path.join(GEN, "Stencils.gen.h")):
         # the FFI build's Stencils.gen.h, with the stencils that call C functions as well. (-I would not do: a quoted include looks in the
@@ -307,7 +327,7 @@ def main():
         if args.wasm:
             print("(for a program built with --wasm: link it with %s and these flags: -Wl,-z,stack-size=1048576 -Wl,--export-table -Wl,--growable-table -fuse-ld=lld)"
                   % os.path.relpath(lib, ROOT))
-        if args.corlib or (not args.no_corlib and shutil.which("mcs")):
+        if args.corlib or (not args.no_corlib and csharp_compiler()):
             return build_corlib()
         return 0
     out = os.path.join(BUILD, ("dna_ffi" if args.ffi else "dna") + ("32" if args.m32 else "") + (".wasm" if args.wasm else ""))
@@ -335,12 +355,12 @@ def main():
             f.write('#!/bin/sh\nexec node --no-warnings "%s" "%s" "$@"\n' % (os.path.join(ROOT, "tools", "run_wasm.mjs"), out))
         os.chmod(launcher, 0o755)
         print("built", os.path.relpath(launcher, ROOT))
-    if args.corlib or (not args.no_corlib and shutil.which("mcs")):
+    if args.corlib or (not args.no_corlib and csharp_compiler()):
         rc = build_corlib()
         if rc:
             return rc
     elif not args.no_corlib:
-        print("note: mcs not found, so build/corlib.dll was not built (apt install mono-mcs); "
+        print("note: no C# compiler (mcs or a .NET SDK), so build/corlib.dll was not built (apt install mono-mcs); "
               "the runtime needs it to run anything")
 
     if args.run is not None:
