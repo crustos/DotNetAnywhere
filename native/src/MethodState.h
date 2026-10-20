@@ -117,6 +117,8 @@ struct tMethodState_ {
 
 //void MethodState_Init();
 tMethodState* MethodState_Direct(tThread *pThread, tMD_MethodDef *pMethod, tMethodState *pCaller, U32 isInternalNewObjCall);
+void MethodState_DumpStack(tMethodState *pState, tMD_MethodDef *pCalling);
+void MethodState_RecordStackTrace(HEAP_PTR exception, tMethodState *pState);
 tMethodState* MethodState(tThread *pThread, tMetaData *pMetaData, IDX_TABLE methodToken, tMethodState *pCaller);
 void MethodState_Delete(tThread *pThread, tMethodState **ppMethodState);
 

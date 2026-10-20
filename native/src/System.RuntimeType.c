@@ -53,8 +53,11 @@ tAsyncCall* System_RuntimeType_get_Name(PTR pThis_, PTR pParams, PTR pReturnValu
 tAsyncCall* System_RuntimeType_get_Namespace(PTR pThis_, PTR pParams, PTR pReturnValue) {
 	tRuntimeType *pRuntimeType = (tRuntimeType*)pThis_;
 	HEAP_PTR strResult;
+	tMD_TypeDef *pOuter = pRuntimeType->pTypeDef;
 
-	strResult = SystemString_FromCharPtrASCII(pRuntimeType->pTypeDef->nameSpace);
+	// a nested type's metadata namespace is empty; .NET reports the outermost type's
+	while (pOuter->pNestedIn != NULL) pOuter = pOuter->pNestedIn;
+	strResult = SystemString_FromCharPtrASCII(pOuter->nameSpace);
 	*(HEAP_PTR*)pReturnValue = strResult;
 
 	return NULL;

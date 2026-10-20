@@ -223,7 +223,7 @@ namespace System.Linq {
 
 		#region Cast
 
-		public static IEnumerable<T> Cast<T>(IEnumerable source) {
+		public static IEnumerable<T> Cast<T>(this IEnumerable source) {
 			Check(source);
 			return CastIterator<T>(source);
 		}

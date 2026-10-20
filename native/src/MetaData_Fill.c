@@ -26,6 +26,9 @@
 #include "Type.h"
 #include "EvalStack.h"
 
+static U32 fillDepth;
+static void Fill_NotePendingType(tMD_TypeDef *pTypeDef);
+
 void MetaData_Fill_FieldDef(tMD_TypeDef *pParentType, tMD_FieldDef *pFieldDef, U32 memOffset, tMD_TypeDef **ppClassTypeArgs) {
 	U32 sigLength;
 	PTR sig;
@@ -36,12 +39,18 @@ void MetaData_Fill_FieldDef(tMD_TypeDef *pParentType, tMD_FieldDef *pFieldDef, U
 	sig = MetaData_GetBlob(pFieldDef->signature, &sigLength);
 
 	MetaData_DecodeSigEntry(&sig); // First entry always 0x06
+	// A field of a reference type takes a pointer, whatever its type holds, so that type is filled after the fills under way (filling it now could reach
+	// a type whose parent is being filled, and copy that parent's vtable before it exists: Component -> GameObject -> Transform : Component).
+	U8 elem = *(U8*)sig;
+	U8 byRef = elem == ELEMENT_TYPE_CLASS || elem == ELEMENT_TYPE_STRING || elem == ELEMENT_TYPE_OBJECT || elem == ELEMENT_TYPE_SZARRAY
+		|| (elem == ELEMENT_TYPE_GENERICINST && ((U8*)sig)[1] == ELEMENT_TYPE_CLASS);
 	pFieldDef->pType = Type_GetTypeFromSig(pFieldDef->pMetaData, &sig, ppClassTypeArgs, NULL);
 	if (pFieldDef->pType == NULL) {
 		// If the field is a core generic type definition, then we can't do anything more
 		return;
 	}
-	MetaData_Fill_TypeDef(pFieldDef->pType, NULL, NULL);
+	if (byRef && fillDepth > 0) Fill_NotePendingType(pFieldDef->pType);
+	else MetaData_Fill_TypeDef(pFieldDef->pType, NULL, NULL);
 	// A check for 0 is done so if a type has a field of it's own type it is handled correctly.
 	pFieldDef->memSize = (pFieldDef->pType->stackSize>0)?pFieldDef->pType->stackSize:sizeof(void*);
 	pFieldDef->memOffset = memOffset;
@@ -76,6 +85,53 @@ void MetaData_Fill_FieldDef(tMD_TypeDef *pParentType, tMD_FieldDef *pFieldDef, U
 				break;
 			}
 		}
+	}
+}
+
+// Methods whose parameters were laid out while one of their struct types was still being filled (its size 0 then), and how deep the fills
+// that are under way are nested.  When the outermost fill returns, every type it reached is complete and the parameters are measured again.
+static tMD_MethodDef **pendingParams = NULL;
+static U32 numPending = 0, capPending = 0;
+static U32 fillDepth;
+
+static void Fill_NotePending(tMD_MethodDef *pMethodDef) {
+	U32 i;
+	for (i = 0; i < numPending; i++) if (pendingParams[i] == pMethodDef) return;
+	if (numPending == capPending) {
+		capPending = capPending == 0 ? 16 : capPending * 2;
+		pendingParams = (tMD_MethodDef**)realloc(pendingParams, capPending * sizeof(tMD_MethodDef*));
+	}
+	pendingParams[numPending++] = pMethodDef;
+}
+
+static tMD_TypeDef **pendingTypes = NULL;
+static U32 numPendingTypes = 0, capPendingTypes = 0;
+
+static void Fill_NotePendingType(tMD_TypeDef *pTypeDef) {
+	if (pTypeDef->isFilled) return;
+	if (numPendingTypes == capPendingTypes) {
+		capPendingTypes = capPendingTypes == 0 ? 16 : capPendingTypes * 2;
+		pendingTypes = (tMD_TypeDef**)realloc(pendingTypes, capPendingTypes * sizeof(tMD_TypeDef*));
+	}
+	pendingTypes[numPendingTypes++] = pTypeDef;
+}
+
+static void Fill_ResolvePending(void) {
+	while (numPendingTypes > 0) {
+		tMD_TypeDef *pTypeDef = pendingTypes[--numPendingTypes];
+		MetaData_Fill_TypeDef(pTypeDef, NULL, NULL);
+	}
+	while (numPending > 0) {
+		tMD_MethodDef *pMethodDef = pendingParams[--numPending];
+		U32 i, totalSize = METHOD_ISSTATIC(pMethodDef) ? 0 : sizeof(void*);
+		for (i = METHOD_ISSTATIC(pMethodDef) ? 0 : 1; i < pMethodDef->numberOfParameters; i++) {
+			tMD_TypeDef *pTypeDef = pMethodDef->pParams[i].pTypeDef;
+			U32 size = pTypeDef == NULL ? 0 : ((pTypeDef->stackSize > 0 || pTypeDef->isValueType) ? pTypeDef->stackSize : sizeof(void*));
+			pMethodDef->pParams[i].offset = totalSize;
+			pMethodDef->pParams[i].size = size;
+			totalSize += size;
+		}
+		pMethodDef->parameterStackSize = totalSize;
 	}
 }
 
@@ -128,7 +184,14 @@ void MetaData_Fill_MethodDef(tMD_TypeDef *pParentType, tMD_MethodDef *pMethodDef
 		pTypeDef = Type_GetTypeFromSig(pMethodDef->pMetaData, &sig, ppClassTypeArgs, ppMethodTypeArgs);
 		//if (pTypeDef != NULL) {
 			MetaData_Fill_TypeDef(pTypeDef, NULL, NULL);
-			size = pTypeDef->stackSize;
+			// A class still being filled has no stack size yet -- a base class whose method takes one of its own subclasses (`set_device(Dev)` in
+			// `Ctl`, filled while Dev waits for its base) -- and the parameter was given size 0, so the argument was never passed. A reference
+			// is pointer-sized whatever it points to, as the field code above already assumes.
+			size = (pTypeDef->stackSize > 0 || pTypeDef->isValueType) ? pTypeDef->stackSize : sizeof(void*);
+			// A struct still being filled is no better known -- InputEventPtr, whose InputDevice field led back to the class whose methods are
+			// being laid out -- and its size cannot be guessed: the method is remembered, and its parameters measured again once the outermost
+			// fill is done (Fill_ResolvePending).
+			if (size == 0 && pTypeDef->isValueType) Fill_NotePending(pMethodDef);
 		//} else {
 		//	// If this method has generic-type-argument arguments, then we can't do anything very sensible yet
 		//	size = 0;
@@ -182,7 +245,15 @@ static tMD_MethodDef* FindVirtualOverriddenMethod(tMD_TypeDef *pTypeDef, tMD_Met
 	return NULL;
 }
 
+static void Fill_TypeDef(tMD_TypeDef *pTypeDef, tMD_TypeDef **ppClassTypeArgs, tMD_TypeDef **ppMethodTypeArgs);
+
 void MetaData_Fill_TypeDef_(tMD_TypeDef *pTypeDef, tMD_TypeDef **ppClassTypeArgs, tMD_TypeDef **ppMethodTypeArgs) {
+	fillDepth++;
+	Fill_TypeDef(pTypeDef, ppClassTypeArgs, ppMethodTypeArgs);
+	if (--fillDepth == 0) Fill_ResolvePending();
+}
+
+static void Fill_TypeDef(tMD_TypeDef *pTypeDef, tMD_TypeDef **ppClassTypeArgs, tMD_TypeDef **ppMethodTypeArgs) {
 	IDX_TABLE firstIdx, lastIdx, token;
 	U32 instanceMemSize, staticMemSize, virtualOfs, i, j, hasAligned8;
 	tMetaData *pMetaData;

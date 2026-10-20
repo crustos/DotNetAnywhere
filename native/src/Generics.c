@@ -118,7 +118,8 @@ tMD_TypeDef* Generics_GetGenericTypeFromCoreType(tMD_TypeDef *pCoreType, U32 num
 			strcat(name, ",");
 		}
 		if (ppTypeArgs[i] != NULL) {
-			sprintf(strchr(name, 0), "%s.%s", ppTypeArgs[i]->nameSpace, ppTypeArgs[i]->name);
+			if (ppTypeArgs[i]->nameSpace[0] == 0) sprintf(strchr(name, 0), "%s", ppTypeArgs[i]->name);   // (the global namespace: no ".")
+			else sprintf(strchr(name, 0), "%s.%s", ppTypeArgs[i]->nameSpace, ppTypeArgs[i]->name);
 		} else {
 			tMD_GenericParam *pGenericParam = FindGenericParam(pCoreType, i);
 			if (pGenericParam != NULL) {

@@ -71,14 +71,14 @@ namespace System {
 
 		#endregion
 
-		public virtual int Length {
+		public int Length {
 			get {
 				return this.length;
 			}
 		}
 
 		[IndexerName("Chars")]
-		extern virtual public char this[int index] {
+		extern public char this[int index] {
 			[MethodImpl(MethodImplOptions.InternalCall)]
 			get;
 		}
@@ -129,12 +129,65 @@ namespace System {
 			return ret.ToArray();
 		}
 
+		static bool IgnoresCase(StringComparison comparisonType) {
+			return comparisonType == StringComparison.CurrentCultureIgnoreCase || comparisonType == StringComparison.InvariantCultureIgnoreCase
+				|| comparisonType == StringComparison.OrdinalIgnoreCase;
+		}
+
+		public int IndexOf(string value, StringComparison comparisonType) { return IndexOf(value, 0, comparisonType); }
+
+		public int IndexOf(string value, int startIndex, StringComparison comparisonType) {
+			if (value == null) throw new ArgumentNullException("value");
+			return IgnoresCase(comparisonType) ? ToLowerInvariant().IndexOf(value.ToLowerInvariant(), startIndex) : IndexOf(value, startIndex);
+		}
+
+		public int LastIndexOf(string value) {
+			if (value == null) throw new ArgumentNullException("value");
+			for (int i = this.length - value.length; i >= 0; i--) {
+				int k = 0;
+				while (k < value.length && this[i + k] == value[k]) k++;
+				if (k == value.length) return i;
+			}
+			return -1;
+		}
+
+		public bool StartsWith(string value, StringComparison comparisonType) {
+			return IgnoresCase(comparisonType) ? ToLowerInvariant().StartsWith(value.ToLowerInvariant()) : StartsWith(value);
+		}
+
+		public bool EndsWith(string value, StringComparison comparisonType) {
+			return IgnoresCase(comparisonType) ? ToLowerInvariant().EndsWith(value.ToLowerInvariant()) : EndsWith(value);
+		}
+
+		public bool Equals(string value, StringComparison comparisonType) { return Equals(this, value, comparisonType); }
+
+		public static bool Equals(string a, string b, StringComparison comparisonType) {
+			if (a == null || b == null) return (object)a == (object)b;
+			return IgnoresCase(comparisonType) ? a.ToLowerInvariant() == b.ToLowerInvariant() : a == b;
+		}
+
+		public static int Compare(string strA, string strB, bool ignoreCase) {
+			return ignoreCase && strA != null && strB != null ? Compare(strA.ToLowerInvariant(), strB.ToLowerInvariant()) : Compare(strA, strB);
+		}
+
+		public static int Compare(string strA, string strB, StringComparison comparisonType) { return Compare(strA, strB, IgnoresCase(comparisonType)); }
+
+		public bool Contains(string value) { return IndexOf(value) >= 0; }
+
+		// (a value longer than the string is false, as in .NET: this was Substring, which threw)
 		public bool StartsWith(string str) {
-			return this.Substring(0, str.length) == str;
+			if (str == null) throw new ArgumentNullException("value");
+			if (str.length > this.length) return false;
+			for (int i = 0; i < str.length; i++) if (this[i] != str[i]) return false;
+			return true;
 		}
 
 		public bool EndsWith(string str) {
-			return this.Substring(this.length - str.length, str.length) == str;
+			if (str == null) throw new ArgumentNullException("value");
+			int at = this.length - str.length;
+			if (at < 0) return false;
+			for (int i = 0; i < str.length; i++) if (this[at + i] != str[i]) return false;
+			return true;
 		}
 
 		#endregion
@@ -496,6 +549,15 @@ namespace System {
 				return ToLowerInvariant();
 			}
 			return culture.TextInfo.ToLower(this);
+		}
+
+		public char[] ToCharArray() { return ToCharArray(0, this.length); }
+
+		public char[] ToCharArray(int startIndex, int length) {
+			if (startIndex < 0 || length < 0 || startIndex + length > this.length) throw new ArgumentOutOfRangeException();
+			char[] r = new char[length];
+			for (int i = 0; i < length; i++) r[i] = this[startIndex + i];
+			return r;
 		}
 
 		public string ToLowerInvariant() {

@@ -37,7 +37,7 @@ namespace System.IO {
 		}
 
 		public override bool Exists {
-			get { throw new Exception("The method or operation is not implemented."); }
+			get { return Directory.Exists(base.fullPath); }
 		}
 
 		public override string Name {
@@ -58,6 +58,13 @@ namespace System.IO {
 			foreach (string name in names) {
 				infos[i++] = new FileInfo(name);
 			}
+			return infos;
+		}
+
+		public DirectoryInfo[] GetDirectories() {
+			string[] names = Directory.GetDirectories(base.fullPath);
+			DirectoryInfo[] infos = new DirectoryInfo[names.Length];
+			for (int i = 0; i < names.Length; i++) infos[i] = new DirectoryInfo(names[i]);
 			return infos;
 		}
 

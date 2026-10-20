@@ -96,16 +96,17 @@ namespace System.Collections.Generic {
 			return this.dict.ContainsKey(item);
 		}
 
-		public void CopyTo(T[] array) {
-			throw new NotImplementedException();
-		}
+		public void CopyTo(T[] array) { CopyTo(array, 0, this.Count); }
 
-		public void CopyTo(T[] array, int arrayIndex) {
-			throw new NotImplementedException();
-		}
+		public void CopyTo(T[] array, int arrayIndex) { CopyTo(array, arrayIndex, this.Count); }
 
 		public void CopyTo(T[] array, int arrayIndex, int count) {
-			throw new NotImplementedException();
+			if (array == null) throw new ArgumentNullException("array");
+			if (arrayIndex < 0 || count < 0 || arrayIndex + Math.Min(count, this.Count) > array.Length) throw new ArgumentOutOfRangeException();
+			foreach (T item in this) {
+				if (count-- <= 0) break;
+				array[arrayIndex++] = item;
+			}
 		}
 
 		public Enumerator GetEnumerator() {
@@ -150,6 +151,59 @@ namespace System.Collections.Generic {
 		}
 
 		#endregion
+
+		// ---- the set operations (each by Contains / Add / Remove, so the set's comparer decides)
+
+		public void UnionWith(IEnumerable<T> other) { foreach (T item in other) Add(item); }
+
+		public void ExceptWith(IEnumerable<T> other) { foreach (T item in other) Remove(item); }
+
+		public void IntersectWith(IEnumerable<T> other) {
+			HashSet<T> keep = new HashSet<T>(other);
+			List<T> drop = new List<T>();
+			foreach (T item in this) if (!keep.Contains(item)) drop.Add(item);
+			foreach (T item in drop) Remove(item);
+		}
+
+		public void SymmetricExceptWith(IEnumerable<T> other) {
+			foreach (T item in new HashSet<T>(other)) if (!Remove(item)) Add(item);
+		}
+
+		public bool Overlaps(IEnumerable<T> other) {
+			foreach (T item in other) if (Contains(item)) return true;
+			return false;
+		}
+
+		public bool IsSubsetOf(IEnumerable<T> other) {
+			HashSet<T> o = new HashSet<T>(other);
+			foreach (T item in this) if (!o.Contains(item)) return false;
+			return true;
+		}
+
+		public bool IsSupersetOf(IEnumerable<T> other) {
+			foreach (T item in other) if (!Contains(item)) return false;
+			return true;
+		}
+
+		public bool SetEquals(IEnumerable<T> other) {
+			HashSet<T> o = new HashSet<T>(other);
+			return o.Count == Count && IsSupersetOf(o);
+		}
+
+		public int RemoveWhere(Predicate<T> match) {
+			List<T> drop = new List<T>();
+			foreach (T item in this) if (match(item)) drop.Add(item);
+			foreach (T item in drop) Remove(item);
+			return drop.Count;
+		}
+
+		public bool TryGetValue(T equalValue, out T actualValue) {
+			foreach (T item in this) {
+				if (EqualityComparer<T>.Default.Equals(item, equalValue)) { actualValue = item; return true; }
+			}
+			actualValue = default(T);
+			return false;
+		}
 	}
 
 }

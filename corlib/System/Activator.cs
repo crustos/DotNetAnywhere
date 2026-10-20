@@ -25,9 +25,32 @@ using System.Text;
 
 namespace System {
 
+	public class MissingMethodException : SystemException {
+		public MissingMethodException() : base("Attempted to access a missing method.") { }
+		public MissingMethodException(string message) : base(message) { }
+	}
+
 	public static class Activator {
         [MethodImpl(MethodImplOptions.InternalCall)]
-        public extern static object CreateInstance(Type type);
+        extern static object Allocate(Type type);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        extern static System.Reflection.MethodBase DefaultConstructor(Type type);
+
+        /// <summary>A new instance with its parameterless constructor run (field initialisers included); a value type without one comes back zeroed.</summary>
+        public static object CreateInstance(Type type) {
+            if (type == null) throw new ArgumentNullException("type");
+            object o = Allocate(type);
+            System.Reflection.MethodBase ctor = DefaultConstructor(type);
+            if (ctor != null) ctor.Invoke(o, new object[0]);
+            else if (!type.IsValueType) throw new MissingMethodException("No parameterless constructor defined for type '" + type.FullName + "'.");
+            return o;
+        }
+
+        // `new T()` in a generic method compiles to this
+        public static T CreateInstance<T>() {
+            return (T)CreateInstance(typeof(T));
+        }
 	}
 
 }

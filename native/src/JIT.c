@@ -754,7 +754,7 @@ static tBlockRecipe* InlineRecipeFor(tMD_MethodDef *m, int isCallvirt, tMD_Metho
 	const char *why = "inlined";
 	tBlockRecipe *r = InlineRecipeFor1(m, isCallvirt, caller, allowIslands, &why);
 	if (getenv("DNA_FUSION_DEBUG") != NULL && m != NULL) {
-		fprintf(stderr, "  call to %s.%s: %s\n", m->pParentType != NULL ? m->pParentType->name : "?", m->name, r != NULL ? "INLINED" : why);
+		fprintf(stderr, "  call to %s.%s: %s\n", m->pParentType != NULL ? (char*)m->pParentType->name : "?", m->name, r != NULL ? "INLINED" : why);
 	}
 	return r;
 }
@@ -2815,6 +2815,9 @@ conv2:
 					// Get the FieldRef or FieldDef of the field to store
 					u32Value = GetUnalignedU32(pCIL, &cilOfs);
 					pFieldDef = MetaData_GetFieldDefFromDefOrRef(pMethodDef->pMetaData, u32Value, pMethodDef->pParentType->ppClassTypeArgs, pMethodDef->ppMethodTypeArgs);
+					// The field's type has its offset only once filled -- and a method compiled ahead to be inlined can store into an object
+					// whose type nothing has created yet (as CIL_LDFLDA already allows for)
+					MetaData_Fill_TypeDef(MetaData_GetTypeDefFromFieldDef(pFieldDef), NULL, NULL);
 					PushPTR(pFieldDef);
 					// Pop the object/valuetype on which to store the field. Don't care what it is
 					PopStackTypeDontCare();
@@ -2828,6 +2831,8 @@ conv2:
 					// Get the FieldRef or FieldDef of the field to load
 					u32Value = GetUnalignedU32(pCIL, &cilOfs);
 					pFieldDef = MetaData_GetFieldDefFromDefOrRef(pMethodDef->pMetaData, u32Value, pMethodDef->pParentType->ppClassTypeArgs, pMethodDef->ppMethodTypeArgs);
+					// (filled first, as for CIL_STFLD: its offset and type are known only then)
+					MetaData_Fill_TypeDef(MetaData_GetTypeDefFromFieldDef(pFieldDef), NULL, NULL);
 					// Pop the object/valuetype on which to load the field.
 					pStackType = PopStackType();
 					if (pStackType->stackType == EVALSTACK_VALUETYPE) {

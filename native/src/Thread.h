@@ -29,7 +29,11 @@ typedef struct tThreadStack_ tThreadStack;
 #include "Heap.h"
 #include "Types.h"
 
-#define THREADSTACK_CHUNK_SIZE 10000
+// A thread's managed stack: frames, their evaluation stacks, parameters and locals.  1 MiB, as .NET's default (10000 bytes, as it was, did not hold
+// one method with a few thousand locals, such as a scene built as code); a small target can build with -DTHREADSTACK_CHUNK_SIZE=...
+#ifndef THREADSTACK_CHUNK_SIZE
+#define THREADSTACK_CHUNK_SIZE (1 << 20)
+#endif
 
 struct tThreadStack_ {
 	// This chunk of stack memory

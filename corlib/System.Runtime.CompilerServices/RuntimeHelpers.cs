@@ -28,6 +28,9 @@ namespace System.Runtime.CompilerServices {
 		[MethodImplAttribute(MethodImplOptions.InternalCall)]
 		extern public static void InitializeArray(Array array, RuntimeFieldHandle fldHandle);
 
+		/// <summary>A zeroed instance; no constructor runs.</summary>
+		public static object GetUninitializedObject(Type type) { return System.Runtime.Serialization.FormatterServices.GetUninitializedObject(type); }
+
 	}
 }
 #endif

@@ -44,18 +44,33 @@ namespace System {
 			get;
 		}
 
-		extern public override string Namespace {
-			[MethodImpl(MethodImplOptions.InternalCall)]
-			get;
+		[MethodImpl(MethodImplOptions.InternalCall)]
+		extern private string Internal_GetNamespace();
+
+		[MethodImpl(MethodImplOptions.InternalCall)]
+		extern private string Internal_GetName();
+
+		// An array is named after its element, as in .NET (`Int32[]`, `System.Int32[]`): every array type used to be `System.Array`, and so equal to
+		// every other one (Type == compares full names).  A generic instance's Name leaves out its arguments (`List`1`); FullName has them.
+		public override string Namespace {
+			get { Type e = GetElementType(); return e != null ? e.Namespace : Internal_GetNamespace(); }
 		}
 
-		extern public override string Name {
-			[MethodImpl(MethodImplOptions.InternalCall)]
-			get;
+		public override string Name {
+			get {
+				Type e = GetElementType();
+				if (e != null) return e.Name + "[]";
+				string n = Internal_GetName();
+				int tick = n.IndexOf('`');
+				int open = tick < 0 ? -1 : n.IndexOf('[', tick);
+				return open < 0 ? n : n.Substring(0, open);
+			}
 		}
 
 		public override string FullName {
 			get {
+				Type e = GetElementType();
+				if (e != null) return e.FullName + "[]";
 				StringBuilder ret = new StringBuilder(32);
 				// A type in the global namespace has no "namespace." prefix (this used to give ".Name")
 				string ns = this.Namespace;
@@ -77,7 +92,7 @@ namespace System {
 						ret.Append('+');
 					}
 				}
-				ret.Append(this.Name);
+				ret.Append(Internal_GetName());
 				return ret.ToString();
 			}
 		}

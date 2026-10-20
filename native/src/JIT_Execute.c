@@ -1598,7 +1598,7 @@ JIT_INVOKE_SYSTEM_REFLECTION_METHODBASE_start:
 			U32 invocationParamsArrayLength = SystemArray_GetLength(invocationParamsArray);
 			PTR invocationParamsArrayElements = SystemArray_GetElements(invocationParamsArray);
 			for (U32 paramIndex = 0; paramIndex < invocationParamsArrayLength; paramIndex++) {
-				HEAP_PTR currentParam = (HEAP_PTR)(((U32*)(invocationParamsArrayElements))[paramIndex]);
+				HEAP_PTR currentParam = ((HEAP_PTR*)(invocationParamsArrayElements))[paramIndex];   // (the elements are pointers: a U32 read cut them on 64-bit)
 				if (currentParam == NULL) {
 					PUSH_O(NULL);
 				} else {
@@ -1660,7 +1660,7 @@ JIT_BOX_CALLVIRT_start:
 	PTR fblock_ = fs_->memory + fs_->ofs; \
 	tMethodState *fnew_ = (tMethodState*)fblock_; \
 	fs_->ofs += (U32)sizeof(tMethodState) + fms_ + fpsz_ + fls_; \
-	if (fs_->ofs > THREADSTACK_CHUNK_SIZE) { Crash("Thread-local stack is too large"); } \
+	if (fs_->ofs > THREADSTACK_CHUNK_SIZE) { MethodState_DumpStack(pCurrentMethodState, fm_); Crash("Thread-local stack is too large"); } \
 	fnew_->pEvalStack = fblock_ + sizeof(tMethodState); \
 	fnew_->pParamsLocals = fnew_->pEvalStack + fms_; \
 	if (fls_ != 0) { SmallZero(fnew_->pParamsLocals + fpsz_, fls_); } \
@@ -4433,6 +4433,7 @@ throwHeapPtr:
 		pThread->pCurrentExceptionObject = heapPtr;
 	}
 	SAVE_METHOD_STATE();
+	MethodState_RecordStackTrace(pThread->pCurrentExceptionObject, pCurrentMethodState);   // (a rethrow keeps the trace it has)
 	// A new search starts in the frame that threw. If a filter is running, the exception is one
 	// thrown from inside it, and nothing outside that filter's own call chain may handle it.
 	pThread->pThrowTopState = pCurrentMethodState;
@@ -4508,6 +4509,7 @@ searchHandlers:
 			pFrame = pFrame->pCaller;
 			startClause = 0;
 			if (pFrame == NULL) {
+				MethodState_DumpStack(pCurrentMethodState, NULL);
 				Crash("Unhandled exception in %s.%s(): %s.%s",
 					pCurrentMethodState->pMethod->pParentType->name,
 					pCurrentMethodState->pMethod->name, pExType->nameSpace, pExType->name);
