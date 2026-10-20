@@ -39,6 +39,7 @@ tAsyncCall* System_String_InternalIndexOfAny(PTR pThis_, PTR pParams, PTR pRetur
 HEAP_PTR SystemString_FromUserStrings(tMetaData *pMetaData, IDX_USERSTRINGS index);
 HEAP_PTR SystemString_FromCharPtrASCII(U8 *pStr);
 HEAP_PTR SystemString_FromCharPtrUTF16(U16 *pStr);
+HEAP_PTR SystemString_FromUTF16(void *pChars, U32 len);
 STRING2 SystemString_GetString(HEAP_PTR pThis_, U32 *pLength);
 U32 SystemString_GetNumBytes(HEAP_PTR pThis_);
 

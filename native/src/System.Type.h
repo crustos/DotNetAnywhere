@@ -29,6 +29,18 @@ tAsyncCall* System_Type_get_IsValueType(PTR pThis_, PTR pParams, PTR pReturnValu
 tAsyncCall* System_Type_GetTypeFromName(PTR pThis_, PTR pParams, PTR pReturnValue);
 tAsyncCall* System_Type_EnsureAssemblyLoaded(PTR pThis_, PTR pParams, PTR pReturnValue);
 tAsyncCall* System_Type_GetProperties(PTR pThis_, PTR pParams, PTR pReturnValue);
+tAsyncCall* System_Type_Internal_GetFields(PTR pThis_, PTR pParams, PTR pReturnValue);
+tAsyncCall* System_Type_Internal_GetNestedType(PTR pThis_, PTR pParams, PTR pReturnValue);
+tAsyncCall* System_Type_Internal_FieldName(PTR pThis_, PTR pParams, PTR pReturnValue);
+tAsyncCall* System_Type_Internal_FieldType(PTR pThis_, PTR pParams, PTR pReturnValue);
+tAsyncCall* System_Type_Internal_FieldFlags(PTR pThis_, PTR pParams, PTR pReturnValue);
+tAsyncCall* System_Type_Internal_GetFieldValue(PTR pThis_, PTR pParams, PTR pReturnValue);
+tAsyncCall* System_Type_Internal_SetFieldValue(PTR pThis_, PTR pParams, PTR pReturnValue);
+tAsyncCall* System_Type_Internal_NewObject(PTR pThis_, PTR pParams, PTR pReturnValue);
+tAsyncCall* System_Type_Internal_TakeTypeInitializer(PTR pThis_, PTR pParams, PTR pReturnValue);
+tAsyncCall* System_Type_Internal_GetMethods(PTR pThis_, PTR pParams, PTR pReturnValue);
+tAsyncCall* System_Type_Internal_TypeFlags(PTR pThis_, PTR pParams, PTR pReturnValue);
+tAsyncCall* System_Type_Internal_FieldHasAttribute(PTR pThis_, PTR pParams, PTR pReturnValue);
 tAsyncCall* System_Type_GetMethod(PTR pThis_, PTR pParams, PTR pReturnValue);
 
 #endif

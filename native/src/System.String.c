@@ -375,6 +375,13 @@ HEAP_PTR SystemString_FromCharPtrASCII(U8 *pStr) {
 	return (HEAP_PTR)pSystemString;
 }
 
+// len chars of UTF-16, which need not be aligned or terminated (a constant's blob)
+HEAP_PTR SystemString_FromUTF16(void *pChars, U32 len) {
+	tSystemString *pSystemString = CreateStringHeapObj(len);
+	memcpy(pSystemString->chars, pChars, len << 1);
+	return (HEAP_PTR)pSystemString;
+}
+
 HEAP_PTR SystemString_FromCharPtrUTF16(U16 *pStr) {
 	tSystemString *pSystemString;
 	int strLen = 0;

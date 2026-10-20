@@ -1598,7 +1598,7 @@ JIT_INVOKE_SYSTEM_REFLECTION_METHODBASE_start:
 			U32 invocationParamsArrayLength = SystemArray_GetLength(invocationParamsArray);
 			PTR invocationParamsArrayElements = SystemArray_GetElements(invocationParamsArray);
 			for (U32 paramIndex = 0; paramIndex < invocationParamsArrayLength; paramIndex++) {
-				HEAP_PTR currentParam = (HEAP_PTR)(((U32*)(invocationParamsArrayElements))[paramIndex]);
+				HEAP_PTR currentParam = ((HEAP_PTR*)(invocationParamsArrayElements))[paramIndex];   // (the elements are pointers: a U32 read cut them on 64-bit)
 				if (currentParam == NULL) {
 					PUSH_O(NULL);
 				} else {
