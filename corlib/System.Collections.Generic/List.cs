@@ -184,10 +184,95 @@ namespace System.Collections.Generic {
 			}
 		}
 
+		public void AddRange(IEnumerable<T> collection) {
+			this.InsertRange(this.size, collection);
+		}
+
+		public void RemoveRange(int index, int count) {
+			if (index < 0 || count < 0 || index + count > this.size) {
+				throw new ArgumentOutOfRangeException(index < 0 ? "index" : "count");
+			}
+			this.Shift(index, -count);
+		}
+
 		public T[] ToArray() {
 			T[] array = new T[this.size];
 			Array.Copy(this.items, array, this.size);
 			return array;
+		}
+
+		public void Sort() { Sort(0, this.size, null); }
+		public void Sort(IComparer<T> comparer) { Sort(0, this.size, comparer); }
+		public void Sort(int index, int count, IComparer<T> comparer) {
+			if (index < 0 || count < 0 || index + count > this.size) throw new ArgumentOutOfRangeException();
+			Array.Sort(this.items, index, count, comparer);
+		}
+		public void Sort(Comparison<T> comparison) {
+			if (comparison == null) throw new ArgumentNullException("comparison");
+			Array.MergeSort(this.items, 0, this.size, comparison);
+		}
+
+		public void Reverse() { Reverse(0, this.size); }
+		public void Reverse(int index, int count) {
+			if (index < 0 || count < 0 || index + count > this.size) throw new ArgumentOutOfRangeException();
+			for (int i = index, j = index + count - 1; i < j; i++, j--) { T t = this.items[i]; this.items[i] = this.items[j]; this.items[j] = t; }
+		}
+
+		public T Find(Predicate<T> match) {
+			for (int i = 0; i < this.size; i++) if (match(this.items[i])) return this.items[i];
+			return default(T);
+		}
+		public T FindLast(Predicate<T> match) {
+			for (int i = this.size - 1; i >= 0; i--) if (match(this.items[i])) return this.items[i];
+			return default(T);
+		}
+		public List<T> FindAll(Predicate<T> match) {
+			List<T> r = new List<T>();
+			for (int i = 0; i < this.size; i++) if (match(this.items[i])) r.Add(this.items[i]);
+			return r;
+		}
+		public int FindIndex(Predicate<T> match) { return FindIndex(0, this.size, match); }
+		public int FindIndex(int startIndex, Predicate<T> match) { return FindIndex(startIndex, this.size - startIndex, match); }
+		public int FindIndex(int startIndex, int count, Predicate<T> match) {
+			if (startIndex < 0 || count < 0 || startIndex + count > this.size) throw new ArgumentOutOfRangeException();
+			for (int i = startIndex; i < startIndex + count; i++) if (match(this.items[i])) return i;
+			return -1;
+		}
+		public int FindLastIndex(Predicate<T> match) {
+			for (int i = this.size - 1; i >= 0; i--) if (match(this.items[i])) return i;
+			return -1;
+		}
+		public bool Exists(Predicate<T> match) { return FindIndex(match) >= 0; }
+		public bool TrueForAll(Predicate<T> match) {
+			for (int i = 0; i < this.size; i++) if (!match(this.items[i])) return false;
+			return true;
+		}
+		public int RemoveAll(Predicate<T> match) {
+			int k = 0;
+			for (int i = 0; i < this.size; i++) if (!match(this.items[i])) this.items[k++] = this.items[i];
+			int removed = this.size - k;
+			for (int i = k; i < this.size; i++) this.items[i] = default(T);
+			this.size = k;
+			return removed;
+		}
+		public void ForEach(Action<T> action) {
+			for (int i = 0; i < this.size; i++) action(this.items[i]);
+		}
+		public List<T> GetRange(int index, int count) {
+			if (index < 0 || count < 0 || index + count > this.size) throw new ArgumentOutOfRangeException();
+			List<T> r = new List<T>(count);
+			for (int i = index; i < index + count; i++) r.Add(this.items[i]);
+			return r;
+		}
+		public List<TOutput> ConvertAll<TOutput>(Converter<T, TOutput> converter) {
+			List<TOutput> r = new List<TOutput>(this.size);
+			for (int i = 0; i < this.size; i++) r.Add(converter(this.items[i]));
+			return r;
+		}
+		public int LastIndexOf(T item) {
+			EqualityComparer<T> eq = EqualityComparer<T>.Default;
+			for (int i = this.size - 1; i >= 0; i--) if (eq.Equals(this.items[i], item)) return i;
+			return -1;
 		}
 
 		#region Interface Members
@@ -225,6 +310,8 @@ namespace System.Collections.Generic {
 		public bool Contains(T item) {
 			return Array.IndexOf(this.items, item) >= 0;
 		}
+
+		public void CopyTo(T[] array) { CopyTo(array, 0); }
 
 		public void CopyTo(T[] array, int arrayIndex) {
 			Array.Copy(this.items, 0, (Array)array, arrayIndex, this.size);

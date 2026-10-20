@@ -267,6 +267,35 @@ namespace System {
 			Copy(srcArray, 0, dstArray, 0, length);
 		}
 
+		/// <summary>A stable merge sort of array[index .. index + length) (.NET's sort is not stable, so equal elements may come out in another order).</summary>
+		internal static void MergeSort<T>(T[] array, int index, int length, Comparison<T> comparison) {
+			if (length < 2) return;
+			T[] tmp = new T[length];
+			for (int width = 1; width < length; width *= 2) {
+				for (int lo = 0; lo < length; lo += 2 * width) {
+					int mid = Math.Min(lo + width, length), hi = Math.Min(lo + 2 * width, length), a = lo, b = mid, k = lo;
+					while (a < mid && b < hi) tmp[k++] = comparison(array[index + b], array[index + a]) < 0 ? array[index + b++] : array[index + a++];
+					while (a < mid) tmp[k++] = array[index + a++];
+					while (b < hi) tmp[k++] = array[index + b++];
+				}
+				for (int i = 0; i < length; i++) array[index + i] = tmp[i];
+			}
+		}
+
+		public static void Sort<T>(T[] array) { Sort(array, 0, array.Length, (IComparer<T>)null); }
+		public static void Sort<T>(T[] array, IComparer<T> comparer) { Sort(array, 0, array.Length, comparer); }
+		public static void Sort<T>(T[] array, int index, int length, IComparer<T> comparer) {
+			if (array == null) throw new ArgumentNullException("array");
+			if (index < 0 || length < 0 || index + length > array.Length) throw new ArgumentOutOfRangeException();
+			IComparer<T> c = comparer ?? Comparer<T>.Default;
+			MergeSort(array, index, length, c.Compare);
+		}
+		public static void Sort<T>(T[] array, Comparison<T> comparison) {
+			if (array == null) throw new ArgumentNullException("array");
+			if (comparison == null) throw new ArgumentNullException("comparison");
+			MergeSort(array, 0, array.Length, comparison);
+		}
+
 		public static int IndexOf<T>(T[] array, T value) {
 			return IndexOf((Array)array, (object)value);
 		}

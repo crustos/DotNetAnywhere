@@ -5,7 +5,13 @@ using System.Collections.Generic;
 using System.IO;
 
 namespace System.Globalization {
-	public class CultureInfo {
+	public class CultureInfo : IFormatProvider {
+
+		public virtual object GetFormat(Type formatType) {
+			if (formatType == typeof(NumberFormatInfo)) return NumberFormat;
+			if (formatType == typeof(DateTimeFormatInfo)) return DateTimeFormat;
+			return null;
+		}
 
 		#region Static methods
 
