@@ -24,6 +24,7 @@
 #include "Thread.h"
 #include "MethodState.h"
 #include "JIT.h"
+#include "System.String.h"
 
 #ifdef GEN_COMBINED_OPCODES
 
@@ -136,7 +137,9 @@ tMethodState* MethodState_Direct(tThread *pThread, tMD_MethodDef *pMethod, tMeth
 		// allocated in one step (they were three allocations, each a function call; the layout is the same).
 		tJITted *pJITted = pMethod->pJITted;
 		U32 paramsLocalsSize = pMethod->parameterStackSize + pJITted->localsStackSize;
-		PTR pBlock = (PTR)Thread_StackAlloc(pThread, sizeof(tMethodState) + pJITted->maxStack + paramsLocalsSize);
+		U32 frameSize = sizeof(tMethodState) + pJITted->maxStack + paramsLocalsSize;
+		if (pThread->pThreadStack->ofs + frameSize > THREADSTACK_CHUNK_SIZE) MethodState_DumpStack(pCaller, pMethod);
+		PTR pBlock = (PTR)Thread_StackAlloc(pThread, frameSize);
 		pThis = (tMethodState*)pBlock;
 		pThis->pEvalStack = pBlock + sizeof(tMethodState);
 		pThis->pParamsLocals = pThis->pEvalStack + pJITted->maxStack;
@@ -244,4 +247,55 @@ void MethodState_Delete(tThread *pThread, tMethodState **ppMethodState) {
 	Thread_StackFree(pThread, pThis);
 
 	*ppMethodState = NULL;
+}
+// On a stack overflow (pCalling, the method that did not fit) or an unhandled exception (NULL), the managed frames to stderr, as .NET prints
+// them: the innermost ones, then the method seen most often (a recursion's).
+void MethodState_DumpStack(tMethodState *pState, tMD_MethodDef *pCalling) {
+	U32 depth = 0, i;
+	tMethodState *p;
+	tMD_MethodDef *most = NULL;
+	U32 mostCount = 0;
+	if (pCalling != NULL) fprintf(stderr, "\nStack overflow calling %s.  Innermost frames:\n", Sys_GetMethodDesc(pCalling));
+	else fprintf(stderr, "\nInnermost frames:\n");
+	for (p = pState; p != NULL; p = p->pCaller, depth++) {
+		if (depth < 24) fprintf(stderr, "   at %s\n", Sys_GetMethodDesc(p->pMethod));
+		if (depth < 4096) {
+			U32 n = 0;
+			tMethodState *q;
+			for (q = pState, i = 0; q != NULL && i < 4096; q = q->pCaller, i++) if (q->pMethod == p->pMethod) n++;
+			if (n > mostCount) { mostCount = n; most = p->pMethod; }
+		}
+	}
+	fprintf(stderr, "   (%u frames; %s is %u of them)\n", depth, most == NULL ? "-" : Sys_GetMethodDesc(most), mostCount);
+}
+
+// Exception.stackTrace, for an exception being thrown that has none yet (a rethrow keeps the first): "   at M(..)" a line for each frame, innermost
+// first, as .NET's StackTrace reads.  The field is found once, on System.Exception.
+void MethodState_RecordStackTrace(HEAP_PTR exception, tMethodState *pState) {
+	static tMD_FieldDef *pField = NULL;
+	static int searched = 0;
+	if (exception == NULL) return;
+	if (!searched) {
+		tMD_TypeDef *t;
+		U32 i;
+		searched = 1;
+		for (t = Heap_GetType(exception); t != NULL; t = t->pParent) {
+			if (strcmp(t->name, "Exception") == 0 && strcmp(t->nameSpace, "System") == 0) {
+				for (i = 0; i < t->numFields; i++) if (strcmp(t->ppFields[i]->name, "stackTrace") == 0) pField = t->ppFields[i];
+				break;
+			}
+		}
+	}
+	if (pField == NULL || *(HEAP_PTR*)((PTR)exception + pField->memOffset) != NULL) return;
+	char buf[8192];
+	U32 n = 0, depth = 0;
+	tMethodState *p;
+	buf[0] = 0;
+	for (p = pState; p != NULL && depth < 64; p = p->pCaller, depth++) {
+		const char *d = Sys_GetMethodDesc(p->pMethod);
+		U32 len = (U32)strlen(d);
+		if (n + len + 8 >= sizeof(buf)) break;
+		n += (U32)sprintf(buf + n, "%s   at %s", n ? "\n" : "", d);
+	}
+	*(HEAP_PTR*)((PTR)exception + pField->memOffset) = SystemString_FromCharPtrASCII((U8*)buf);
 }

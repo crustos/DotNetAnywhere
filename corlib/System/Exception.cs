@@ -6,6 +6,7 @@ namespace System {
 		private Exception innerException;
 		private string message;
 		private int hresult = unchecked((int)0x80004005);
+		private string stackTrace;      // set by the runtime when the exception is first thrown: the frames, innermost first
 
 		public Exception() { }
 
@@ -21,6 +22,12 @@ namespace System {
 		public virtual string Message {
 			get {
 				return message;
+			}
+		}
+
+		public virtual string StackTrace {
+			get {
+				return stackTrace;
 			}
 		}
 
